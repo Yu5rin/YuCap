@@ -1,0 +1,121 @@
+# YuCap — キャプチャビューア
+
+USB キャプチャボード（UVC/UAC 準拠。想定機種：j5create JVA14）の映像・音声を
+**「見るだけ＋スナップショット」**に特化した Windows デスクトップアプリです。録画機能は持ちません。
+
+Media Foundation の Capture Engine を使い、プレビューを **GPU で直接ウィンドウへ描画**します。
+NV12/P010 をネイティブに扱えるため、DirectShow では届かなかった **1080p120 / 1440p60 / 4K30** が使えます。
+
+## 動作環境
+
+- Windows 10 / 11（x64）
+- [.NET 8 デスクトップランタイム](https://dotnet.microsoft.com/download/dotnet/8.0)
+- UVC/UAC 準拠の USB キャプチャデバイス
+
+## インストール
+
+Releases から `YuCap.exe` をダウンロードして任意の場所に置くだけです（インストーラ不要）。
+設定は `%APPDATA%\YuCap\settings.json` に保存されます。
+
+## 主な機能
+
+- **自動デバイス選択** — 名前に指定キーワード（既定 `JVA14`）を含む機器を優先。無ければ先頭を使用
+- **抜き差し検出と自動再接続** — ケーブルを挿し直すと映像・音声が自動復帰。既定の再生デバイス変更にも追従
+- **表示モード** — アスペクト比保持／引き伸ばし／原寸／**整数倍**（ドット絵がボケない）
+- **回転・左右反転**、**デジタルズーム**（Ctrl+ホイール）とドラッグでのパン
+- **全画面 / ピクチャインピクチャ**（不透明度・クリックスルー・表示位置・サイズを設定可能）
+- **一時停止**（Space）— 映像を静止し音声も停止
+- **スナップショット** — PNG/JPEG 保存、クリップボードへコピー、連写（間隔・枚数指定）
+- **音声パススルー** — 音量 0〜500%（ソフトリミッター内蔵で歪みにくい）、ミュート、遅延の実測表示
+- **グローバルホットキー**（他アプリ使用中でも動作、キー割り当て変更可）
+- **カーソル自動非表示**（時間設定可）、**画面スリープ抑止**
+- 日本語 / English UI
+
+## 操作
+
+| 操作 | 動作 |
+|---|---|
+| 映像上でホイール | 音量 5% 増減 |
+| Ctrl + ホイール | デジタルズーム（Ctrl+0 でリセット） |
+| ダブルクリック / F11 | 全画面切替（Esc でも解除） |
+| Space | 一時停止 / 再開 |
+| M / 中クリック | ミュート |
+| Ctrl+S | スナップショット保存 |
+| Ctrl+C | スナップショットをクリップボードへ |
+| Ctrl+T / Ctrl+B | 常に前面 / ウィンドウ枠なし |
+| F10 | メニューバー表示切替 |
+| 右クリック | コンテキストメニュー |
+
+グローバルホットキー（既定・変更可）: `Ctrl+Alt+S` 保存 / `Ctrl+Alt+M` ミュート / `Ctrl+Alt+P` PiP
+
+## コマンドラインオプション
+
+```
+--fullscreen        全画面で起動
+--borderless        ウィンドウ枠なしで起動
+--topmost           常に前面で起動
+--muted             ミュートで起動
+--volume <0-500>    音量を指定
+--mode <指定>       映像モード指定（例: 1080p120 / 1440p60 / 1920x1080@120）
+--list-formats [出力先]   対応フォーマットを書き出して終了
+--selftest [出力先]       自己診断を実行して終了
+--help              オプション一覧を表示
+```
+
+## ビルド
+
+```bash
+dotnet build -c Release
+```
+
+単一 exe を作る場合:
+
+```bash
+dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o .
+```
+
+ランタイム不要の版が必要なら `--self-contained true`（約 69MB）。
+
+> ビルド前に実行中の YuCap を終了してください（exe がロックされます）。
+
+## 構成
+
+| ファイル | 役割 |
+|---|---|
+| `Program.cs` | エントリポイント、コマンドライン解析、診断モード、クラッシュログ |
+| `MainForm.cs` | UI・メニュー・入力・ウィンドウ状態管理 |
+| `VideoEngine.cs` | MF Capture Engine による取得・GPU描画・モード選択・スナップショット |
+| `MfInterop.cs` | Capture Engine の自前 COM interop |
+| `AudioEngine.cs` | WASAPI パススルー、音量／リミッター、遅延制御 |
+| `VideoBox.cs` | プレビューの描画先ホストウィンドウ |
+| `OsdOverlay.cs` | 映像上のOSD表示 |
+| `Settings.cs` / `Strings.cs` | 設定の永続化 / UI文字列（日英） |
+| `Log.cs` | 診断ログとUIスレッド監視 |
+
+## 設計メモ（触る前に読む価値のある落とし穴）
+
+- **`UpdateVideo` は必ずワーカースレッドから呼ぶ。** UIスレッドから呼ぶと、MF内部がUIスレッドの応答を
+  待つためデッドロックする（全画面化で数秒〜無限に固まる）。戻り値 `S_FALSE (0x1)` は**正常**であり
+  失敗ではない。
+- **`UpdateVideo` に `dst=NULL`（fill window）を渡してはいけない。** DirectComposition では明示矩形が
+  合成ビジュアルのリサイズ契機になっており、NULL だと全画面で何も描画されない。
+- **プレビュー描画ストリームに `SetSampleCallback` を設定しない。** フレームがレンダラから奪われ、
+  プレビューが真っ白になる。
+- 万一 `UpdateVideo` が固着した場合に備え、セッションを分離し、検知したらプレビューを自動再起動する
+  仕組みを入れている（`--selftest` で両方の経路を検証できる）。
+
+## 診断
+
+問題が起きた場合は `%APPDATA%\YuCap\yucap.log`（動作ログ）と `error.log`（クラッシュ）を確認してください。
+UIスレッドが固まった場合も、別スレッドの監視により `*** UI THREAD STUCK` として記録されます。
+
+## ライセンス
+
+MIT License — [LICENSE](LICENSE) を参照
+
+### 使用ライブラリ
+
+| ライブラリ | ライセンス | 用途 |
+|---|---|---|
+| [NAudio](https://github.com/naudio/NAudio) | MIT | WASAPI 音声パススルー |
+| [Vortice.MediaFoundation](https://github.com/amerkoleci/Vortice.Windows) | MIT | Media Foundation バインディング |

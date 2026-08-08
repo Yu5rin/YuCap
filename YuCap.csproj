@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>YuCap</RootNamespace>
+    <AssemblyName>YuCap</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>AnyCPU;x86;x64</Platforms>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Product>YuCap</Product>
+    <Copyright>© 2026 YUGO</Copyright>
+    <AssemblyTitle>YuCap - キャプチャビューア</AssemblyTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+  </ItemGroup>
+
+</Project>

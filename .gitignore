@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+
+# Published binaries live in the project root (see build steps in README);
+# they are release assets, not source.
+YuCap.exe
+YuCap.pdb
+publish/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
