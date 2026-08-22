@@ -1866,19 +1866,13 @@ public sealed class MainForm : Form, IMessageFilter
     // ---- Update ----------------------------------------------------------
 
     /// <summary>
-    /// Startup check, at most once a day and only if enabled. Fired and
-    /// forgotten so nothing about it can delay the window appearing; the check
-    /// itself stays quiet unless there is genuinely something newer.
+    /// Startup check, on every launch when enabled. Fired and forgotten so
+    /// nothing about it can delay the window appearing; the check itself stays
+    /// quiet unless there is genuinely something newer.
     /// </summary>
     private void MaybeCheckForUpdatesOnStartup()
     {
         if (!_settings.UpdateCheckOnStartup) return;
-        if (DateTime.TryParse(_settings.LastUpdateCheckUtc, null,
-                System.Globalization.DateTimeStyles.RoundtripKind, out DateTime last)
-            && (DateTime.UtcNow - last).TotalHours < 24)
-        {
-            return;
-        }
 
         // Let the capture settle before adding network work.
         var delay = new System.Windows.Forms.Timer { Interval = 4000 };

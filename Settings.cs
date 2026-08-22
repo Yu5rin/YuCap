@@ -50,6 +50,7 @@ public sealed class AppSettings
     // the app talks to.
     public bool UpdateCheckOnStartup { get; set; } = true;
     public string UpdateApiUrl { get; set; } = "https://api.github.com/repos/Yu5rin/YuCap/releases/latest";
+    /// <summary>Recorded for diagnostics only — the startup check is not throttled.</summary>
     public string? LastUpdateCheckUtc { get; set; }
 
     // Behavior.
