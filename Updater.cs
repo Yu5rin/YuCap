@@ -141,18 +141,22 @@ internal static class Updater
         return null;
     }
 
+    /// <summary>Folder the downloaded build is staged in before being applied.</summary>
+    private static string StagingDir => Path.Combine(Path.GetTempPath(), "YuCapUpdate");
+
     /// <summary>Download the asset to a temp file and verify it. Throws on failure.</summary>
     public static async Task<string> DownloadAsync(UpdateInfo info, IProgress<int>? progress,
         CancellationToken ct = default)
     {
-        string dir = Path.Combine(Path.GetTempPath(), "YuCapUpdate");
+        string dir = StagingDir;
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, info.AssetName);
 
-        using (HttpResponseMessage resp = await Http
-                   .GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct)
-                   .ConfigureAwait(false))
+        try
         {
+            using HttpResponseMessage resp = await Http
+                .GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
             resp.EnsureSuccessStatusCode();
             long total = resp.Content.Headers.ContentLength ?? info.Size;
 
@@ -168,13 +172,19 @@ internal static class Updater
                 if (total > 0) progress?.Report((int)(done * 100 / total));
             }
         }
+        catch
+        {
+            // Cancelled or failed: don't leave a partial download behind.
+            DiscardStaging();
+            throw;
+        }
 
         if (info.Sha256 != null)
         {
             string actual = ComputeSha256(path);
             if (!actual.Equals(info.Sha256, StringComparison.OrdinalIgnoreCase))
             {
-                try { File.Delete(path); } catch { /* best effort */ }
+                DiscardStaging();
                 Log.Info($"update: SHA256 mismatch (expected {info.Sha256}, got {actual})");
                 throw new InvalidDataException("ダウンロードしたファイルの検証に失敗しました。");
             }
@@ -257,7 +267,24 @@ internal static class Updater
         Log.Info("update: relaunched, exiting");
     }
 
-    /// <summary>Remove the displaced executable left by a previous update.</summary>
+    /// <summary>Delete the staged download. The applying process cannot do this
+    /// itself — it exits immediately after launching the new build — so the
+    /// staged copy is cleared at the next startup instead.</summary>
+    public static void DiscardStaging()
+    {
+        try
+        {
+            if (Directory.Exists(StagingDir))
+            {
+                Directory.Delete(StagingDir, recursive: true);
+                Log.Info("update: removed staged download");
+            }
+        }
+        catch (Exception ex) { Log.Info("update: could not remove staging — " + ex.Message); }
+    }
+
+    /// <summary>Remove what a previous update left behind: the displaced
+    /// executable, and the downloaded copy staged in temp.</summary>
     public static void CleanupOld()
     {
         try
@@ -272,6 +299,8 @@ internal static class Updater
             }
         }
         catch { /* still locked; next launch will get it */ }
+
+        DiscardStaging();
     }
 
     /// <summary>Wait for the superseded process to exit so the mutex is free.</summary>
