@@ -5,6 +5,8 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace YuCap;
@@ -80,6 +82,7 @@ public sealed class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miHotkeys = null!;
     private ToolStripMenuItem _miStartup = null!;
     private ToolStripMenuItem _miCursorHide = null!;
+    private ToolStripMenuItem _miUpdateCheck = null!;
     private readonly List<ToolStripMenuItem> _cursorSecItems = new();
     private readonly List<ToolStripMenuItem> _pipIdleItems = new();
     private readonly List<ToolStripMenuItem> _pipHoverItems = new();
@@ -139,6 +142,10 @@ public sealed class MainForm : Form, IMessageFilter
 
     // Command-line video mode (session-only; never persisted).
     private CaptureMode? _cliMode;
+
+    // Set when an update has already persisted settings and torn down the
+    // engines; the closing handler must not run that work a second time.
+    private bool _skipSaveOnClose;
 
     // Interactive (border-drag) resize in progress: keep the video streaming
     // smoothly instead of clear+reblit on every move message.
@@ -584,6 +591,7 @@ public sealed class MainForm : Form, IMessageFilter
         _miHotkeys = new ToolStripMenuItem(L.T("グローバルホットキーを有効化"), null, (_, _) => ToggleGlobalHotkeys());
         var hotkeyCfg = new ToolStripMenuItem(L.T("ホットキー設定..."), null, (_, _) => ShowHotkeySettings());
         _miStartup = new ToolStripMenuItem(L.T("Windows起動時に自動実行"), null, (_, _) => ToggleStartup());
+        _miUpdateCheck = new ToolStripMenuItem(L.T("起動時に更新を確認"), null, (_, _) => ToggleUpdateCheck());
         var lang = new ToolStripMenuItem(L.T("言語 / Language"));
         var langJa = new ToolStripMenuItem("日本語", null, (_, _) => SetLanguage("ja")) { Checked = !L.English };
         var langEn = new ToolStripMenuItem("English", null, (_, _) => SetLanguage("en")) { Checked = L.English };
@@ -609,11 +617,15 @@ public sealed class MainForm : Form, IMessageFilter
         options.DropDownItems.Add(cursorSecs);
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(_miStartup);
+        options.DropDownItems.Add(_miUpdateCheck);
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(lang);
 
         // ---- ヘルプ ----
         var help = new ToolStripMenuItem(L.T("ヘルプ(&H)"));
+        help.DropDownItems.Add(new ToolStripMenuItem(L.T("更新を確認..."), null,
+            async (_, _) => await CheckForUpdatesAsync(manual: true)));
+        help.DropDownItems.Add(new ToolStripSeparator());
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
 
         _menu.Items.AddRange(new ToolStripItem[] { file, device, view, options, help });
@@ -798,6 +810,7 @@ public sealed class MainForm : Form, IMessageFilter
         _lastCursorPos = Cursor.Position;
         _lastCursorMoveTick = Environment.TickCount;
         _cursorTimer.Start();
+        MaybeCheckForUpdatesOnStartup();
         Log.Info($"OnLoad done: video={_video.CurrentDeviceName ?? "none"} audio={_audio.CurrentDeviceName ?? "none"} " +
                  $"borderless={_isBorderless} fs={_isFullscreen} pip={_isPip}");
     }
@@ -1008,7 +1021,12 @@ public sealed class MainForm : Form, IMessageFilter
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
-        try { SaveSettings(); } catch { /* ignore */ }
+        // An update has already saved settings; re-saving here would capture the
+        // torn-down state (no device, window mid-close) over the real settings.
+        if (!_skipSaveOnClose)
+        {
+            try { SaveSettings(); } catch { /* ignore */ }
+        }
         _uiTimer.Stop();
         _osdTimer.Stop();
         _devTimer.Stop();
@@ -1843,6 +1861,176 @@ public sealed class MainForm : Form, IMessageFilter
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         _settings.DeviceKeyword = string.IsNullOrWhiteSpace(txt.Text) ? "JVA14" : txt.Text.Trim();
         SaveSettings();
+    }
+
+    // ---- Update ----------------------------------------------------------
+
+    /// <summary>
+    /// Startup check, at most once a day and only if enabled. Fired and
+    /// forgotten so nothing about it can delay the window appearing; the check
+    /// itself stays quiet unless there is genuinely something newer.
+    /// </summary>
+    private void MaybeCheckForUpdatesOnStartup()
+    {
+        if (!_settings.UpdateCheckOnStartup) return;
+        if (DateTime.TryParse(_settings.LastUpdateCheckUtc, null,
+                System.Globalization.DateTimeStyles.RoundtripKind, out DateTime last)
+            && (DateTime.UtcNow - last).TotalHours < 24)
+        {
+            return;
+        }
+
+        // Let the capture settle before adding network work.
+        var delay = new System.Windows.Forms.Timer { Interval = 4000 };
+        delay.Tick += async (_, _) =>
+        {
+            delay.Stop();
+            delay.Dispose();
+            if (IsDisposed) return;
+            try { await CheckForUpdatesAsync(manual: false); }
+            catch (Exception ex) { Log.Info("startup update check failed: " + ex.Message); }
+        };
+        delay.Start();
+    }
+
+    private void ToggleUpdateCheck()
+    {
+        _settings.UpdateCheckOnStartup = !_settings.UpdateCheckOnStartup;
+        UpdateChecks();
+        ShowOsd(_settings.UpdateCheckOnStartup
+            ? L.T("起動時の更新確認: オン")
+            : L.T("起動時の更新確認: オフ"));
+    }
+
+    /// <summary>
+    /// Look for a newer release and, with the user's consent, install it.
+    /// Communication only ever happens here — from an explicit menu action, or
+    /// from the once-a-day startup check the user can switch off.
+    /// </summary>
+    /// <param name="manual">True when the user asked; only then do we report
+    /// "no update" or a failed check. The startup check stays silent.</param>
+    private async Task CheckForUpdatesAsync(bool manual)
+    {
+        UpdateInfo? info;
+        try
+        {
+            info = await Updater.CheckAsync(_settings.UpdateApiUrl);
+        }
+        catch (Exception ex)
+        {
+            Log.Info("update check threw: " + ex.Message);
+            info = null;
+        }
+
+        _settings.LastUpdateCheckUtc = DateTime.UtcNow.ToString("o");
+
+        if (info == null)
+        {
+            if (manual)
+            {
+                MessageBox.Show(this,
+                    L.F("現在のバージョンは {0} です。\n更新はありません。", Updater.CurrentVersion),
+                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            return;
+        }
+
+        if (IsDisposed) return;
+
+        var prompt = MessageBox.Show(this,
+            L.F("新しいバージョン {0} があります（現在 {1}）。\n\n今すぐ更新しますか？\n更新後、YuCap は自動的に再起動します。",
+                info.Version, Updater.CurrentVersion),
+            "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+        if (prompt != DialogResult.Yes) return;
+
+        // Under Program Files the swap cannot work; say so instead of failing
+        // halfway through.
+        if (!Updater.CanWriteToInstallDir())
+        {
+            if (MessageBox.Show(this,
+                    L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
+                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                OpenUrl(info.PageUrl);
+            return;
+        }
+
+        DownloadAndApply(info);
+    }
+
+    /// <summary>Synchronous by design: the progress dialog's own modal loop
+    /// drives the download, so there is nothing here to await.</summary>
+    private void DownloadAndApply(UpdateInfo info)
+    {
+        using var dlg = new Form
+        {
+            Text = L.T("更新をダウンロード中"),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            ControlBox = false,
+            ClientSize = new Size(380, 120),
+        };
+        var lbl = new Label
+        {
+            Text = L.F("{0} をダウンロードしています...", info.AssetName),
+            AutoSize = true,
+            Location = new Point(16, 18),
+        };
+        var bar = new ProgressBar { Location = new Point(16, 46), Size = new Size(348, 22), Maximum = 100 };
+        var cancelBtn = new Button { Text = L.T("キャンセル"), Location = new Point(274, 80), Width = 90 };
+        var cts = new CancellationTokenSource();
+        cancelBtn.Click += (_, _) => { cts.Cancel(); dlg.Close(); };
+        dlg.Controls.AddRange(new Control[] { lbl, bar, cancelBtn });
+
+        string? file = null;
+        Exception? failure = null;
+        var progress = new Progress<int>(p => { if (!dlg.IsDisposed) bar.Value = Math.Clamp(p, 0, 100); });
+
+        dlg.Shown += async (_, _) =>
+        {
+            try { file = await Updater.DownloadAsync(info, progress, cts.Token); }
+            catch (OperationCanceledException) { /* user cancelled */ }
+            catch (Exception ex) { failure = ex; }
+            finally { if (!dlg.IsDisposed) dlg.Close(); }
+        };
+        dlg.ShowDialog(this);
+        cts.Dispose();
+
+        if (failure != null)
+        {
+            MessageBox.Show(this, L.F("更新のダウンロードに失敗しました。\n\n{0}", failure.Message),
+                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (file == null) return;   // cancelled
+
+        try
+        {
+            // Save settings and release devices before the swap: the new process
+            // starts immediately and would otherwise fight over the capture card.
+            SaveSettings();
+            try { _video.Dispose(); } catch { /* ignore */ }
+            try { _audio.Dispose(); } catch { /* ignore */ }
+
+            Updater.Apply(file);      // rolls back internally if the swap fails
+            _skipSaveOnClose = true;  // settings already written above
+            Close();
+        }
+        catch (Exception ex)
+        {
+            Log.Info("update apply failed: " + ex.Message);
+            MessageBox.Show(this,
+                L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", ex.Message),
+                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void OpenUrl(string url)
+    {
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); }
+        catch (Exception ex) { Log.Info("open url failed: " + ex.Message); }
     }
 
     // ---- Language --------------------------------------------------------
@@ -2791,6 +2979,7 @@ public sealed class MainForm : Form, IMessageFilter
         _miClickThrough.Checked = _settings.PipClickThrough;
         _miHotkeys.Checked = _settings.GlobalHotkeys;
         _miCursorHide.Checked = _settings.CursorAutoHide;
+        _miUpdateCheck.Checked = _settings.UpdateCheckOnStartup;
         foreach (var item in _cursorSecItems)
             item.Checked = _settings.CursorAutoHide && (int)item.Tag! == _settings.CursorHideSeconds;
         foreach (var item in _pipIdleItems)

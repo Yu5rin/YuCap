@@ -48,12 +48,36 @@ internal static class Program
             return;
         }
 
+        // Update check as a one-shot, for verifying the endpoint and parsing
+        // without needing an actual newer release to exist.
+        if (args.Length > 0 && args[0] == "--check-update")
+        {
+            AppSettings s = SettingsStore.Load();
+            UpdateInfo? info = Updater.CheckAsync(s.UpdateApiUrl).GetAwaiter().GetResult();
+            string msg = info == null
+                ? $"現在: {Updater.CurrentVersion}\n更新はありません（または確認できませんでした）。\n\nエンドポイント:\n{s.UpdateApiUrl}"
+                : $"現在: {Updater.CurrentVersion}\n最新: {info.Version} ({info.TagName})\n\n{info.AssetName}  {info.Size:N0} bytes\nSHA256: {info.Sha256 ?? "(なし)"}\n{info.DownloadUrl}";
+            MessageBox.Show(msg, "YuCap - 更新確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
         // Self-test: build the capture graph and report status.
         if (args.Length > 0 && args[0] == "--selftest")
         {
             RunSelfTest(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_selftest.txt"));
             return;
         }
+
+        // Just replaced a running build: wait for it to exit before contending
+        // for the single-instance mutex, then clear away the displaced exe.
+        int postUpdate = Array.IndexOf(args, Updater.PostUpdateArg);
+        if (postUpdate >= 0 && postUpdate + 1 < args.Length
+            && int.TryParse(args[postUpdate + 1], out int oldPid))
+        {
+            Log.Info($"update: started after update, waiting for pid {oldPid}");
+            Updater.WaitForPreviousExit(oldPid);
+        }
+        Updater.CleanupOld();
 
         if (args.Contains("--help") || args.Contains("-h") || args.Contains("/?"))
         {
@@ -67,7 +91,8 @@ internal static class Program
                 "  --mode <指定>       映像モード指定\n" +
                 "                      例: 1080p120 / 1440p60 / 1920x1080@120\n" +
                 "  --list-formats [出力先]   対応フォーマットを書き出して終了\n" +
-                "  --selftest [出力先]       自己診断を実行して終了",
+                "  --selftest [出力先]       自己診断を実行して終了\n" +
+                "  --check-update      更新の有無を確認して終了",
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }

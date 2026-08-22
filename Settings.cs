@@ -45,6 +45,13 @@ public sealed class AppSettings
     public int PipSizePct { get; set; } = 25;      // window size as % of the source resolution
     public int PipCorner { get; set; }             // 0=右下 1=左下 2=右上 3=左上
 
+    // Update check. The endpoint lives in the settings file rather than in code
+    // so it can be repointed without a rebuild — and so the user can see where
+    // the app talks to.
+    public bool UpdateCheckOnStartup { get; set; } = true;
+    public string UpdateApiUrl { get; set; } = "https://api.github.com/repos/Yu5rin/YuCap/releases/latest";
+    public string? LastUpdateCheckUtc { get; set; }
+
     // Behavior.
     public bool CursorAutoHide { get; set; } = true;
     public int CursorHideSeconds { get; set; } = 3;

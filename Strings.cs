@@ -88,6 +88,21 @@ internal static class L
         ["ヘルプ(&H)"] = "&Help",
         ["言語 / Language"] = "言語 / Language",
         ["バージョン情報..."] = "About...",
+        ["更新を確認..."] = "Check for updates...",
+        ["起動時に更新を確認"] = "Check for updates at startup",
+        ["起動時の更新確認: オン"] = "Startup update check: on",
+        ["起動時の更新確認: オフ"] = "Startup update check: off",
+        ["現在のバージョンは {0} です。\n更新はありません。"] =
+            "You are running {0}.\nNo updates available.",
+        ["新しいバージョン {0} があります（現在 {1}）。\n\n今すぐ更新しますか？\n更新後、YuCap は自動的に再起動します。"] =
+            "Version {0} is available (you have {1}).\n\nUpdate now?\nYuCap will restart automatically.",
+        ["インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"] =
+            "Cannot write to the install folder, so the update cannot be applied.\nOpen the releases page instead?",
+        ["更新をダウンロード中"] = "Downloading update",
+        ["{0} をダウンロードしています..."] = "Downloading {0}...",
+        ["更新のダウンロードに失敗しました。\n\n{0}"] = "Failed to download the update.\n\n{0}",
+        ["更新の適用に失敗しました。元の状態に戻しました。\n\n{0}"] =
+            "Failed to apply the update; the previous version was restored.\n\n{0}",
         // ---- Context menu ----
         ["全画面切替"] = "Toggle fullscreen",
         ["スナップショット保存"] = "Save snapshot",
