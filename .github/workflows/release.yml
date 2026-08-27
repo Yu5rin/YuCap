@@ -1,0 +1,74 @@
+name: Release
+
+# Tagging is the whole trigger: `git tag v1.2.3 && git push origin v1.2.3`
+# builds, hashes and publishes. Doing it by hand is where mistakes creep in —
+# a stale exe, a forgotten SHA256, or a rate-limited CLI leaving a half-made
+# release behind.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:        # lets a release be re-run from the Actions tab
+
+permissions:
+  contents: write           # required to create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify the tag matches the project version
+        shell: pwsh
+        run: |
+          # A tag that disagrees with <Version> would ship a build whose
+          # self-reported version is wrong, and the updater compares versions —
+          # so it could offer an update that never appears to apply.
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $proj = ([xml](Get-Content YuCap.csproj)).Project.PropertyGroup.Version
+          Write-Host "tag=$tag  csproj=$proj"
+          if ($tag -ne $proj) {
+            Write-Error "Tag $tag does not match <Version>$proj</Version> in YuCap.csproj"
+            exit 1
+          }
+
+      - name: Build
+        run: dotnet build YuCap.csproj -c Release --warnaserror
+
+      - name: Publish single-file exe
+        run: >
+          dotnet publish YuCap.csproj -c Release -r win-x64
+          --self-contained false -p:PublishSingleFile=true
+          -o publish
+
+      - name: Compute SHA256
+        id: hash
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash publish/YuCap.exe -Algorithm SHA256).Hash
+          Write-Host "SHA256: $h"
+          "sha256=$h" >> $env:GITHUB_OUTPUT
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: YuCap ${{ github.ref_name }}
+          files: publish/YuCap.exe
+          generate_release_notes: true
+          append_body: true
+          body: |
+
+            ## インストール
+
+            `YuCap.exe` をダウンロードして任意の場所に置くだけです。
+            [.NET 8 デスクトップランタイム](https://dotnet.microsoft.com/download/dotnet/8.0) が必要です。
+
+            署名していないため SmartScreen の警告が出ます。［詳細情報］→［実行］で起動できます。
+
+            SHA256: `${{ steps.hash.outputs.sha256 }}`

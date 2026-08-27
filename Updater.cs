@@ -69,9 +69,18 @@ internal static class Updater
     /// </summary>
     public static async Task<UpdateInfo?> CheckAsync(string apiUrl, CancellationToken ct = default)
     {
+        // The endpoint is user-editable in settings.json; refuse anything that
+        // would send the check (and the download link it returns) in the clear.
+        if (!Uri.TryCreate(apiUrl, UriKind.Absolute, out Uri? uri)
+            || uri.Scheme != Uri.UriSchemeHttps)
+        {
+            Log.Info($"update: refusing non-HTTPS endpoint '{apiUrl}'");
+            return null;
+        }
+
         try
         {
-            string json = await Http.GetStringAsync(apiUrl, ct).ConfigureAwait(false);
+            string json = await Http.GetStringAsync(uri, ct).ConfigureAwait(false);
             using JsonDocument doc = JsonDocument.Parse(json);
             JsonElement root = doc.RootElement;
 
@@ -98,6 +107,11 @@ internal static class Updater
 
                 string url = a.TryGetProperty("browser_download_url", out JsonElement u) ? u.GetString() ?? "" : "";
                 if (string.IsNullOrEmpty(url)) continue;
+                if (!url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Info("update: asset URL is not HTTPS — ignoring");
+                    continue;
+                }
                 long size = a.TryGetProperty("size", out JsonElement s) ? s.GetInt64() : 0;
 
                 // GitHub exposes "sha256:<hex>" on newer releases; otherwise fall

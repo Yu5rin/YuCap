@@ -11,7 +11,7 @@ using System.Windows.Forms;
 
 namespace YuCap;
 
-public sealed class MainForm : Form, IMessageFilter
+public sealed partial class MainForm : Form, IMessageFilter
 {
     // ---- Constants -------------------------------------------------------
     private const int VolumeStep = 5;
@@ -83,6 +83,7 @@ public sealed class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miStartup = null!;
     private ToolStripMenuItem _miCursorHide = null!;
     private ToolStripMenuItem _miUpdateCheck = null!;
+    private ToolStripMenuItem _miBurst = null!;
     private readonly List<ToolStripMenuItem> _cursorSecItems = new();
     private readonly List<ToolStripMenuItem> _pipIdleItems = new();
     private readonly List<ToolStripMenuItem> _pipHoverItems = new();
@@ -147,6 +148,9 @@ public sealed class MainForm : Form, IMessageFilter
     // engines; the closing handler must not run that work a second time.
     private bool _skipSaveOnClose;
 
+    // Most recent snapshot file name, so the OSD can act as a shortcut to it.
+    private string? _lastSavedSnapshot;
+
     // Interactive (border-drag) resize in progress: keep the video streaming
     // smoothly instead of clear+reblit on every move message.
     private bool _inSizeMove;
@@ -176,6 +180,7 @@ public sealed class MainForm : Form, IMessageFilter
     // cursor position rather than using mouse events: once the cursor is hidden
     // and the user stops moving it, no further events arrive to reason about.
     private readonly System.Windows.Forms.Timer _cursorTimer = new();
+    private readonly System.Windows.Forms.Timer _settingsSaveTimer = new();
     private Point _lastCursorPos;
     private int _lastCursorMoveTick;
     private bool _cursorHidden;
@@ -223,6 +228,16 @@ public sealed class MainForm : Form, IMessageFilter
         _osdTimer.Interval = OsdMilliseconds;
         _osdTimer.Tick += (_, _) => { _osdTimer.Stop(); _osd.Visible = false; };
 
+        // Clicking a "saved" notice reveals the file in Explorer.
+        _osd.Cursor = Cursors.Hand;
+        _osd.Click += (_, _) =>
+        {
+            if (_lastSavedSnapshot == null) return;
+            OpenFolder(SnapshotDirectory, _lastSavedSnapshot);
+            _osdTimer.Stop();
+            _osd.Visible = false;
+        };
+
         _uiTimer.Interval = 500;
         _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); };
 
@@ -237,6 +252,15 @@ public sealed class MainForm : Form, IMessageFilter
 
         _cursorTimer.Interval = 250;
         _cursorTimer.Tick += (_, _) => UpdateCursorVisibility();
+
+        // Settings used to be written only on exit, so a crash lost everything
+        // changed that session. Coalesce changes and flush a few seconds later.
+        _settingsSaveTimer.Interval = 3000;
+        _settingsSaveTimer.Tick += (_, _) =>
+        {
+            _settingsSaveTimer.Stop();
+            try { SaveSettings(); } catch (Exception ex) { Log.Info("deferred save failed: " + ex.Message); }
+        };
 
         // Mouse-over detection works even with click-through (no mouse events
         // reach the window then), so poll the cursor position while in PiP.
@@ -258,7 +282,7 @@ public sealed class MainForm : Form, IMessageFilter
 
         Load += OnLoad;
         FormClosing += OnFormClosing;
-        Resize += (_, _) => LayoutCanvas();
+        Resize += (_, _) => { LayoutCanvas(); MarkSettingsDirty(); };  // debounced: one save per drag
         Shown += (_, _) => LayoutCanvas(); // ensure correct fit once fully laid out
     }
 
@@ -486,13 +510,14 @@ public sealed class MainForm : Form, IMessageFilter
         {
             ShortcutKeyDisplayString = "Ctrl+C",
         };
-        var burst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog());
+        _miBurst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog());
         var openDir = new ToolStripMenuItem(L.T("保存先フォルダを開く"), null, (_, _) => OpenSnapshotFolder());
         var snapCfg = new ToolStripMenuItem(L.T("スナップショット設定..."), null, (_, _) => ShowSnapshotSettings());
         var exit = new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close());
+        file.DropDownOpening += (_, _) => UpdateChecks();
         file.DropDownItems.Add(snap);
         file.DropDownItems.Add(copy);
-        file.DropDownItems.Add(burst);
+        file.DropDownItems.Add(_miBurst);
         file.DropDownItems.Add(openDir);
         file.DropDownItems.Add(new ToolStripSeparator());
         file.DropDownItems.Add(snapCfg);
@@ -779,6 +804,7 @@ public sealed class MainForm : Form, IMessageFilter
     private void OnLoad(object? sender, EventArgs e)
     {
         Application.AddMessageFilter(this);
+        SingleInstance.MarkWindow(Handle);   // lets a second launch find us
 
         // Command-line switches override the saved view state for this launch.
         var opts = Program.Options;
@@ -796,7 +822,7 @@ public sealed class MainForm : Form, IMessageFilter
         _audio.VolumePercent = _settings.Volume; // apply after the device starts
         if (opts.Muted && _audio.IsRunning) _audio.Muted = true;
 
-        if (_settings.GlobalHotkeys) RegisterGlobalHotkeys();
+        if (_settings.GlobalHotkeys) RegisterGlobalHotkeys(announce: false);
 
         // Restore how the last session was being viewed. Both can be set: a PiP
         // entered FROM fullscreen — EnterPip records the fullscreen state so
@@ -810,6 +836,7 @@ public sealed class MainForm : Form, IMessageFilter
         _lastCursorPos = Cursor.Position;
         _lastCursorMoveTick = Environment.TickCount;
         _cursorTimer.Start();
+        AnnounceNewVersion();
         MaybeCheckForUpdatesOnStartup();
         Log.Info($"OnLoad done: video={_video.CurrentDeviceName ?? "none"} audio={_audio.CurrentDeviceName ?? "none"} " +
                  $"borderless={_isBorderless} fs={_isFullscreen} pip={_isPip}");
@@ -1035,6 +1062,8 @@ public sealed class MainForm : Form, IMessageFilter
         _resumeTimer.Stop();
         _resizeGuard.Stop();
         _cursorTimer.Stop();
+        _settingsSaveTimer.Stop();
+        try { if (IsHandleCreated) SingleInstance.UnmarkWindow(Handle); } catch { /* ignore */ }
         ShowCursorIfHidden();   // never leave the user without a pointer
         try { UnregisterGlobalHotkeys(); } catch { /* ignore */ }
         SetThreadExecutionState(EsContinuous); // release the sleep inhibition
@@ -1294,8 +1323,18 @@ public sealed class MainForm : Form, IMessageFilter
             Math.Max(MinimumSize.Height, ClientSize.Height + delta)));
     }
 
+    /// <summary>Note that something worth persisting changed; the write happens
+    /// a few seconds later so a burst of changes costs one save.</summary>
+    private void MarkSettingsDirty()
+    {
+        if (_skipSaveOnClose) return;   // an update is mid-flight
+        _settingsSaveTimer.Stop();
+        _settingsSaveTimer.Start();
+    }
+
     private void ShowOsd(string text)
     {
+        _lastSavedSnapshot = null;   // only a "saved" notice is clickable
         _osd.ShowText(text);
         PositionOsd();
         _osdTimer.Stop();
@@ -1323,12 +1362,20 @@ public sealed class MainForm : Form, IMessageFilter
         }
 
         if (!_audio.IsRunning) return false;
+        NudgeVolume(steps * VolumeStep);
+        return true;
+    }
+
+    /// <summary>Shared by the wheel and the arrow keys.</summary>
+    private void NudgeVolume(int delta)
+    {
+        if (!_audio.IsRunning) { ShowOsd(L.T("音声がありません")); return; }
         if (_audio.Muted) { _audio.Muted = false; UpdateChecks(); } // adjusting volume unmutes
-        int newVol = Math.Clamp(_audio.VolumePercent + steps * VolumeStep, 0, AudioEngine.MaxVolumePercent);
+        int newVol = Math.Clamp(_audio.VolumePercent + delta, 0, AudioEngine.MaxVolumePercent);
         _audio.VolumePercent = newVol;
         ShowOsd(L.F("音量 {0}%", newVol));
         UpdateStatus();
-        return true;
+        MarkSettingsDirty();
     }
 
     // ---- Mute ------------------------------------------------------------
@@ -1396,352 +1443,6 @@ public sealed class MainForm : Form, IMessageFilter
         UpdateStatus();
     }
 
-    // ---- Picture-in-picture ---------------------------------------------
-
-    private void TogglePip()
-    {
-        if (_isPip) ExitPip();
-        else EnterPip();
-    }
-
-    private void EnterPip()
-    {
-        // Remember whether we were fullscreen so exiting PiP returns there.
-        _prePipFullscreen = _isFullscreen;
-        if (_isFullscreen) ExitFullscreen();
-
-        _prePipBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-        _prePipBorderless = _isBorderless;
-        _prePipTopmost = _alwaysOnTop;
-        _prePipMenu = _menu.Visible;
-        _prePipStatus = _status.Visible;
-        _isPip = true;
-
-        WindowState = FormWindowState.Normal;
-        _menu.Visible = false;
-        _status.Visible = false;
-        if (!_isBorderless)
-        {
-            _isBorderless = true;
-            _canvas.EnableEdgeResize = true;
-            RefreshFrame();
-        }
-        TopMost = true;
-
-        // Preset-sized window docked to the configured work-area corner.
-        ApplyPipSize(anchorCorner: false);
-        Location = PipCornerLocation();
-
-        _pipHovered = Bounds.Contains(Cursor.Position);
-        ApplyPipOpacity();
-        _pipHoverTimer.Start();
-        if (_settings.PipClickThrough) ApplyClickThrough(true);
-
-        LayoutCanvas(ModeChangeSettleMs);
-        UpdateChecks();
-        ShowOsd(L.T("PiP: オン"));
-    }
-
-    private void ExitPip()
-    {
-        _isPip = false;
-        _pipHoverTimer.Stop();
-        ApplyClickThrough(false);
-        try { Opacity = 1.0; } catch { }
-        TopMost = _alwaysOnTop = _prePipTopmost;
-        if (_isBorderless != _prePipBorderless)
-        {
-            _isBorderless = _prePipBorderless;
-            _canvas.EnableEdgeResize = _isBorderless;
-            RefreshFrame();
-        }
-        _menu.Visible = _prePipMenu;
-        _status.Visible = _prePipStatus;
-        if (_prePipBounds.Width > 0) Bounds = _prePipBounds;
-        // Return to the mode the user was in before PiP (e.g. fullscreen).
-        if (_prePipFullscreen)
-        {
-            _prePipFullscreen = false;
-            EnterFullscreen();
-        }
-        LayoutCanvas(ModeChangeSettleMs);
-        UpdateChecks();
-        ShowOsd(L.T("PiP: オフ"));
-    }
-
-    private void SetPipSize(int pct)
-    {
-        _settings.PipSizePct = Math.Clamp(pct, 5, 100);
-        if (_isPip) ApplyPipSize(anchorCorner: true);
-        UpdateChecks();
-    }
-
-    private void SetPipCorner(int corner)
-    {
-        _settings.PipCorner = Math.Clamp(corner, 0, 3);
-        if (_isPip) Location = PipCornerLocation();
-        UpdateChecks();
-    }
-
-    /// <summary>Work-area location docking the current window to the configured
-    /// corner (0=BR, 1=BL, 2=TR, 3=TL) with a 16px margin.</summary>
-    private Point PipCornerLocation()
-    {
-        Rectangle wa = Screen.FromControl(this).WorkingArea;
-        const int m = 16;
-        return _settings.PipCorner switch
-        {
-            1 => new Point(wa.Left + m, wa.Bottom - Height - m),
-            2 => new Point(wa.Right - Width - m, wa.Top + m),
-            3 => new Point(wa.Left + m, wa.Top + m),
-            _ => new Point(wa.Right - Width - m, wa.Bottom - Height - m),
-        };
-    }
-
-    /// <summary>Resize the PiP window to the preset % of the source resolution.
-    /// With click-through on, drag-resizing is impossible, so this preset is the
-    /// only sizing control. When resizing mid-session the window keeps the
-    /// corner matching the configured docking corner, so a docked PiP (even one
-    /// the user has dragged elsewhere) grows away from its anchor.</summary>
-    private void ApplyPipSize(bool anchorCorner)
-    {
-        Size res = _video.DisplayResolution;
-        int pct = Math.Clamp(_settings.PipSizePct, 5, 100);
-        int w = res.Width > 0 ? Math.Max(160, res.Width * pct / 100) : 480;
-        int h = res.Width > 0 ? (int)Math.Round((double)w * res.Height / res.Width) : 270;
-        Rectangle old = Bounds;
-        SetOuterForClient(new Size(w, h));
-        if (anchorCorner)
-        {
-            Location = _settings.PipCorner switch
-            {
-                1 => new Point(old.Left, old.Bottom - Height),          // BL
-                2 => new Point(old.Right - Width, old.Top),             // TR
-                3 => new Point(old.Left, old.Top),                      // TL
-                _ => new Point(old.Right - Width, old.Bottom - Height), // BR
-            };
-        }
-    }
-
-    private void SetPipOpacity(int pct, bool hover)
-    {
-        pct = Math.Clamp(pct, 0, 100);
-        if (hover) _settings.PipOpacityHover = pct;
-        else _settings.PipOpacity = pct;
-        if (_isPip) ApplyPipOpacity();
-        UpdateChecks();
-    }
-
-    /// <summary>Apply the idle/hover opacity matching the current cursor state.
-    /// 0% is allowed (fully invisible): hovering — or Ctrl+Alt+P — brings it back.
-    /// While click-through is on, the layered alpha is driven DIRECTLY: the
-    /// Form.Opacity setter rewrites the ex-style from WinForms' own cache, which
-    /// strips WS_EX_TRANSPARENT and silently disables click-through.</summary>
-    private void ApplyPipOpacity()
-    {
-        int pct = Math.Clamp(_pipHovered ? _settings.PipOpacityHover : _settings.PipOpacity, 0, 100);
-        if (_isPip && _settings.PipClickThrough && IsHandleCreated)
-        {
-            int ex = GetWindowLong(Handle, GwlExStyle);
-            SetWindowLong(Handle, GwlExStyle, ex | WsExTransparent | WsExLayered);
-            SetLayeredWindowAttributes(Handle, 0, (byte)(pct * 255 / 100), LwaAlpha);
-        }
-        else
-        {
-            try { Opacity = pct / 100.0; } catch { }
-        }
-    }
-
-    private void UpdatePipHoverOpacity()
-    {
-        if (!_isPip) { _pipHoverTimer.Stop(); return; }
-        bool hovered = Bounds.Contains(Cursor.Position);
-        if (hovered == _pipHovered) return;
-        _pipHovered = hovered;
-        ApplyPipOpacity();
-    }
-
-    private void TogglePipClickThrough()
-    {
-        _settings.PipClickThrough = !_settings.PipClickThrough;
-        if (_isPip) ApplyClickThrough(_settings.PipClickThrough);
-        UpdateChecks();
-        ShowOsd(_settings.PipClickThrough
-            ? L.T("クリックスルー: オン (Ctrl+Alt+Pで解除)")
-            : L.T("クリックスルー: オフ"));
-    }
-
-    private void ApplyClickThrough(bool on)
-    {
-        if (!IsHandleCreated) return;
-        if (on)
-        {
-            ApplyPipOpacity(); // sets WS_EX_TRANSPARENT|LAYERED + the layered alpha
-            if (!_settings.GlobalHotkeys)
-            {
-                // Safety hatch: with the mouse passing through, the PiP hotkey
-                // must work even if the user disabled global hotkeys.
-                TryRegisterHotkey(HkPip, (Keys)_settings.HotkeyPip, new List<string>());
-            }
-        }
-        else
-        {
-            int ex = GetWindowLong(Handle, GwlExStyle);
-            SetWindowLong(Handle, GwlExStyle, ex & ~(WsExTransparent | WsExLayered));
-            // Hand opacity back to WinForms. Its cached Opacity may equal the
-            // target (making the setter a no-op), so pass through 1.0 first to
-            // force a real style re-apply, then restore the PiP opacity if any.
-            try
-            {
-                Opacity = 1.0;
-                if (_isPip) ApplyPipOpacity();
-            }
-            catch { }
-            if (!_settings.GlobalHotkeys) UnregisterHotKey(Handle, HkPip);
-        }
-    }
-
-    // ---- Global hotkeys --------------------------------------------------
-
-    private void RegisterGlobalHotkeys()
-    {
-        var failed = new List<string>();
-        TryRegisterHotkey(HkSnapshot, (Keys)_settings.HotkeySnapshot, failed);
-        TryRegisterHotkey(HkMute, (Keys)_settings.HotkeyMute, failed);
-        TryRegisterHotkey(HkPip, (Keys)_settings.HotkeyPip, failed);
-        // Partial failure just means one combo is owned by another app — say
-        // which one instead of a blanket error; the others still work.
-        if (failed.Count > 0)
-        {
-            Log.Info("hotkey conflict: " + string.Join(", ", failed));
-            ShowOsd(L.F("ホットキー使用中のため無効: {0}", string.Join(", ", failed)));
-        }
-    }
-
-    private void TryRegisterHotkey(int id, Keys combo, List<string> failed)
-    {
-        // Defensive: an id left over from a previous register (toggle, click-
-        // through safety hatch) makes a re-register fail — clear it first.
-        UnregisterHotKey(Handle, id);
-        if ((combo & Keys.KeyCode) == Keys.None) return; // disabled
-        uint mods = ModNoRepeat;
-        if (combo.HasFlag(Keys.Control)) mods |= ModControl;
-        if (combo.HasFlag(Keys.Alt)) mods |= ModAlt;
-        if (combo.HasFlag(Keys.Shift)) mods |= ModShift;
-        if (!RegisterHotKey(Handle, id, mods, (uint)(combo & Keys.KeyCode)))
-            failed.Add(FormatHotkey(combo));
-    }
-
-    private static string FormatHotkey(Keys combo)
-    {
-        if ((combo & Keys.KeyCode) == Keys.None) return L.T("なし");
-        var parts = new List<string>();
-        if (combo.HasFlag(Keys.Control)) parts.Add("Ctrl");
-        if (combo.HasFlag(Keys.Alt)) parts.Add("Alt");
-        if (combo.HasFlag(Keys.Shift)) parts.Add("Shift");
-        parts.Add((combo & Keys.KeyCode).ToString());
-        return string.Join("+", parts);
-    }
-
-    private void ShowHotkeySettings()
-    {
-        using var dlg = new Form
-        {
-            Text = L.T("ホットキー設定"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(360, 210),
-            KeyPreview = true,
-        };
-
-        Keys snapCombo = (Keys)_settings.HotkeySnapshot;
-        Keys muteCombo = (Keys)_settings.HotkeyMute;
-        Keys pipCombo = (Keys)_settings.HotkeyPip;
-
-        TextBox MakeRow(string label, int y, Keys initial, Action<Keys> set)
-        {
-            var lbl = new Label { Text = L.T(label), AutoSize = true, Location = new Point(16, y + 4) };
-            var tb = new TextBox
-            {
-                Text = FormatHotkey(initial),
-                ReadOnly = true,
-                Location = new Point(150, y),
-                Width = 190,
-                TabStop = true,
-            };
-            tb.KeyDown += (_, e) =>
-            {
-                e.SuppressKeyPress = true;
-                e.Handled = true;
-                if (e.KeyCode == Keys.Escape)
-                {
-                    set(Keys.None);
-                    tb.Text = FormatHotkey(Keys.None);
-                    return;
-                }
-                // Ignore presses of a modifier alone; require Ctrl/Alt/Shift.
-                if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu) return;
-                if (e.Modifiers == Keys.None) return;
-                set(e.KeyData);
-                tb.Text = FormatHotkey(e.KeyData);
-            };
-            dlg.Controls.Add(lbl);
-            dlg.Controls.Add(tb);
-            return tb;
-        }
-
-        var tbSnap = MakeRow("スナップショット:", 16, snapCombo, k => snapCombo = k);
-        var tbMute = MakeRow("ミュート:", 52, muteCombo, k => muteCombo = k);
-        var tbPip = MakeRow("PiP切替:", 88, pipCombo, k => pipCombo = k);
-
-        var hint = new Label
-        {
-            Text = L.T("欄をクリックしてキーを押してください。Esc で無効化できます。"),
-            AutoSize = true,
-            ForeColor = Color.Gray,
-            Location = new Point(16, 126),
-        };
-        var reset = new Button { Text = L.T("既定に戻す"), Location = new Point(16, 168), Width = 100 };
-        reset.Click += (_, _) =>
-        {
-            snapCombo = Keys.Control | Keys.Alt | Keys.S;
-            muteCombo = Keys.Control | Keys.Alt | Keys.M;
-            pipCombo = Keys.Control | Keys.Alt | Keys.P;
-            tbSnap.Text = FormatHotkey(snapCombo);
-            tbMute.Text = FormatHotkey(muteCombo);
-            tbPip.Text = FormatHotkey(pipCombo);
-        };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(164, 168), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(255, 168), Width = 90 };
-        dlg.Controls.AddRange(new Control[] { hint, reset, ok, cancel });
-        dlg.CancelButton = cancel;
-
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-
-        _settings.HotkeySnapshot = (int)snapCombo;
-        _settings.HotkeyMute = (int)muteCombo;
-        _settings.HotkeyPip = (int)pipCombo;
-        SaveSettings();
-        if (_settings.GlobalHotkeys) RegisterGlobalHotkeys(); // re-register + report conflicts now
-    }
-
-    private void UnregisterGlobalHotkeys()
-    {
-        UnregisterHotKey(Handle, HkSnapshot);
-        UnregisterHotKey(Handle, HkMute);
-        UnregisterHotKey(Handle, HkPip);
-    }
-
-    private void ToggleGlobalHotkeys()
-    {
-        _settings.GlobalHotkeys = !_settings.GlobalHotkeys;
-        if (_settings.GlobalHotkeys) RegisterGlobalHotkeys();
-        else UnregisterGlobalHotkeys();
-        UpdateChecks();
-    }
 
     // ---- Burst snapshots -------------------------------------------------
 
@@ -1863,179 +1564,73 @@ public sealed class MainForm : Form, IMessageFilter
         SaveSettings();
     }
 
-    // ---- Update ----------------------------------------------------------
-
     /// <summary>
-    /// Startup check, on every launch when enabled. Fired and forgotten so
-    /// nothing about it can delay the window appearing; the check itself stays
-    /// quiet unless there is genuinely something newer.
+    /// Act on switches passed to a second launch, which forwarded them here
+    /// rather than starting a rival instance. Only the view-affecting ones make
+    /// sense to apply live; device/mode changes would disrupt a running session.
     /// </summary>
-    private void MaybeCheckForUpdatesOnStartup()
+    private void ApplyForwardedArgs(string[] args)
     {
-        if (!_settings.UpdateCheckOnStartup) return;
-
-        // Let the capture settle before adding network work.
-        var delay = new System.Windows.Forms.Timer { Interval = 4000 };
-        delay.Tick += async (_, _) =>
+        Log.Info("forwarded args: " + string.Join(" ", args));
+        foreach (string a in args)
         {
-            delay.Stop();
-            delay.Dispose();
-            if (IsDisposed) return;
-            try { await CheckForUpdatesAsync(manual: false); }
-            catch (Exception ex) { Log.Info("startup update check failed: " + ex.Message); }
-        };
-        delay.Start();
-    }
-
-    private void ToggleUpdateCheck()
-    {
-        _settings.UpdateCheckOnStartup = !_settings.UpdateCheckOnStartup;
-        UpdateChecks();
-        ShowOsd(_settings.UpdateCheckOnStartup
-            ? L.T("起動時の更新確認: オン")
-            : L.T("起動時の更新確認: オフ"));
-    }
-
-    /// <summary>
-    /// Look for a newer release and, with the user's consent, install it.
-    /// Communication only ever happens here — from an explicit menu action, or
-    /// from the once-a-day startup check the user can switch off.
-    /// </summary>
-    /// <param name="manual">True when the user asked; only then do we report
-    /// "no update" or a failed check. The startup check stays silent.</param>
-    private async Task CheckForUpdatesAsync(bool manual)
-    {
-        UpdateInfo? info;
-        try
-        {
-            info = await Updater.CheckAsync(_settings.UpdateApiUrl);
-        }
-        catch (Exception ex)
-        {
-            Log.Info("update check threw: " + ex.Message);
-            info = null;
-        }
-
-        _settings.LastUpdateCheckUtc = DateTime.UtcNow.ToString("o");
-
-        if (info == null)
-        {
-            if (manual)
+            switch (a.ToLowerInvariant())
             {
-                MessageBox.Show(this,
-                    L.F("現在のバージョンは {0} です。\n更新はありません。", Updater.CurrentVersion),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                case "--fullscreen": if (!_isFullscreen) EnterFullscreen(); break;
+                case "--borderless": if (!_isBorderless) ToggleBorderless(); break;
+                case "--topmost": if (!_alwaysOnTop) ToggleAlwaysOnTop(); break;
+                case "--muted": if (_audio.IsRunning && !_audio.Muted) ToggleMute(); break;
             }
-            return;
         }
-
-        if (IsDisposed) return;
-
-        var prompt = MessageBox.Show(this,
-            L.F("新しいバージョン {0} があります（現在 {1}）。\n\n今すぐ更新しますか？\n更新後、YuCap は自動的に再起動します。",
-                info.Version, Updater.CurrentVersion),
-            "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-        if (prompt != DialogResult.Yes) return;
-
-        // Under Program Files the swap cannot work; say so instead of failing
-        // halfway through.
-        if (!Updater.CanWriteToInstallDir())
-        {
-            if (MessageBox.Show(this,
-                    L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
-                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
-                OpenUrl(info.PageUrl);
-            return;
-        }
-
-        DownloadAndApply(info);
+        UpdateChecks();
+        ShowOsd(L.T("既に起動しています"));
     }
 
-    /// <summary>Synchronous by design: the progress dialog's own modal loop
-    /// drives the download, so there is nothing here to await.</summary>
-    private void DownloadAndApply(UpdateInfo info)
-    {
-        using var dlg = new Form
-        {
-            Text = L.T("更新をダウンロード中"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ControlBox = false,
-            ClientSize = new Size(380, 120),
-        };
-        var lbl = new Label
-        {
-            Text = L.F("{0} をダウンロードしています...", info.AssetName),
-            AutoSize = true,
-            Location = new Point(16, 18),
-        };
-        var bar = new ProgressBar { Location = new Point(16, 46), Size = new Size(348, 22), Maximum = 100 };
-        var cancelBtn = new Button { Text = L.T("キャンセル"), Location = new Point(274, 80), Width = 90 };
-        var cts = new CancellationTokenSource();
-        cancelBtn.Click += (_, _) => { cts.Cancel(); dlg.Close(); };
-        dlg.Controls.AddRange(new Control[] { lbl, bar, cancelBtn });
-
-        string? file = null;
-        Exception? failure = null;
-        var progress = new Progress<int>(p => { if (!dlg.IsDisposed) bar.Value = Math.Clamp(p, 0, 100); });
-
-        dlg.Shown += async (_, _) =>
-        {
-            try { file = await Updater.DownloadAsync(info, progress, cts.Token); }
-            catch (OperationCanceledException) { /* user cancelled */ }
-            catch (Exception ex) { failure = ex; }
-            finally { if (!dlg.IsDisposed) dlg.Close(); }
-        };
-        dlg.ShowDialog(this);
-        cts.Dispose();
-
-        if (failure != null)
-        {
-            MessageBox.Show(this, L.F("更新のダウンロードに失敗しました。\n\n{0}", failure.Message),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-        if (file == null) return;   // cancelled
-
-        try
-        {
-            // Save settings and release devices before the swap: the new process
-            // starts immediately and would otherwise fight over the capture card.
-            SaveSettings();
-            try { _video.Dispose(); } catch { /* ignore */ }
-            try { _audio.Dispose(); } catch { /* ignore */ }
-
-            Updater.Apply(file);      // rolls back internally if the swap fails
-            _skipSaveOnClose = true;  // settings already written above
-            Close();
-        }
-        catch (Exception ex)
-        {
-            Log.Info("update apply failed: " + ex.Message);
-            MessageBox.Show(this,
-                L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", ex.Message),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-    }
-
-    private void OpenUrl(string url)
-    {
-        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); }
-        catch (Exception ex) { Log.Info("open url failed: " + ex.Message); }
-    }
+    // ---- Update ----------------------------------------------------------
 
     // ---- Language --------------------------------------------------------
 
+    /// <summary>
+    /// Switch language and rebuild the menus in place. The menus are built in
+    /// code, so re-running the builders against the new language is enough —
+    /// no restart, which is what this used to demand.
+    /// </summary>
     private void SetLanguage(string lang)
     {
         if (_settings.Language == lang) return;
         _settings.Language = lang;
+        L.English = lang == "en";
         SaveSettings();
-        MessageBox.Show(this, L.T("言語を切り替えました。次回起動時に反映されます。"),
-            "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        RebuildMenus();
+        ShowOsd(lang == "en" ? "Language: English" : "言語: 日本語");
+    }
+
+    /// <summary>Discard and re-create every menu so new-language text is used.</summary>
+    private void RebuildMenus()
+    {
+        bool menuWasVisible = _menu.Visible;
+
+        // The builders append to these collections, so clear them first —
+        // otherwise every switch would leave the previous language's items
+        // behind and the check-state lists would grow without bound.
+        _menu.Items.Clear();
+        _ctx.Items.Clear();
+        _aspectItems.Clear();
+        _rotationItems.Clear();
+        _pipIdleItems.Clear();
+        _pipHoverItems.Clear();
+        _pipSizeItems.Clear();
+        _pipPosItems.Clear();
+        _cursorSecItems.Clear();
+
+        BuildMenu();
+        BuildContextMenu();
+        MainMenuStrip = _menu;
+        _menu.Visible = menuWasVisible;
+
+        UpdateChecks();
+        UpdateStatus();
+        LayoutCanvas();
     }
 
     // ---- Sleep inhibition ------------------------------------------------
@@ -2290,234 +1885,6 @@ public sealed class MainForm : Form, IMessageFilter
         LayoutCanvas();
     }
 
-    // ---- Snapshot --------------------------------------------------------
-
-    private string SnapshotDirectory =>
-        string.IsNullOrWhiteSpace(_settings.SnapshotDir)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CaptureViewer")
-            : _settings.SnapshotDir!;
-
-    /// <summary>Grab the current frame with the OSD hidden (the snapshot is a
-    /// compositor copy — a lingering bubble would be burned into the image).</summary>
-    private Bitmap? GrabFrame()
-    {
-        if (_osd.Visible)
-        {
-            _osdTimer.Stop();
-            _osd.Visible = false;
-            _osd.Update();
-        }
-        return _video.Snapshot();
-    }
-
-    private void SaveSnapshot()
-    {
-        if (SaveSnapshotCore(out string file))
-            ShowOsd(L.F("保存しました: {0}", file));
-    }
-
-    /// <summary>Save one snapshot; returns false (with OSD/dialog) on failure.
-    /// Shared by Ctrl+S, the global hotkey, and burst mode.</summary>
-    private bool SaveSnapshotCore(out string fileName)
-    {
-        fileName = string.Empty;
-        using Bitmap? frame = GrabFrame();
-        if (frame == null)
-        {
-            ShowOsd(L.T("映像がありません"));
-            return false;
-        }
-
-        try
-        {
-            string dir = SnapshotDirectory;
-            Directory.CreateDirectory(dir);
-            bool jpg = _settings.SnapshotFormat.Equals("jpg", StringComparison.OrdinalIgnoreCase);
-            // Milliseconds in the name so rapid consecutive shots never overwrite.
-            fileName = $"Capture_{DateTime.Now:yyyyMMdd_HHmmss_fff}.{(jpg ? "jpg" : "png")}";
-            string path = Path.Combine(dir, fileName);
-            if (jpg)
-            {
-                ImageCodecInfo codec = ImageCodecInfo.GetImageEncoders()
-                    .First(c => c.FormatID == ImageFormat.Jpeg.Guid);
-                using var ep = new EncoderParameters(1);
-                ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 92L);
-                frame.Save(path, codec, ep);
-            }
-            else
-            {
-                frame.Save(path, ImageFormat.Png);
-            }
-            return true;
-        }
-        catch (Exception ex)
-        {
-            ShowOsd(L.T("保存に失敗しました"));
-            MessageBox.Show(this, ex.Message, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return false;
-        }
-    }
-
-    private void CopySnapshotToClipboard()
-    {
-        using Bitmap? frame = GrabFrame();
-        if (frame == null)
-        {
-            ShowOsd(L.T("映像がありません"));
-            return;
-        }
-        try
-        {
-            Clipboard.SetImage(frame);
-            ShowOsd(L.T("クリップボードにコピーしました"));
-        }
-        catch
-        {
-            ShowOsd(L.T("コピーに失敗しました"));
-        }
-    }
-
-    private void OpenSnapshotFolder()
-    {
-        try
-        {
-            string dir = SnapshotDirectory;
-            Directory.CreateDirectory(dir);
-            System.Diagnostics.Process.Start("explorer.exe", dir);
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, ex.Message, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-    }
-
-    private void ShowSnapshotSettings()
-    {
-        using var dlg = new Form
-        {
-            Text = L.T("スナップショット設定"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(420, 150),
-        };
-
-        var lblDir = new Label { Text = L.T("保存先:"), AutoSize = true, Location = new Point(16, 20) };
-        var txtDir = new TextBox
-        {
-            Text = SnapshotDirectory,
-            ReadOnly = true,
-            Location = new Point(80, 16),
-            Width = 240,
-        };
-        var browse = new Button { Text = L.T("参照..."), Location = new Point(328, 14), Width = 76 };
-        browse.Click += (_, _) =>
-        {
-            using var fb = new FolderBrowserDialog
-            {
-                Description = L.T("スナップショットの保存先フォルダ"),
-                SelectedPath = SnapshotDirectory,
-                ShowNewFolderButton = true,
-            };
-            if (fb.ShowDialog(dlg) == DialogResult.OK) txtDir.Text = fb.SelectedPath;
-        };
-
-        var lblFmt = new Label { Text = L.T("形式:"), AutoSize = true, Location = new Point(16, 62) };
-        var cmbFmt = new ComboBox
-        {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Location = new Point(80, 58),
-            Width = 140,
-        };
-        cmbFmt.Items.AddRange(new object[] { L.T("PNG (無劣化)"), L.T("JPEG (高画質)") });
-        cmbFmt.SelectedIndex =
-            _settings.SnapshotFormat.Equals("jpg", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
-
-        var reset = new Button { Text = L.T("既定に戻す"), Location = new Point(16, 108), Width = 100 };
-        reset.Click += (_, _) =>
-        {
-            txtDir.Text = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CaptureViewer");
-            cmbFmt.SelectedIndex = 0;
-        };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(224, 108), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(315, 108), Width = 90 };
-
-        dlg.Controls.AddRange(new Control[] { lblDir, txtDir, browse, lblFmt, cmbFmt, reset, ok, cancel });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
-
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-
-        string defDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CaptureViewer");
-        _settings.SnapshotDir = string.Equals(txtDir.Text, defDir, StringComparison.OrdinalIgnoreCase)
-            ? null : txtDir.Text;
-        _settings.SnapshotFormat = cmbFmt.SelectedIndex == 1 ? "jpg" : "png";
-        SaveSettings();
-        ShowOsd(L.F("スナップショット: {0}", cmbFmt.SelectedIndex == 1 ? "JPEG" : "PNG"));
-    }
-
-    // ---- About -----------------------------------------------------------
-
-    private void ShowAbout()
-    {
-        string ver = Application.ProductVersion;
-        int plus = ver.IndexOf('+'); // strip build metadata if present
-        if (plus > 0) ver = ver[..plus];
-
-        using var dlg = new Form
-        {
-            Text = L.T("バージョン情報"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(380, 240),
-        };
-
-        var pic = new PictureBox
-        {
-            Location = new Point(20, 20),
-            Size = new Size(48, 48),
-            SizeMode = PictureBoxSizeMode.StretchImage,
-        };
-        try { pic.Image = Icon?.ToBitmap(); } catch { /* no icon */ }
-
-        var title = new Label
-        {
-            Text = "YuCap - キャプチャビューア",
-            Font = new Font("Segoe UI", 13f, FontStyle.Bold),
-            AutoSize = true,
-            Location = new Point(80, 22),
-        };
-        var version = new Label
-        {
-            Text = L.F("バージョン {0}", ver) + "\n© 2026 YUGO",
-            AutoSize = true,
-            Location = new Point(82, 50),
-        };
-        var libs = new Label
-        {
-            Text = L.T("使用ライブラリ:") + "\n" +
-                   "  ・Windows Media Foundation (Capture Engine)\n" +
-                   "  ・NAudio — MIT License\n" +
-                   "  ・Vortice.MediaFoundation — MIT License",
-            AutoSize = true,
-            Location = new Point(20, 96),
-        };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(280, 198), Width = 85 };
-
-        dlg.Controls.AddRange(new Control[] { pic, title, version, libs, ok });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = ok;
-        dlg.ShowDialog(this);
-        pic.Image?.Dispose();
-    }
-
     // ---- Device / mode switching ----------------------------------------
 
     private void RebuildVideoDeviceList()
@@ -2760,6 +2127,15 @@ public sealed class MainForm : Form, IMessageFilter
 
     protected override void WndProc(ref Message m)
     {
+        // A second launch handed us its command line instead of failing.
+        if (m.Msg == SingleInstance.WmCopyData)
+        {
+            string[]? forwarded = SingleInstance.ReadForwardedArgs(m.LParam);
+            if (forwarded != null) ApplyForwardedArgs(forwarded);
+            m.Result = (IntPtr)1;
+            return;
+        }
+
         // Hot-plug: debounce the burst of WM_DEVICECHANGE messages, then rescan.
         if (m.Msg == WmDeviceChange)
         {
@@ -2974,6 +2350,15 @@ public sealed class MainForm : Form, IMessageFilter
         _miHotkeys.Checked = _settings.GlobalHotkeys;
         _miCursorHide.Checked = _settings.CursorAutoHide;
         _miUpdateCheck.Checked = _settings.UpdateCheckOnStartup;
+
+        // Burst mode is started and stopped by the same menu item; say which.
+        _miBurst.Text = _burstTimer.Enabled
+            ? L.F("連写を停止 ({0}/{1})", _burstDone, _burstTotal)
+            : L.T("連写スナップショット...");
+
+        // Every state toggle funnels through here, so this is the one place
+        // that reliably catches "something the user changed" for persistence.
+        MarkSettingsDirty();
         foreach (var item in _cursorSecItems)
             item.Checked = _settings.CursorAutoHide && (int)item.Tag! == _settings.CursorHideSeconds;
         foreach (var item in _pipIdleItems)
@@ -3032,6 +2417,14 @@ public sealed class MainForm : Form, IMessageFilter
             case Keys.Space:
                 ToggleFreeze();
                 return true;
+            // Volume from the keyboard, matching the wheel's step. Handy in
+            // fullscreen, where the pointer is hidden anyway.
+            case Keys.Up:
+                NudgeVolume(+VolumeStep);
+                return true;
+            case Keys.Down:
+                NudgeVolume(-VolumeStep);
+                return true;
             case Keys.Escape:
                 if (_isFullscreen) { ExitFullscreen(); return true; }
                 break;
@@ -3053,6 +2446,7 @@ public sealed class MainForm : Form, IMessageFilter
             _resumeTimer.Dispose();
             _resizeGuard.Dispose();
             _cursorTimer.Dispose();
+            _settingsSaveTimer.Dispose();
             ShowCursorIfHidden();   // belt and braces: Cursor.Hide() is process-wide
         }
         base.Dispose(disposing);

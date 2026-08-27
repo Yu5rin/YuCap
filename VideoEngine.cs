@@ -94,6 +94,16 @@ public sealed class VideoEngine : IDisposable
     private SinkSession? _session;
     private bool _reqValid;
 
+    // Photo sink, created lazily on the first snapshot and torn down with the
+    // engine. Serialised: TakePhoto is a single-shot operation on the engine.
+    private readonly object _photoLock = new();
+    private IMFCapturePhotoSink? _photoSink;
+    private PhotoReceiver? _photoReceiver;
+    /// <summary>Set once the photo path proves unusable on this device, so
+    /// snapshots go straight to the screen-copy fallback instead of paying the
+    /// setup cost and timeout on every shot.</summary>
+    private bool _photoUnavailable;
+
     public string? CurrentDeviceName { get; private set; }
     public Size CurrentResolution { get; private set; }
     public CaptureMode? CurrentMode { get; private set; }
@@ -339,12 +349,22 @@ public sealed class VideoEngine : IDisposable
             }
         }
 
+        lock (_photoLock)
+        {
+            SafeRelease(_photoSink);
+            _photoSink = null;
+            _photoReceiver?.Reset();
+            _photoReceiver = null;
+            _photoUnavailable = false;   // re-probe against the next device
+        }
+
         _sink = null;
         _source = null;
         _engine = null;
 
         _callback?.Initialized.Dispose();
         _callback?.PreviewStarted.Dispose();
+        _callback?.PhotoTaken.Dispose();
         _callback = null;
 
         CurrentDeviceName = null;
@@ -690,10 +710,184 @@ public sealed class VideoEngine : IDisposable
     }
 
     /// <summary>
+    /// Capture a frame at the source's own resolution using the capture engine's
+    /// photo sink. Unlike the screen-copy fallback this is independent of the
+    /// window: full sensor resolution, nothing overlapping it, and correct even
+    /// when the window is small, minimised or covered.
+    /// Returns null if the photo path is unavailable, so callers can fall back.
+    /// </summary>
+    public Bitmap? PhotoSnapshot(int timeoutMs = 4000)
+    {
+        IMFCaptureEngine? engine = _engine;
+        CaptureEventCallback? cb = _callback;
+        if (engine == null || cb == null) return null;
+        if (_photoUnavailable) return null;   // probed once and found wanting
+
+        lock (_photoLock)
+        {
+            try
+            {
+                if (!EnsurePhotoSink(engine)) { _photoUnavailable = true; return null; }
+
+                _photoReceiver!.Reset();
+                cb.PhotoTaken.Reset();
+                cb.LastPhotoHr = 0;
+
+                int hr = engine.TakePhoto();
+                if (hr < 0) { Log.Info($"photo: TakePhoto failed hr=0x{hr:X}"); return null; }
+
+                // Wait on the delivered sample rather than the PHOTO_TAKEN
+                // event: the frame itself is the thing we need, and waiting for
+                // it keeps this working regardless of which completion events a
+                // given driver raises.
+                Bitmap? bmp = _photoReceiver.TakeBitmap(timeoutMs);
+                if (bmp == null)
+                {
+                    Log.Info(cb.LastPhotoHr < 0
+                        ? $"photo: capture reported hr=0x{cb.LastPhotoHr:X}"
+                        : "photo: no sample delivered before the timeout");
+                }
+                return bmp;
+            }
+            catch (Exception ex)
+            {
+                Log.Info("photo: " + ex.Message);
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Create the photo sink on first use and wire up the receiver. A capture
+    /// card usually has no dedicated photo pin, so the preferred-photo stream
+    /// fails with MF_E_INVALIDSTREAMNUMBER; the video streams are tried next so
+    /// the still is taken from the same pin the preview uses.
+    /// </summary>
+    private bool EnsurePhotoSink(IMFCaptureEngine engine)
+    {
+        if (_photoSink != null && _photoReceiver != null) return true;
+        if (_source == null) return false;
+
+        engine.GetSink(Mf.SinkTypePhoto, out IntPtr sinkPtr);
+        if (sinkPtr == IntPtr.Zero) return false;
+        var sink = (IMFCapturePhotoSink)Marshal.GetObjectForIUnknown(sinkPtr);
+        Marshal.Release(sinkPtr);
+
+        foreach (int stream in new[] { Mf.PreferredPhotoStream, Mf.PreferredPreviewStream, Mf.FirstVideoStream })
+        {
+            ulong frameSize;
+            try
+            {
+                using IMFMediaType src = _source.GetCurrentDeviceMediaType(stream);
+                frameSize = src.GetUInt64(MediaTypeAttributeKeys.FrameSize);
+            }
+            catch (Exception ex)
+            {
+                Log.Info($"photo: stream 0x{stream:X} unusable — {ex.Message.Split('\n')[0]}");
+                continue;
+            }
+
+            int w = (int)(frameSize >> 32), h = (int)(frameSize & 0xFFFFFFFF);
+            if (w <= 0 || h <= 0) continue;
+
+            // Uncompressed RGB32 at the source's frame size, so the delivered
+            // buffer maps straight onto a Bitmap with no decoding.
+            using IMFMediaType outType = MediaFactory.MFCreateMediaType();
+            outType.Set(MediaTypeAttributeKeys.MajorType, Mf.MFMediaTypeVideo);
+            outType.Set(MediaTypeAttributeKeys.Subtype, Mf.MFVideoFormatRGB32);
+            outType.Set(MediaTypeAttributeKeys.FrameSize, frameSize);
+
+            sink.RemoveAllStreams();
+            int hrAdd = sink.AddStream(stream, outType.NativePointer, IntPtr.Zero, out int _);
+            if (hrAdd < 0)
+            {
+                Log.Info($"photo: AddStream on 0x{stream:X} failed hr=0x{hrAdd:X}");
+                continue;
+            }
+
+            var receiver = new PhotoReceiver(w, h);
+            int hrCb = sink.SetSampleCallback(receiver);
+            if (hrCb < 0)
+            {
+                Log.Info($"photo: SetSampleCallback failed hr=0x{hrCb:X}");
+                continue;
+            }
+
+            _photoSink = sink;
+            _photoReceiver = receiver;
+            Log.Info($"photo: sink ready on stream 0x{stream:X} at {w}x{h} RGB32");
+            return true;
+        }
+
+        Log.Info("photo: no usable stream for the photo sink");
+        SafeRelease(sink);
+        return false;
+    }
+
+    /// <summary>
+    /// Turns the delivered photo sample into a Bitmap. The buffer arrives on an
+    /// MF thread, so the frame is handed over through an event rather than being
+    /// touched directly by the caller.
+    /// </summary>
+    [ClassInterface(ClassInterfaceType.None)]
+    private sealed class PhotoReceiver : IMFCaptureEngineOnSampleCallback
+    {
+        private readonly int _width, _height;
+        private readonly ManualResetEventSlim _ready = new(false);
+        private Bitmap? _frame;
+
+        public PhotoReceiver(int width, int height) { _width = width; _height = height; }
+
+        public void Reset()
+        {
+            _ready.Reset();
+            Bitmap? old = Interlocked.Exchange(ref _frame, null);
+            old?.Dispose();
+        }
+
+        public Bitmap? TakeBitmap(int timeoutMs)
+        {
+            if (!_ready.Wait(timeoutMs)) return null;
+            return Interlocked.Exchange(ref _frame, null);
+        }
+
+        public int OnSample(IntPtr sample)
+        {
+            try
+            {
+                if (sample == IntPtr.Zero) return 0;
+                Marshal.AddRef(sample);
+                using var s = (IMFSample)sample;
+                using IMFMediaBuffer buffer = s.ConvertToContiguousBuffer();
+
+                buffer.Lock(out IntPtr scan0, out _, out int length);
+                try
+                {
+                    // RGB32 rows arrive bottom-up; a negative stride flips them.
+                    int stride = _width * 4;
+                    if (length < stride * _height) return 0;
+                    using var src = new Bitmap(_width, _height, -stride,
+                        PixelFormat.Format32bppRgb, scan0 + stride * (_height - 1));
+                    var copy = new Bitmap(src);   // detach from the MF buffer
+                    Bitmap? old = Interlocked.Exchange(ref _frame, copy);
+                    old?.Dispose();
+                }
+                finally { buffer.Unlock(); }
+
+                _ready.Set();
+            }
+            catch (Exception ex) { Log.Info("photo receiver: " + ex.Message); }
+            return 0;
+        }
+    }
+
+    /// <summary>
     /// Snapshot the displayed video by copying the composited screen region of
     /// the render window. PrintWindow cannot capture the D3D/EVR surface, so the
     /// compositor copy is used. Resolution follows the window; the window must be
-    /// visible and unobscured.
+    /// visible and unobscured. Used as the fallback when the photo sink is
+    /// unavailable, and for the freeze-frame overlay which wants exactly what is
+    /// on screen.
     /// </summary>
     public Bitmap? Snapshot(bool cropToVideo = true)
     {

@@ -99,12 +99,18 @@ internal static class Program
         ParseOptions(args);
 
         // The capture device is exclusive — a second instance could only fail to
-        // open it (or steal it), so allow one instance at a time.
+        // open it (or steal it), so allow one instance at a time. Rather than
+        // just refusing, bring the existing window forward: launching an app and
+        // getting only an error box reads as "it didn't start".
         using var single = new System.Threading.Mutex(true, @"Local\YuCap.SingleInstance", out bool first);
         if (!first)
         {
-            MessageBox.Show("YuCap は既に起動しています。", "YuCap",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Log.Info("second instance — activating the existing window");
+            if (!SingleInstance.ActivateExisting(args))
+            {
+                MessageBox.Show("YuCap は既に起動しています。", "YuCap",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
             return;
         }
 
@@ -268,6 +274,17 @@ internal static class Program
                     t.Stop();
                     log.Add($"windowed: {VerifyVideo(engine)}");
 
+                    // The photo sink should hand back the source resolution,
+                    // not the (much smaller) window size the screen copy gives.
+                    using (Bitmap? photo = engine.PhotoSnapshot())
+                    {
+                        log.Add(photo == null
+                            ? "PHOTO SINK: unavailable (falls back to screen copy)"
+                            : $"PHOTO SINK: {photo.Width}x{photo.Height}" +
+                              $" (source is {engine.CurrentResolution.Width}x{engine.CurrentResolution.Height})" +
+                              $" center={photo.GetPixel(photo.Width / 2, photo.Height / 2)}");
+                    }
+
                     // Reproduce the operation that used to deadlock: go
                     // borderless-fullscreen and push a full-screen video rect.
                     // The UI thread must stay responsive throughout.
@@ -297,6 +314,26 @@ internal static class Program
                         pump.Stop();
                         log.Add($"worst UI stall during resize: {worstGap}ms (deadlock would be thousands)");
                         log.Add($"FULLSCREEN: {VerifyVideo(engine)}");
+
+                        // Rotation goes through the preview sink's vtable, which
+                        // is easy to break silently when the interop shifts.
+                        log.Add("--- rotation / mirror ---");
+                        foreach (int deg in new[] { 90, 180, 0 })
+                        {
+                            bool okRot = engine.SetRotation(deg);
+                            log.Add($"  rotate {deg}° → {(okRot ? "ok" : "unsupported")}"
+                                  + $"  reported={engine.Rotation}°"
+                                  + $"  display={engine.DisplayResolution.Width}x{engine.DisplayResolution.Height}");
+                        }
+                        log.Add($"  mirror on → {(engine.SetMirror(true) ? "ok" : "unsupported")}");
+                        engine.SetMirror(false);
+
+                        // Version ordering drives the updater; a string compare
+                        // would rank 1.0.10 below 1.0.9 and strand users there.
+                        log.Add("--- version ordering ---");
+                        log.Add($"  current={Updater.CurrentVersion}"
+                              + $"  1.0.9<1.0.10={new Version(1, 0, 9) < new Version(1, 0, 10)}"
+                              + $"  1.0.2<1.1.0={new Version(1, 0, 2) < new Version(1, 1, 0)}");
 
                         // Exercise the real wedge-recovery action, including the
                         // window recreation that DirectComposition requires:

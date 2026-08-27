@@ -70,6 +70,21 @@ YuCap.exe --selftest <出力パス>
 - **`SetWindowPos(SWP_NOMOVE|NOSIZE|FRAMECHANGED)` の後は `UpdateBounds()` が必要。**
   WinForms の ClientSize キャッシュが古いままになり、レイアウトがずれる。
 
+## UI文字列を変更するときは Strings.cs も直す
+
+`Strings.cs` は**日本語の文字列そのものを辞書のキー**にしている。日本語側を書き換えると
+キーが一致しなくなり、**英語UIが黙ってその行だけ日本語に戻る**（ビルドは通るので気づけない）。
+
+- 日本語文言を変えたら、`Strings.cs` の対応するキーも同じ内容に変えること
+- UI文字列を新規追加したら、`Strings.cs` に英訳を追加すること
+- `L.T()` / `L.F()` を通さない生の日本語をUIに書かないこと
+
+## バージョンを上げるときは3か所そろえる
+
+`YuCap.csproj` の `<Version>`、`CHANGELOG.md` の見出し、git タグ（`vX.Y.Z`）。
+リリースのCIはタグと `<Version>` の不一致を検出して失敗する（更新機能がバージョン比較で
+動くため、ここがずれると更新が適用されたのに再通知され続ける）。
+
 ## 診断
 
 - `%APPDATA%\YuCap\yucap.log` — 動作ログ（UIスレッド監視つき）

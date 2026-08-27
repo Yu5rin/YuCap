@@ -52,6 +52,12 @@ public sealed class AppSettings
     public string UpdateApiUrl { get; set; } = "https://api.github.com/repos/Yu5rin/YuCap/releases/latest";
     /// <summary>Recorded for diagnostics only — the startup check is not throttled.</summary>
     public string? LastUpdateCheckUtc { get; set; }
+    /// <summary>A version the user declined; not offered again until a newer one appears.</summary>
+    public string? SkippedUpdateVersion { get; set; }
+    /// <summary>Version that produced the "what's new" notice, so it shows once.</summary>
+    public string? LastRunVersion { get; set; }
+    /// <summary>Hotkey combos already reported as conflicting, to warn only once.</summary>
+    public string? HotkeyConflictNotified { get; set; }
 
     // Behavior.
     public bool CursorAutoHide { get; set; } = true;

@@ -21,9 +21,24 @@ internal static class Mf
     public static readonly Guid EventPreviewStarted = new("a416df21-f9d3-4a74-991b-b817298952c4");
     public static readonly Guid EventError = new("46b89fc6-33cc-4399-9dad-784de77d587c");
 
+    public static readonly Guid EventPhotoTaken = new("3c50c445-7304-48eb-8656-51c6b7a4a1a1");
+
+    public const int SinkTypeRecord = 0;
     public const int SinkTypePreview = 1;
+    public const int SinkTypePhoto = 2;
     // MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_VIDEO_PREVIEW
     public const int PreferredPreviewStream = unchecked((int)0xFFFFFFFA);
+    // MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_PHOTO. Capture cards
+    // generally have no dedicated still-image pin, so the photo sink has to be
+    // fed from a video stream instead — see the candidate list in VideoEngine.
+    public const int PreferredPhotoStream = unchecked((int)0xFFFFFFFB);
+    // MF_CAPTURE_ENGINE_FIRST_SOURCE_VIDEO_STREAM
+    public const int FirstVideoStream = unchecked((int)0xFFFFFFFC);
+
+    // Uncompressed 32-bit RGB — what the photo sink is asked to produce so the
+    // bytes can be turned into a Bitmap without decoding anything.
+    public static readonly Guid MFMediaTypeVideo = new("73646976-0000-0010-8000-00AA00389B71");
+    public static readonly Guid MFVideoFormatRGB32 = new("00000016-0000-0010-8000-00AA00389B71");
 
     [DllImport("ole32.dll")]
     public static extern int CoCreateInstance(ref Guid clsid, IntPtr outer, int context,
@@ -98,6 +113,38 @@ internal sealed class MFVideoNormalizedRect
 }
 
 /// <summary>
+/// The photo sink, used for snapshots at the source's own resolution. The
+/// preview-window copy that snapshots used before is limited to the on-screen
+/// size and picks up anything overlapping the window; this path takes the frame
+/// from the capture pipeline itself.
+/// </summary>
+[ComImport, Guid("d2d43cc8-48bb-4aa7-95db-10c06977e777"),
+ InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMFCapturePhotoSink
+{
+    // --- IMFCaptureSink ---
+    [PreserveSig] int GetOutputMediaType(int stream, out IntPtr mediaType);
+    [PreserveSig] int GetService(int stream, ref Guid service, ref Guid riid, out IntPtr unknown);
+    [PreserveSig] int AddStream(int sourceStream, IntPtr mediaType, IntPtr attributes, out int sinkStream);
+    [PreserveSig] int Prepare();
+    [PreserveSig] int RemoveAllStreams();
+    // --- IMFCapturePhotoSink ---
+    [PreserveSig] int SetOutputFileName([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+    [PreserveSig] int SetSampleCallback(IMFCaptureEngineOnSampleCallback callback);
+    [PreserveSig] int SetOutputByteStream(IntPtr byteStream);
+}
+
+/// <summary>Receives the photo frame. Unlike the preview stream — where a
+/// sample callback steals frames from the renderer — this is the photo sink's
+/// intended delivery mechanism.</summary>
+[ComImport, Guid("52150b82-ab39-4467-980f-e48bf0822ecd"),
+ InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMFCaptureEngineOnSampleCallback
+{
+    [PreserveSig] int OnSample(IntPtr sample);
+}
+
+/// <summary>
 /// Managed implementation of the capture engine event callback. Signals the
 /// initialized/preview-started events so the (synchronous) startup code can wait.
 /// </summary>
@@ -106,7 +153,9 @@ internal sealed class CaptureEventCallback : IMFCaptureEngineOnEventCallback
 {
     public readonly ManualResetEventSlim Initialized = new(false);
     public readonly ManualResetEventSlim PreviewStarted = new(false);
+    public readonly ManualResetEventSlim PhotoTaken = new(false);
     public volatile int LastHr;
+    public volatile int LastPhotoHr;
 
     public int OnEvent(IntPtr mediaEvent)
     {
@@ -120,11 +169,17 @@ internal sealed class CaptureEventCallback : IMFCaptureEngineOnEventCallback
 
             if (ext == Mf.EventInitialized) Initialized.Set();
             else if (ext == Mf.EventPreviewStarted) PreviewStarted.Set();
+            else if (ext == Mf.EventPhotoTaken)
+            {
+                LastPhotoHr = hr;
+                PhotoTaken.Set();
+            }
             else if (ext == Mf.EventError)
             {
                 if (LastHr == 0) LastHr = -1;
                 Initialized.Set();
                 PreviewStarted.Set();
+                PhotoTaken.Set();
             }
         }
         catch { /* never throw back into COM */ }
