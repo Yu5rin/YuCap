@@ -21,6 +21,11 @@ internal sealed record UpdateInfo(
     string? Sha256,
     string PageUrl);
 
+/// <summary>Outcome of an update check. Info != null means a newer release
+/// exists; Error != null means the check could not be completed; both null
+/// means the running build is current.</summary>
+internal sealed record UpdateCheckResult(UpdateInfo? Info, string? Error);
+
 /// <summary>
 /// Checks GitHub Releases for a newer build, downloads it, and replaces the
 /// running executable.
@@ -44,11 +49,30 @@ internal static class Updater
 
     private static HttpClient CreateClient()
     {
-        var c = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        // A manual check blocks the user's menu action; a couple of retries at
+        // 30s each would read as a hang rather than "checking".
+        var c = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
         // GitHub rejects requests without a User-Agent.
         c.DefaultRequestHeaders.UserAgent.ParseAdd("YuCap-Updater");
         c.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         return c;
+    }
+
+    /// <summary>
+    /// Hosts allowed for both the release-check endpoint and the asset download
+    /// URL. The release response carries the SHA256 we verify the download
+    /// against, so if an arbitrary host could serve that response, it could
+    /// supply a malicious exe and a matching hash in the same breath — the
+    /// verification would prove nothing. Restricting both to GitHub's own
+    /// hosts keeps the hash check meaningful.
+    /// </summary>
+    private static bool IsTrustedHost(Uri uri)
+    {
+        string host = uri.Host;
+        return host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase)
+            || host.Equals("github.com", StringComparison.OrdinalIgnoreCase)
+            || host.Equals("objects.githubusercontent.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Version of the running build, ignoring any build metadata.</summary>
@@ -64,18 +88,27 @@ internal static class Updater
     }
 
     /// <summary>
-    /// Ask GitHub for the latest release. Returns null when the check fails or
-    /// nothing newer exists — a failed check must never interrupt the user.
+    /// Ask GitHub for the latest release. A null Info with a null Error means
+    /// the running build is current; a null Info with a non-null Error means
+    /// the check itself could not be completed (offline, rate-limited, refused
+    /// endpoint) — the two must not be conflated, or an offline user gets told
+    /// "no updates" when the truth is "couldn't tell".
     /// </summary>
-    public static async Task<UpdateInfo?> CheckAsync(string apiUrl, CancellationToken ct = default)
+    public static async Task<UpdateCheckResult> CheckAsync(string apiUrl, CancellationToken ct = default)
     {
         // The endpoint is user-editable in settings.json; refuse anything that
-        // would send the check (and the download link it returns) in the clear.
+        // would send the check (and the download link it returns) in the clear,
+        // or to a host other than GitHub's own (see IsTrustedHost).
         if (!Uri.TryCreate(apiUrl, UriKind.Absolute, out Uri? uri)
             || uri.Scheme != Uri.UriSchemeHttps)
         {
             Log.Info($"update: refusing non-HTTPS endpoint '{apiUrl}'");
-            return null;
+            return new UpdateCheckResult(null, L.T("更新の確認先が不正です。"));
+        }
+        if (!IsTrustedHost(uri))
+        {
+            Log.Info($"update: refusing untrusted endpoint host '{uri.Host}'");
+            return new UpdateCheckResult(null, L.T("更新の確認先が不正です。"));
         }
 
         try
@@ -85,21 +118,26 @@ internal static class Updater
             JsonElement root = doc.RootElement;
 
             string tag = root.TryGetProperty("tag_name", out JsonElement t) ? t.GetString() ?? "" : "";
-            if (!TryParseTag(tag, out Version? parsedTag) || parsedTag == null) return null;
+            if (!TryParseTag(tag, out Version? parsedTag) || parsedTag == null)
+                return new UpdateCheckResult(null, L.T("最新リリースの情報を解釈できませんでした。"));
             Version latest = parsedTag;
 
             // Numeric comparison — a string compare would rank 1.0.10 below 1.0.9.
             if (latest <= CurrentVersion)
             {
                 Log.Info($"update: up to date (current {CurrentVersion}, latest {latest})");
-                return null;
+                return new UpdateCheckResult(null, null);
             }
 
             string page = root.TryGetProperty("html_url", out JsonElement h) ? h.GetString() ?? "" : "";
             string body = root.TryGetProperty("body", out JsonElement b) ? b.GetString() ?? "" : "";
 
             // Pick the .exe asset.
-            if (!root.TryGetProperty("assets", out JsonElement assets)) return null;
+            if (!root.TryGetProperty("assets", out JsonElement assets))
+            {
+                Log.Info("update: release has no assets array");
+                return new UpdateCheckResult(null, null);
+            }
             foreach (JsonElement a in assets.EnumerateArray())
             {
                 string name = a.TryGetProperty("name", out JsonElement n) ? n.GetString() ?? "" : "";
@@ -110,6 +148,14 @@ internal static class Updater
                 if (!url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 {
                     Log.Info("update: asset URL is not HTTPS — ignoring");
+                    continue;
+                }
+                // Same trust requirement as the check endpoint: the SHA256 we
+                // verify against comes from this same response, so an asset
+                // hosted anywhere else would make that verification meaningless.
+                if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? assetUri) || !IsTrustedHost(assetUri))
+                {
+                    Log.Info($"update: asset URL host not trusted — ignoring ({url})");
                     continue;
                 }
                 long size = a.TryGetProperty("size", out JsonElement s) ? s.GetInt64() : 0;
@@ -126,14 +172,16 @@ internal static class Updater
                 sha ??= FindSha256InNotes(body);
 
                 Log.Info($"update: {CurrentVersion} → {latest} ({name}, {size} bytes, sha256={(sha == null ? "none" : "yes")})");
-                return new UpdateInfo(latest, tag, url, name, size, sha, page);
+                return new UpdateCheckResult(new UpdateInfo(latest, tag, url, name, size, sha, page), null);
             }
-            return null;
+            // No usable .exe asset — not something the user can act on, just log it.
+            Log.Info("update: no usable .exe asset found on latest release");
+            return new UpdateCheckResult(null, null);
         }
         catch (Exception ex)
         {
             Log.Info("update check failed: " + ex.Message);
-            return null;   // offline, rate-limited, malformed — all just "couldn't check"
+            return new UpdateCheckResult(null, ex.Message);
         }
     }
 
@@ -200,7 +248,7 @@ internal static class Updater
             {
                 DiscardStaging();
                 Log.Info($"update: SHA256 mismatch (expected {info.Sha256}, got {actual})");
-                throw new InvalidDataException("ダウンロードしたファイルの検証に失敗しました。");
+                throw new InvalidDataException(L.T("ダウンロードしたファイルの検証に失敗しました。"));
             }
             Log.Info("update: SHA256 verified");
         }
@@ -246,7 +294,7 @@ internal static class Updater
     public static void Apply(string downloadedExe)
     {
         string? cur = ExePath;
-        if (cur == null) throw new InvalidOperationException("実行ファイルの場所を特定できません。");
+        if (cur == null) throw new InvalidOperationException(L.T("実行ファイルの場所を特定できません。"));
         string old = cur + OldSuffix;
 
         // A leftover from a previous update would block the rename.

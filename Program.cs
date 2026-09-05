@@ -32,6 +32,12 @@ internal static class Program
         Log.Init();
         if (args.Length > 0) Log.Info("args: " + string.Join(" ", args));
 
+        // The diagnostic and error paths below (--help, --check-update, the
+        // "already running" notice, the crash dialog) can show a MessageBox
+        // before MainForm ever runs, so the UI language must be loaded now —
+        // otherwise an English-configured user sees Japanese in those dialogs.
+        L.English = SettingsStore.Load().Language == "en";
+
         // Crash log: keep evidence in %APPDATA%\YuCap\error.log even after the
         // dialog is dismissed.
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
@@ -53,11 +59,21 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--check-update")
         {
             AppSettings s = SettingsStore.Load();
-            UpdateInfo? info = Updater.CheckAsync(s.UpdateApiUrl).GetAwaiter().GetResult();
-            string msg = info == null
-                ? $"現在: {Updater.CurrentVersion}\n更新はありません（または確認できませんでした）。\n\nエンドポイント:\n{s.UpdateApiUrl}"
-                : $"現在: {Updater.CurrentVersion}\n最新: {info.Version} ({info.TagName})\n\n{info.AssetName}  {info.Size:N0} bytes\nSHA256: {info.Sha256 ?? "(なし)"}\n{info.DownloadUrl}";
-            MessageBox.Show(msg, "YuCap - 更新確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            UpdateCheckResult result = Updater.CheckAsync(s.UpdateApiUrl).GetAwaiter().GetResult();
+            // Three distinct outcomes, not two: a failed check must not read as
+            // "you're up to date" — that would hide a broken endpoint from the
+            // one command meant to diagnose it.
+            string msg = result.Error != null
+                ? L.F("現在: {0}\n更新の確認に失敗しました。\n\n{1}\n\nエンドポイント:\n{2}",
+                    Updater.CurrentVersion, result.Error, s.UpdateApiUrl)
+                : result.Info == null
+                    ? L.F("現在: {0}\n更新はありません。\n\nエンドポイント:\n{1}",
+                        Updater.CurrentVersion, s.UpdateApiUrl)
+                    : L.F("現在: {0}\n最新: {1} ({2})\n\n{3}  {4} bytes\nSHA256: {5}\n{6}",
+                        Updater.CurrentVersion, result.Info.Version, result.Info.TagName,
+                        result.Info.AssetName, result.Info.Size.ToString("N0"),
+                        result.Info.Sha256 ?? L.T("なし"), result.Info.DownloadUrl);
+            MessageBox.Show(msg, "YuCap - " + L.T("更新確認"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -82,17 +98,17 @@ internal static class Program
         if (args.Contains("--help") || args.Contains("-h") || args.Contains("/?"))
         {
             MessageBox.Show(
-                "YuCap コマンドラインオプション:\n\n" +
+                L.T("YuCap コマンドラインオプション:\n\n" +
                 "  --fullscreen        全画面で起動\n" +
                 "  --borderless        ウィンドウ枠なしで起動\n" +
                 "  --topmost           常に前面で起動\n" +
                 "  --muted             ミュートで起動\n" +
-                "  --volume <0-200>    音量を指定\n" +
+                "  --volume <0-500>    音量を指定\n" +
                 "  --mode <指定>       映像モード指定\n" +
                 "                      例: 1080p120 / 1440p60 / 1920x1080@120\n" +
                 "  --list-formats [出力先]   対応フォーマットを書き出して終了\n" +
                 "  --selftest [出力先]       自己診断を実行して終了\n" +
-                "  --check-update      更新の有無を確認して終了",
+                "  --check-update      更新の有無を確認して終了"),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -108,7 +124,7 @@ internal static class Program
             Log.Info("second instance — activating the existing window");
             if (!SingleInstance.ActivateExisting(args))
             {
-                MessageBox.Show("YuCap は既に起動しています。", "YuCap",
+                MessageBox.Show(L.T("YuCap は既に起動しています。"), "YuCap",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             return;
@@ -122,7 +138,12 @@ internal static class Program
         Application.ThreadException += (s, e) =>
         {
             LogCrash(e.Exception);
-            MessageBox.Show(e.Exception.Message, "YuCap - エラー",
+            // Describe(), not e.Exception.Message: the raw message can be a bare
+            // HRESULT string (e.g. "Exception from HRESULT: 0xC00D3E85"), which
+            // means nothing to a user. Full detail still goes to error.log below.
+            MessageBox.Show(
+                L.F("予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。", Errors.Describe(e.Exception)),
+                "YuCap - " + L.T("エラー"),
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         };
 
@@ -142,7 +163,7 @@ internal static class Program
                 case "--muted": Options.Muted = true; break;
                 case "--volume":
                     if (i + 1 < args.Length && int.TryParse(args[++i], out int v))
-                        Options.Volume = Math.Clamp(v, 0, 200);
+                        Options.Volume = Math.Clamp(v, 0, AudioEngine.MaxVolumePercent);
                     break;
                 case "--mode":
                     if (i + 1 < args.Length) Options.Mode = ParseMode(args[++i]);
@@ -225,7 +246,20 @@ internal static class Program
             string dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YuCap");
             Directory.CreateDirectory(dir);
-            File.AppendAllText(Path.Combine(dir, "error.log"),
+            string logPath = Path.Combine(dir, "error.log");
+
+            // Unlike yucap.log (which rotates at 2MB), error.log had no cap and
+            // grew without bound on machines that crash repeatedly. Rotate it the
+            // same way: one backup, kept inside this try so a rotation failure
+            // still can't take down the crash logger itself.
+            if (File.Exists(logPath) && new FileInfo(logPath).Length > 1_000_000)
+            {
+                string oldPath = Path.Combine(dir, "error.old.log");
+                try { File.Delete(oldPath); } catch { /* ignore */ }
+                File.Move(logPath, oldPath);
+            }
+
+            File.AppendAllText(logPath,
                 $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] v{Application.ProductVersion}\n{ex}\n\n");
         }
         catch { /* never throw from the crash logger */ }

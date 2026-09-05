@@ -100,26 +100,71 @@ public static class SettingsStore
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "YuCap", "settings.json");
 
+    /// <summary>
+    /// True when the last <see cref="Load"/> found a settings.json that exists but
+    /// could not be read/parsed (as opposed to a first run with no file at all).
+    /// Reflects only the most recent call.
+    /// </summary>
+    public static bool LastLoadFailed { get; private set; }
+
     public static AppSettings Load()
     {
+        string path = FilePath;
         try
         {
-            string path = FilePath;
-            if (!File.Exists(path)) return new AppSettings();
-            return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path)) ?? new AppSettings();
+            if (!File.Exists(path))
+            {
+                // First run — not a failure.
+                LastLoadFailed = false;
+                return new AppSettings();
+            }
+            AppSettings? loaded = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path));
+            LastLoadFailed = false;
+            return loaded ?? new AppSettings();
         }
-        catch { return new AppSettings(); }
+        catch (Exception ex)
+        {
+            // The file exists but is unreadable/corrupt (e.g. truncated by a power
+            // loss mid-write). Keep the evidence instead of silently discarding it,
+            // so the user has something to hand us if they notice lost settings.
+            LastLoadFailed = true;
+            try
+            {
+                string bad = Path.Combine(Path.GetDirectoryName(path)!, "settings.bad.json");
+                if (File.Exists(bad)) File.Delete(bad);
+                File.Move(path, bad);
+                Log.Info($"settings: load failed ({ex.Message}); moved unreadable file to {bad}");
+            }
+            catch (Exception moveEx)
+            {
+                Log.Info($"settings: load failed ({ex.Message}); could not preserve bad file — {moveEx.Message}");
+            }
+            return new AppSettings();
+        }
     }
 
     public static void Save(AppSettings settings)
     {
+        string path = FilePath;
+        string tmp = path + ".tmp";
         try
         {
-            string path = FilePath;
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllText(path, JsonSerializer.Serialize(settings,
+            File.WriteAllText(tmp, JsonSerializer.Serialize(settings,
                 new JsonSerializerOptions { WriteIndented = true }));
+
+            // Swap the temp file in atomically so a crash/power loss mid-write
+            // can never leave settings.json half-written. File.Replace (and plain
+            // File.Move onto a nonexistent target) are atomic renames on NTFS.
+            if (File.Exists(path))
+                File.Replace(tmp, path, null);
+            else
+                File.Move(tmp, path);
         }
-        catch { /* best effort */ }
+        catch (Exception ex)
+        {
+            Log.Info("settings: save failed — " + ex.Message);
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* best effort */ }
+        }
     }
 }

@@ -46,35 +46,89 @@ public sealed partial class MainForm
         return _video.Snapshot();
     }
 
+    /// <summary>Set once the configured snapshot folder has proven unusable
+    /// and a save fell back to the default Pictures folder, so the caller can
+    /// tell the user about it a single time rather than on every burst shot.</summary>
+    private bool _snapshotDirFellBack;
+
     private void SaveSnapshot()
     {
-        if (!SaveSnapshotCore(out string file)) return;
-        // The OSD becomes a shortcut to the file until it fades. Set the target
-        // after ShowOsd, which clears it for any other kind of message.
-        ShowOsd(L.F("保存しました: {0}（クリックで開く）", file));
+        bool fellBackBefore = _snapshotDirFellBack;
+        if (!SaveSnapshotCore(out string file, out string? error))
+        {
+            ShowOsd(L.T("保存に失敗しました"));
+            MessageBox.Show(this, L.F("保存に失敗しました。\n\n{0}", error),
+                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (_snapshotDirFellBack && !fellBackBefore)
+        {
+            // The configured folder just proved unusable for the first time
+            // this session — say so once instead of silently redirecting saves.
+            ShowOsd(L.T("保存先フォルダを使えないため、既定のフォルダに保存しました。"), OsdLongMilliseconds);
+        }
+        else
+        {
+            // The OSD becomes a shortcut to the file until it fades. Set the target
+            // after ShowOsd, which clears it for any other kind of message.
+            ShowOsd(L.F("保存しました: {0}（クリックで開く）", file), OsdLongMilliseconds);
+        }
         _lastSavedSnapshot = file;
     }
 
-    /// <summary>Save one snapshot; returns false (with OSD/dialog) on failure.
-    /// Shared by Ctrl+S, the global hotkey, and burst mode.</summary>
-    private bool SaveSnapshotCore(out string fileName)
+    /// <summary>Save one snapshot. Never shows a MessageBox or OSD itself —
+    /// burst mode calls this on a timer, and a MessageBox per failed shot
+    /// would pile up into an unstoppable storm of modal dialogs (and, since a
+    /// failed shot didn't used to advance the burst counter, never stop).
+    /// Callers (Ctrl+S, the global hotkey, burst mode) decide how to surface
+    /// <paramref name="error"/> themselves.</summary>
+    private bool SaveSnapshotCore(out string fileName, out string? error)
     {
         fileName = string.Empty;
+        error = null;
         using Bitmap? frame = GrabFrame();
         if (frame == null)
         {
-            ShowOsd(L.T("映像がありません"));
+            error = L.T("映像がありません");
             return false;
+        }
+
+        string dir = SnapshotDirectory;
+        try
+        {
+            Directory.CreateDirectory(dir);
+        }
+        catch (Exception ex)
+        {
+            // The configured folder may be on a removed USB drive or a
+            // disconnected network share. Fall back to the default Pictures
+            // folder rather than failing outright, but leave the user's
+            // setting alone — the drive may come back on a later save.
+            Log.Info("snapshot: configured folder unusable, falling back to default — " + ex);
+            string fallback = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CaptureViewer");
+            try
+            {
+                Directory.CreateDirectory(fallback);
+                dir = fallback;
+                _snapshotDirFellBack = true;
+            }
+            catch (Exception ex2)
+            {
+                Log.Info("snapshot: fallback folder also unusable — " + ex2);
+                error = Errors.Describe(ex2);
+                return false;
+            }
         }
 
         try
         {
-            string dir = SnapshotDirectory;
-            Directory.CreateDirectory(dir);
             bool jpg = _settings.SnapshotFormat.Equals("jpg", StringComparison.OrdinalIgnoreCase);
             // Milliseconds in the name so rapid consecutive shots never overwrite.
             fileName = $"Capture_{DateTime.Now:yyyyMMdd_HHmmss_fff}.{(jpg ? "jpg" : "png")}";
             string path = Path.Combine(dir, fileName);
+            _lastSaveDir = dir;   // may be the fallback, not SnapshotDirectory
             if (jpg)
             {
                 ImageCodecInfo codec = ImageCodecInfo.GetImageEncoders()
@@ -91,8 +145,8 @@ public sealed partial class MainForm
         }
         catch (Exception ex)
         {
-            ShowOsd(L.T("保存に失敗しました"));
-            MessageBox.Show(this, ex.Message, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Info("snapshot save failed: " + ex);
+            error = Errors.Describe(ex);
             return false;
         }
     }
@@ -110,8 +164,11 @@ public sealed partial class MainForm
             Clipboard.SetImage(frame);
             ShowOsd(L.T("クリップボードにコピーしました"));
         }
-        catch
+        catch (Exception ex)
         {
+            // Clipboard.SetImage fails when another process holds the clipboard
+            // open. Silently swallowing it left nothing to diagnose from.
+            Log.Info("clipboard copy failed: " + ex);
             ShowOsd(L.T("コピーに失敗しました"));
         }
     }
@@ -138,7 +195,8 @@ public sealed partial class MainForm
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Info("open folder failed: " + ex);
+            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -153,6 +211,12 @@ public sealed partial class MainForm
             MinimizeBox = false,
             ShowInTaskbar = false,
             ClientSize = new Size(420, 150),
+            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
+            // were drawn against at 100% — WinForms then scales every
+            // Location/Size by the same factor as the font, so the layout
+            // still holds together at 125-200% display scaling.
+            AutoScaleMode = AutoScaleMode.Font,
+            AutoScaleDimensions = new SizeF(7F, 15F),
         };
 
         var lblDir = new Label { Text = L.T("保存先:"), AutoSize = true, Location = new Point(16, 20) };
@@ -228,6 +292,8 @@ public sealed partial class MainForm
             MinimizeBox = false,
             ShowInTaskbar = false,
             ClientSize = new Size(380, 240),
+            AutoScaleMode = AutoScaleMode.Font,
+            AutoScaleDimensions = new SizeF(7F, 15F),
         };
 
         var pic = new PictureBox
@@ -240,7 +306,7 @@ public sealed partial class MainForm
 
         var title = new Label
         {
-            Text = "YuCap - キャプチャビューア",
+            Text = L.T("YuCap - キャプチャビューア"),
             Font = new Font("Segoe UI", 13f, FontStyle.Bold),
             AutoSize = true,
             Location = new Point(80, 22),
@@ -267,6 +333,7 @@ public sealed partial class MainForm
         dlg.CancelButton = ok;
         dlg.ShowDialog(this);
         pic.Image?.Dispose();
+        title.Font.Dispose();
     }
 
 }

@@ -46,6 +46,11 @@ public sealed partial class MainForm
         }
         TopMost = true;
 
+        // The normal-mode minimum (320x240) would clamp the smaller PiP size
+        // presets (10-20%) up to a 4:3 window with black bars instead of a
+        // small 16:9 one — lower it before sizing the PiP window.
+        MinimumSize = new Size(120, 68);
+
         // Preset-sized window docked to the configured work-area corner.
         ApplyPipSize(anchorCorner: false);
         Location = PipCornerLocation();
@@ -75,6 +80,11 @@ public sealed partial class MainForm
         }
         _menu.Visible = _prePipMenu;
         _status.Visible = _prePipStatus;
+        // Restore the normal minimum BEFORE restoring Bounds below: otherwise
+        // the PiP-era 120x68 floor is still in effect while _prePipBounds is
+        // applied, and raising MinimumSize afterwards would immediately clamp
+        // the just-restored window back up rather than leaving it untouched.
+        MinimumSize = NormalMinimumSize;
         if (_prePipBounds.Width > 0) Bounds = _prePipBounds;
         // Return to the mode the user was in before PiP (e.g. fullscreen).
         if (_prePipFullscreen)
@@ -143,7 +153,11 @@ public sealed partial class MainForm
 
     private void SetPipOpacity(int pct, bool hover)
     {
-        pct = Math.Clamp(pct, 0, 100);
+        // Hover opacity has a floor of 10%: it is the one guarantee that a PiP
+        // window can always be found again with the mouse. Idle opacity has no
+        // such floor — fully hiding an idle PiP is a legitimate thing to want,
+        // since hovering (or the recovery invariant below) still reveals it.
+        pct = hover ? Math.Clamp(pct, 10, 100) : Math.Clamp(pct, 0, 100);
         if (hover) _settings.PipOpacityHover = pct;
         else _settings.PipOpacity = pct;
         if (_isPip) ApplyPipOpacity();
@@ -151,13 +165,17 @@ public sealed partial class MainForm
     }
 
     /// <summary>Apply the idle/hover opacity matching the current cursor state.
-    /// 0% is allowed (fully invisible): hovering — or Ctrl+Alt+P — brings it back.
+    /// Idle opacity may be 0% (fully invisible): hovering — or Ctrl+Alt+P —
+    /// brings it back. Hover opacity is floored at 10% defensively here too,
+    /// in case a settings.json written by an older build still holds 0.
     /// While click-through is on, the layered alpha is driven DIRECTLY: the
     /// Form.Opacity setter rewrites the ex-style from WinForms' own cache, which
     /// strips WS_EX_TRANSPARENT and silently disables click-through.</summary>
     private void ApplyPipOpacity()
     {
-        int pct = Math.Clamp(_pipHovered ? _settings.PipOpacityHover : _settings.PipOpacity, 0, 100);
+        int pct = _pipHovered
+            ? Math.Clamp(_settings.PipOpacityHover, 10, 100)
+            : Math.Clamp(_settings.PipOpacity, 0, 100);
         if (_isPip && _settings.PipClickThrough && IsHandleCreated)
         {
             int ex = GetWindowLong(Handle, GwlExStyle);
@@ -179,16 +197,43 @@ public sealed partial class MainForm
         ApplyPipOpacity();
     }
 
+    /// <summary>Click-through must never be enabled without an escape route: a
+    /// working PiP-toggle hotkey is the only way to reach an unreachable window
+    /// once the mouse passes through it. Returns false (and registers nothing)
+    /// when the hotkey is unset, or true only if registering it succeeded.
+    /// TryRegisterHotkey already unregisters the id first, so calling this while
+    /// global hotkeys are already on (and the id already registered) is safe.</summary>
+    private bool EnsurePipHotkeyForClickThrough()
+    {
+        Keys combo = (Keys)_settings.HotkeyPip;
+        if ((combo & Keys.KeyCode) == Keys.None) return false;
+        var failed = new List<string>();
+        TryRegisterHotkey(HkPip, combo, failed);
+        return failed.Count == 0;
+    }
+
     private void TogglePipClickThrough()
     {
-        _settings.PipClickThrough = !_settings.PipClickThrough;
+        if (!_settings.PipClickThrough)
+        {
+            if (!EnsurePipHotkeyForClickThrough())
+            {
+                ShowOsd(L.T("クリックスルーには PiP切替 のホットキーが必要です。\nオプション → ホットキー設定 で割り当ててください。"), OsdLongMilliseconds);
+                return;
+            }
+            _settings.PipClickThrough = true;
+        }
+        else
+        {
+            _settings.PipClickThrough = false;
+        }
         if (_isPip) ApplyClickThrough(_settings.PipClickThrough);
         UpdateChecks();
         // With the mouse passing through, the menus are unreachable — name the
         // key that gets the window back rather than leaving the user stuck.
         ShowOsd(_settings.PipClickThrough
             ? L.F("クリックスルー: オン（{0} で解除）", FormatHotkey((Keys)_settings.HotkeyPip))
-            : L.T("クリックスルー: オフ"));
+            : L.T("クリックスルー: オフ"), _settings.PipClickThrough ? OsdLongMilliseconds : (int?)null);
     }
 
     private void ApplyClickThrough(bool on)
@@ -196,13 +241,20 @@ public sealed partial class MainForm
         if (!IsHandleCreated) return;
         if (on)
         {
-            ApplyPipOpacity(); // sets WS_EX_TRANSPARENT|LAYERED + the layered alpha
-            if (!_settings.GlobalHotkeys)
+            // Also guards the EnterPip path, where PipClickThrough may already
+            // be true from a saved settings.json whose PiP hotkey was since
+            // cleared — never trust the stored flag alone.
+            if (!EnsurePipHotkeyForClickThrough())
             {
-                // Safety hatch: with the mouse passing through, the PiP hotkey
-                // must work even if the user disabled global hotkeys.
-                TryRegisterHotkey(HkPip, (Keys)_settings.HotkeyPip, new List<string>());
+                _settings.PipClickThrough = false;
+                ShowOsd(L.T("PiP のホットキーが未設定のため、クリックスルーを解除しました"), OsdLongMilliseconds);
+                return;
             }
+            // Safety hatch: with the mouse passing through, the PiP hotkey must
+            // work even if the user disabled global hotkeys — the check above
+            // already registered it unconditionally (TryRegisterHotkey is a
+            // harmless no-op re-register when it was already active).
+            ApplyPipOpacity(); // sets WS_EX_TRANSPARENT|LAYERED + the layered alpha
         }
         else
         {
@@ -243,7 +295,7 @@ public sealed partial class MainForm
         Log.Info("hotkey conflict: " + signature);
         if (!announce && _settings.HotkeyConflictNotified == signature) return;
         _settings.HotkeyConflictNotified = signature;
-        ShowOsd(L.F("ホットキー使用中のため無効: {0}（オプションで変更できます）", signature));
+        ShowOsd(L.F("ホットキー使用中のため無効: {0}（オプションで変更できます）", signature), OsdLongMilliseconds);
     }
 
     private void TryRegisterHotkey(int id, Keys combo, List<string> failed)
@@ -283,6 +335,12 @@ public sealed partial class MainForm
             ShowInTaskbar = false,
             ClientSize = new Size(360, 210),
             KeyPreview = true,
+            // The controls below are laid out with fixed pixel coordinates
+            // drawn against the default Segoe UI 9pt metric (7, 15) at 100%
+            // scaling. Without this, the font grows with display scaling but
+            // the layout doesn't, and controls overlap at 125-200%.
+            AutoScaleMode = AutoScaleMode.Font,
+            AutoScaleDimensions = new SizeF(7F, 15F),
         };
 
         Keys snapCombo = (Keys)_settings.HotkeySnapshot;
@@ -329,7 +387,10 @@ public sealed partial class MainForm
         {
             Text = L.T("欄をクリックしてキーを押してください。Esc で無効化できます。"),
             AutoSize = true,
-            ForeColor = Color.Gray,
+            // Color.Gray is ~2.9:1 against the dialog background, below the
+            // 4.5:1 readability threshold; SystemColors.GrayText also respects
+            // the user's theme/contrast settings.
+            ForeColor = SystemColors.GrayText,
             Location = new Point(16, 126),
         };
         var reset = new Button { Text = L.T("既定に戻す"), Location = new Point(16, 168), Width = 100 };
@@ -346,14 +407,55 @@ public sealed partial class MainForm
         var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(255, 168), Width = 90 };
         dlg.Controls.AddRange(new Control[] { hint, reset, ok, cancel });
         dlg.CancelButton = cancel;
+        // The textboxes are read-only and their KeyDown handler marks every
+        // key (including Enter) as handled, so without an AcceptButton, Enter
+        // did nothing. This makes Enter work when focus is elsewhere (e.g. on
+        // Reset); it still has no effect while a hotkey field has focus, which
+        // is fine — that field is reachable by Tab or click regardless.
+        dlg.AcceptButton = ok;
 
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        // Loop instead of a single ShowDialog: a duplicate assignment must send
+        // the user back into the same dialog with their typed values intact,
+        // not close it — ShowDialog can be called again on the same (undisposed)
+        // Form, and none of the controls' state is reset in between.
+        while (true)
+        {
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            // Reject the same combo assigned to two actions: RegisterHotKey
+            // would only fail on the second one, and telling the user "another
+            // application is using this key" would be false and unactionable.
+            bool duplicate =
+                ((snapCombo & Keys.KeyCode) != Keys.None && snapCombo == muteCombo) ||
+                ((snapCombo & Keys.KeyCode) != Keys.None && snapCombo == pipCombo) ||
+                ((muteCombo & Keys.KeyCode) != Keys.None && muteCombo == pipCombo);
+            if (duplicate)
+            {
+                MessageBox.Show(this, L.T("同じキーが複数の操作に割り当てられています。"), "YuCap",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                continue;
+            }
+            break;
+        }
 
         _settings.HotkeySnapshot = (int)snapCombo;
         _settings.HotkeyMute = (int)muteCombo;
         _settings.HotkeyPip = (int)pipCombo;
+
+        // Don't let this dialog create the same unreachable-PiP state that
+        // EnsurePipHotkeyForClickThrough guards against elsewhere: clearing the
+        // PiP hotkey while click-through is on would otherwise leave no way to
+        // get the window back once the mouse passes through it.
+        if ((pipCombo & Keys.KeyCode) == Keys.None && _settings.PipClickThrough)
+        {
+            _settings.PipClickThrough = false;
+            if (_isPip) ApplyClickThrough(false);
+            ShowOsd(L.T("PiP のホットキーが未設定のため、クリックスルーを解除しました"), OsdLongMilliseconds);
+        }
+
         SaveSettings();
         if (_settings.GlobalHotkeys) RegisterGlobalHotkeys(); // re-register + report conflicts now
+        UpdateChecks();
     }
 
     private void UnregisterGlobalHotkeys()

@@ -32,7 +32,10 @@ public sealed partial class MainForm
         if (!upgraded) return;
 
         Log.Info($"update: now running {current}");
-        ShowOsd(L.F("バージョン {0} に更新しました", current));
+        // Long duration: this is the one confirmation that the restart the
+        // user just experienced was an update, not a crash — it must survive
+        // long enough to actually be read.
+        ShowOsd(L.F("バージョン {0} に更新しました", current), OsdLongMilliseconds);
     }
 
     /// <summary>
@@ -66,6 +69,11 @@ public sealed partial class MainForm
             : L.T("起動時の更新確認: オフ"));
     }
 
+    /// <summary>True while a check is running, so a second click on the menu
+    /// item (or an overlapping startup check) cannot stack a second check —
+    /// which would mean two prompts and, worse, two downloads.</summary>
+    private bool _updateCheckInFlight;
+
     /// <summary>
     /// Look for a newer release and, with the user's consent, install it.
     /// Communication only ever happens here — from an explicit menu action, or
@@ -75,62 +83,104 @@ public sealed partial class MainForm
     /// "no update" or a failed check. The startup check stays silent.</param>
     private async Task CheckForUpdatesAsync(bool manual)
     {
-        UpdateInfo? info;
+        if (_updateCheckInFlight) return;
+        _updateCheckInFlight = true;
         try
         {
-            info = await Updater.CheckAsync(_settings.UpdateApiUrl);
-        }
-        catch (Exception ex)
-        {
-            Log.Info("update check threw: " + ex.Message);
-            info = null;
-        }
-
-        _settings.LastUpdateCheckUtc = DateTime.UtcNow.ToString("o");
-
-        if (info == null)
-        {
+            if (!IsDisposed) _miCheckUpdate.Enabled = false;
+            // A manual check can take a few seconds against GitHub with
+            // nothing else on screen to say it's doing anything — the OSD and
+            // wait cursor are the only sign of life until it resolves.
             if (manual)
             {
-                MessageBox.Show(this,
-                    L.F("現在のバージョンは {0} です。\n更新はありません。", Updater.CurrentVersion),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                ShowOsd(L.T("更新を確認しています..."));
+                Cursor = Cursors.WaitCursor;
             }
-            return;
+
+            UpdateCheckResult result;
+            try
+            {
+                result = await Updater.CheckAsync(_settings.UpdateApiUrl);
+            }
+            catch (Exception ex)
+            {
+                // CheckAsync is expected to report failures through Error rather
+                // than throw; this only catches something unexpected so it still
+                // reaches the same "failed" path instead of crashing.
+                Log.Info("update check threw: " + ex.Message);
+                result = new UpdateCheckResult(null, Errors.Describe(ex));
+            }
+
+            // The window may have closed while we awaited the network — check
+            // before any use of `this` (message boxes, settings, dialogs).
+            if (IsDisposed) return;
+
+            _settings.LastUpdateCheckUtc = DateTime.UtcNow.ToString("o");
+
+            if (result.Error != null)
+            {
+                Log.Info("update check failed: " + result.Error);
+                if (manual)
+                {
+                    MessageBox.Show(this,
+                        L.F("更新の確認に失敗しました。\nネットワーク接続を確認してください。\n\n{0}", result.Error),
+                        "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
+            UpdateInfo? info = result.Info;
+            if (info == null)
+            {
+                if (manual)
+                {
+                    MessageBox.Show(this,
+                        L.F("現在のバージョンは {0} です。\n更新はありません。", Updater.CurrentVersion),
+                        "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                return;
+            }
+
+            // A version the user already declined must not be offered on every
+            // launch — the startup check now runs each time.
+            if (!manual && _settings.SkippedUpdateVersion == info.Version.ToString())
+            {
+                Log.Info($"update: {info.Version} was skipped by the user — not prompting");
+                return;
+            }
+
+            UpdatePrompt choice = AskAboutUpdate(info);
+            if (choice == UpdatePrompt.Skip)
+            {
+                _settings.SkippedUpdateVersion = info.Version.ToString();
+                SaveSettings();
+                ShowOsd(L.F("{0} をスキップします", info.Version), OsdLongMilliseconds);
+                return;
+            }
+            if (choice != UpdatePrompt.Now) return;
+
+            // Under Program Files the swap cannot work; say so instead of failing
+            // halfway through.
+            if (!Updater.CanWriteToInstallDir())
+            {
+                if (MessageBox.Show(this,
+                        L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
+                        "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                    OpenUrl(info.PageUrl);
+                return;
+            }
+
+            DownloadAndApply(info);
         }
-
-        if (IsDisposed) return;
-
-        // A version the user already declined must not be offered on every
-        // launch — the startup check now runs each time.
-        if (!manual && _settings.SkippedUpdateVersion == info.Version.ToString())
+        finally
         {
-            Log.Info($"update: {info.Version} was skipped by the user — not prompting");
-            return;
+            _updateCheckInFlight = false;
+            if (!IsDisposed)
+            {
+                _miCheckUpdate.Enabled = true;
+                Cursor = Cursors.Default;
+            }
         }
-
-        UpdatePrompt choice = AskAboutUpdate(info);
-        if (choice == UpdatePrompt.Skip)
-        {
-            _settings.SkippedUpdateVersion = info.Version.ToString();
-            SaveSettings();
-            ShowOsd(L.F("{0} をスキップします", info.Version));
-            return;
-        }
-        if (choice != UpdatePrompt.Now) return;
-
-        // Under Program Files the swap cannot work; say so instead of failing
-        // halfway through.
-        if (!Updater.CanWriteToInstallDir())
-        {
-            if (MessageBox.Show(this,
-                    L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
-                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
-                OpenUrl(info.PageUrl);
-            return;
-        }
-
-        DownloadAndApply(info);
     }
 
     private enum UpdatePrompt { Now, Later, Skip }
@@ -150,7 +200,13 @@ public sealed partial class MainForm
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(420, 160),
+            ClientSize = new Size(420, 200),
+            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
+            // were drawn against at 100% — WinForms then scales every
+            // Location/Size by the same factor as the font, so the layout
+            // still holds together at 125-200% display scaling.
+            AutoScaleMode = AutoScaleMode.Font,
+            AutoScaleDimensions = new SizeF(7F, 15F),
         };
         var head = new Label
         {
@@ -164,25 +220,34 @@ public sealed partial class MainForm
             Text = L.T("更新すると YuCap は自動的に再起動します。"),
             AutoSize = true,
             Location = new Point(16, 48),
-            ForeColor = Color.Gray,
+            // SystemColors.GrayText (not Color.Gray, ~2.9:1) is the theme's
+            // intended hint colour and reads at a proper contrast ratio.
+            ForeColor = SystemColors.GrayText,
+        };
+        var size = new Label
+        {
+            Text = L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0")),
+            AutoSize = true,
+            Location = new Point(16, 72),
+            ForeColor = SystemColors.GrayText,
         };
         var notes = new LinkLabel
         {
             Text = L.T("リリースノートを見る"),
             AutoSize = true,
-            Location = new Point(16, 74),
+            Location = new Point(16, 98),
         };
         notes.LinkClicked += (_, _) => OpenUrl(info.PageUrl);
 
-        var now = new Button { Text = L.T("今すぐ更新"), Location = new Point(16, 116), Width = 120 };
-        var later = new Button { Text = L.T("後で"), Location = new Point(150, 116), Width = 100 };
-        var skip = new Button { Text = L.T("この版をスキップ"), Location = new Point(258, 116), Width = 146 };
+        var now = new Button { Text = L.T("今すぐ更新"), Location = new Point(16, 156), Width = 120 };
+        var later = new Button { Text = L.T("後で"), Location = new Point(150, 156), Width = 100 };
+        var skip = new Button { Text = L.T("この版をスキップ"), Location = new Point(258, 156), Width = 146 };
         var result = UpdatePrompt.Later;
         now.Click += (_, _) => { result = UpdatePrompt.Now; dlg.Close(); };
         later.Click += (_, _) => { result = UpdatePrompt.Later; dlg.Close(); };
         skip.Click += (_, _) => { result = UpdatePrompt.Skip; dlg.Close(); };
 
-        dlg.Controls.AddRange(new Control[] { head, body, notes, now, later, skip });
+        dlg.Controls.AddRange(new Control[] { head, body, size, notes, now, later, skip });
         dlg.AcceptButton = now;
         dlg.CancelButton = later;
         dlg.ShowDialog(this);
@@ -204,6 +269,8 @@ public sealed partial class MainForm
             ShowInTaskbar = false,
             ControlBox = false,
             ClientSize = new Size(380, 120),
+            AutoScaleMode = AutoScaleMode.Font,
+            AutoScaleDimensions = new SizeF(7F, 15F),
         };
         var lbl = new Label
         {
@@ -262,7 +329,17 @@ public sealed partial class MainForm
 
     private void OpenUrl(string url)
     {
-        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); }
+        // `url` comes straight from the GitHub API response (html_url); refuse
+        // anything that isn't a plain web link before handing it to
+        // ShellExecute, which would otherwise happily launch any registered
+        // scheme handler (file://, a custom protocol, etc.).
+        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            Log.Info("open url refused (not http/https): " + url);
+            return;
+        }
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true }); }
         catch (Exception ex) { Log.Info("open url failed: " + ex.Message); }
     }
 }

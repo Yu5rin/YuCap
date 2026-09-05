@@ -103,6 +103,13 @@ public sealed class VideoEngine : IDisposable
     /// snapshots go straight to the screen-copy fallback instead of paying the
     /// setup cost and timeout on every shot.</summary>
     private bool _photoUnavailable;
+    /// <summary>Consecutive failures to receive a photo sample. _photoUnavailable
+    /// is only set when the sink itself fails to be CREATED — if the sink exists
+    /// but the device just never delivers a sample, every snapshot (including
+    /// every burst frame) would otherwise pay the full UI-thread timeout forever.
+    /// This counts those failures so the fallback kicks in after a couple of
+    /// misses instead of never.</summary>
+    private int _photoTimeouts;
 
     public string? CurrentDeviceName { get; private set; }
     public Size CurrentResolution { get; private set; }
@@ -212,7 +219,7 @@ public sealed class VideoEngine : IDisposable
             else
                 act.Dispose();
         }
-        return match ?? throw new InvalidOperationException("映像デバイスが見つかりません。");
+        return match ?? throw new InvalidOperationException(L.T("映像デバイスが見つかりません。"));
     }
 
     // ---- Start / Stop ----------------------------------------------------
@@ -223,7 +230,7 @@ public sealed class VideoEngine : IDisposable
         Stop();
         EnsureStartup();
         if (_hwnd == IntPtr.Zero)
-            throw new InvalidOperationException("表示ウィンドウが設定されていません。");
+            throw new InvalidOperationException(L.T("表示ウィンドウが設定されていません。"));
 
         using IMFActivate activate = FindActivate(info);
 
@@ -241,7 +248,7 @@ public sealed class VideoEngine : IDisposable
         Marshal.ThrowExceptionForHR(
             _engine.Initialize(_callback, IntPtr.Zero, IntPtr.Zero, activate.NativePointer));
         if (!_callback.Initialized.Wait(5000))
-            throw new TimeoutException("キャプチャエンジンの初期化がタイムアウトしました。");
+            throw new TimeoutException(L.T("キャプチャエンジンの初期化がタイムアウトしました。"));
         if (_callback.LastHr < 0)
             Marshal.ThrowExceptionForHR(_callback.LastHr);
 
@@ -290,7 +297,7 @@ public sealed class VideoEngine : IDisposable
         _callback.PreviewStarted.Reset();
         Marshal.ThrowExceptionForHR(_engine.StartPreview());
         if (!_callback.PreviewStarted.Wait(5000))
-            throw new TimeoutException("プレビュー開始がタイムアウトしました。");
+            throw new TimeoutException(L.T("プレビュー開始がタイムアウトしました。"));
         if (_callback.LastHr < 0)
             Marshal.ThrowExceptionForHR(_callback.LastHr);
 
@@ -356,6 +363,7 @@ public sealed class VideoEngine : IDisposable
             _photoReceiver?.Reset();
             _photoReceiver = null;
             _photoUnavailable = false;   // re-probe against the next device
+            _photoTimeouts = 0;
         }
 
         _sink = null;
@@ -716,7 +724,7 @@ public sealed class VideoEngine : IDisposable
     /// when the window is small, minimised or covered.
     /// Returns null if the photo path is unavailable, so callers can fall back.
     /// </summary>
-    public Bitmap? PhotoSnapshot(int timeoutMs = 4000)
+    public Bitmap? PhotoSnapshot(int timeoutMs = 1500)
     {
         IMFCaptureEngine? engine = _engine;
         CaptureEventCallback? cb = _callback;
@@ -734,7 +742,12 @@ public sealed class VideoEngine : IDisposable
                 cb.LastPhotoHr = 0;
 
                 int hr = engine.TakePhoto();
-                if (hr < 0) { Log.Info($"photo: TakePhoto failed hr=0x{hr:X}"); return null; }
+                if (hr < 0)
+                {
+                    Log.Info($"photo: TakePhoto failed hr=0x{hr:X}");
+                    NotePhotoFailure();
+                    return null;
+                }
 
                 // Wait on the delivered sample rather than the PHOTO_TAKEN
                 // event: the frame itself is the thing we need, and waiting for
@@ -746,14 +759,33 @@ public sealed class VideoEngine : IDisposable
                     Log.Info(cb.LastPhotoHr < 0
                         ? $"photo: capture reported hr=0x{cb.LastPhotoHr:X}"
                         : "photo: no sample delivered before the timeout");
+                    NotePhotoFailure();
+                }
+                else
+                {
+                    _photoTimeouts = 0;
                 }
                 return bmp;
             }
             catch (Exception ex)
             {
                 Log.Info("photo: " + ex.Message);
+                NotePhotoFailure();
                 return null;
             }
+        }
+    }
+
+    /// <summary>Called with _photoLock held. This method runs on the UI thread
+    /// (PhotoSnapshot's caller), so timeoutMs is a UI-freeze budget, not just a
+    /// wait — after two consecutive misses, disabling the photo path trades a
+    /// lower-resolution screen-copy fallback for never blocking the UI again.</summary>
+    private void NotePhotoFailure()
+    {
+        if (++_photoTimeouts >= 2)
+        {
+            _photoUnavailable = true;
+            Log.Info("photo: repeated failures to receive a sample — disabling the photo path for this device, falling back to the screen copy");
         }
     }
 
