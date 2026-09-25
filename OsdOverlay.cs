@@ -12,7 +12,15 @@ namespace YuCap;
 /// </summary>
 public sealed class OsdOverlay : Control
 {
-    private readonly Font _font = new("Segoe UI", 12f, FontStyle.Bold);
+    // 12pt bold normally; dropped to 9pt when the caller passes a small
+    // maxWidth (a small PiP window), where the larger size would force
+    // excessive wrapping or simply not fit.
+    private readonly Font _fontNormal = new("Segoe UI", 12f, FontStyle.Bold);
+    private readonly Font _fontSmall = new("Segoe UI", 9f, FontStyle.Bold);
+    private const int SmallMaxWidthThreshold = 360;
+
+    private Font _font;
+    private bool _clickable;
 
     public OsdOverlay()
     {
@@ -21,14 +29,25 @@ public sealed class OsdOverlay : Control
                  | ControlStyles.OptimizedDoubleBuffer, true);
         Visible = false;
         TabStop = false;
+        _font = _fontNormal;
+        Cursor = Cursors.Default;
     }
 
-    /// <summary>Set the message, resize to fit and make visible (caller positions it).</summary>
-    public void ShowText(string text)
+    /// <summary>Set the message, wrap it to <paramref name="maxWidth"/>, resize
+    /// to fit and make visible (caller positions it). The hand cursor and the
+    /// underline hint only appear when <paramref name="clickable"/> is true —
+    /// most bubbles are just status text, not a link.</summary>
+    public void ShowText(string text, int maxWidth, bool clickable)
     {
         Text = text;
-        Size sz = TextRenderer.MeasureText(text, _font);
-        Size = new Size(sz.Width + 28, sz.Height + 16);
+        _clickable = clickable;
+        Cursor = clickable ? Cursors.Hand : Cursors.Default;
+        _font = maxWidth < SmallMaxWidthThreshold ? _fontSmall : _fontNormal;
+
+        int innerMaxWidth = Math.Max(20, maxWidth - 28);
+        var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
+        Size textSz = TextRenderer.MeasureText(text, _font, new Size(innerMaxWidth, int.MaxValue), flags);
+        Size = new Size(Math.Min(innerMaxWidth, textSz.Width) + 28, textSz.Height + 16);
 
         using var path = Rounded(new Rectangle(0, 0, Width, Height), 10);
         Region?.Dispose();
@@ -45,7 +64,20 @@ public sealed class OsdOverlay : Control
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using var back = new SolidBrush(Color.FromArgb(215, 20, 20, 20));
         g.FillRectangle(back, ClientRectangle);
-        TextRenderer.DrawText(g, Text, _font, new Point(14, 8), Color.White);
+
+        var textRect = new Rectangle(14, 8, Math.Max(1, Width - 28), Math.Max(1, Height - 16));
+        var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
+        TextRenderer.DrawText(g, Text, _font, textRect, Color.White, flags);
+
+        if (_clickable)
+        {
+            // Thin accent underline under the last line, so a clickable bubble
+            // reads as a link rather than just another status flip.
+            Size textSz = TextRenderer.MeasureText(g, Text, _font, textRect.Size, flags);
+            int lineY = 8 + textSz.Height;
+            using var pen = new Pen(Ui.Colors.Accent, 1.5f);
+            g.DrawLine(pen, 14, lineY, 14 + Math.Min(textSz.Width, textRect.Width), lineY);
+        }
     }
 
     private static GraphicsPath Rounded(Rectangle r, int radius)
@@ -62,7 +94,11 @@ public sealed class OsdOverlay : Control
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _font.Dispose();
+        if (disposing)
+        {
+            _fontNormal.Dispose();
+            _fontSmall.Dispose();
+        }
         base.Dispose(disposing);
     }
 }

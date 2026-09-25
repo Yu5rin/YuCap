@@ -23,6 +23,16 @@ internal static class Program
 {
     public static readonly StartupOptions Options = new();
 
+    /// <summary>
+    /// Settings loaded exactly once, right after Log.Init(). Everywhere else
+    /// must read this instead of calling SettingsStore.Load() again: a second
+    /// Load() call saw no file after the first one had already moved a
+    /// corrupt settings.json aside (the file is gone by then), so it reported
+    /// "first run" and SettingsStore.LastLoadFailed silently went back to
+    /// false — the corrupt-settings notice the first Load() set up never showed.
+    /// </summary>
+    internal static AppSettings Settings { get; private set; } = new();
+
     [STAThread]
     private static void Main(string[] args)
     {
@@ -36,7 +46,8 @@ internal static class Program
         // "already running" notice, the crash dialog) can show a MessageBox
         // before MainForm ever runs, so the UI language must be loaded now —
         // otherwise an English-configured user sees Japanese in those dialogs.
-        L.English = SettingsStore.Load().Language == "en";
+        Settings = SettingsStore.Load();
+        L.English = Settings.Language == "en";
 
         // Crash log: keep evidence in %APPDATA%\YuCap\error.log even after the
         // dialog is dismissed.
@@ -58,7 +69,7 @@ internal static class Program
         // without needing an actual newer release to exist.
         if (args.Length > 0 && args[0] == "--check-update")
         {
-            AppSettings s = SettingsStore.Load();
+            AppSettings s = Settings;
             UpdateCheckResult result = Updater.CheckAsync(s.UpdateApiUrl).GetAwaiter().GetResult();
             // Three distinct outcomes, not two: a failed check must not read as
             // "you're up to date" — that would hide a broken endpoint from the
@@ -358,8 +369,60 @@ internal static class Program
                             log.Add($"  rotate {deg}° → {(okRot ? "ok" : "unsupported")}"
                                   + $"  reported={engine.Rotation}°"
                                   + $"  display={engine.DisplayResolution.Width}x{engine.DisplayResolution.Height}");
+
+                            // The photo sink is made to rotate its still to match
+                            // the preview (VideoEngine.PhotoSnapshot), but the
+                            // DIRECTION of the preview sink's own rotation is
+                            // unverified — a sign error there would still show a
+                            // preview that "looks rotated" while every saved photo
+                            // comes out turned the opposite way from what the user
+                            // saw on screen. Only 90° is checked: at 180° the two
+                            // candidate orientations are identical, so it can't
+                            // distinguish a correct rotation from a reversed one.
+                            if (deg == 90 && okRot)
+                            {
+                                System.Threading.Thread.Sleep(700); // let the preview re-render at the new rotation
+                                using Bitmap? photo90 = engine.PhotoSnapshot();
+                                using Bitmap? shot90 = engine.Snapshot();
+                                if (photo90 != null && shot90 != null)
+                                {
+                                    double[,] shotThumb = Thumbnail8x8(shot90);
+                                    double[,] photoThumb = Thumbnail8x8(photo90);
+                                    using Bitmap photo90Alt = Rotated180Copy(photo90);
+                                    double[,] photoThumbAlt = Thumbnail8x8(photo90Alt);
+                                    double mad = MeanAbsDiff(shotThumb, photoThumb);
+                                    double madAlt = MeanAbsDiff(shotThumb, photoThumbAlt);
+                                    log.Add($"  photo orientation @90°: {(mad < madAlt ? "matches preview" : "MISMATCH (direction reversed?)")}  mad={mad:F1} alt={madAlt:F1}");
+                                }
+                                else
+                                {
+                                    log.Add("  photo orientation @90°: skipped (photo or screen snapshot unavailable)");
+                                }
+                            }
                         }
-                        log.Add($"  mirror on → {(engine.SetMirror(true) ? "ok" : "unsupported")}");
+
+                        bool okMirror = engine.SetMirror(true);
+                        log.Add($"  mirror on → {(okMirror ? "ok" : "unsupported")}");
+                        if (okMirror)
+                        {
+                            System.Threading.Thread.Sleep(700); // let the preview re-render mirrored
+                            using Bitmap? photoM = engine.PhotoSnapshot();
+                            using Bitmap? shotM = engine.Snapshot();
+                            if (photoM != null && shotM != null)
+                            {
+                                double[,] shotThumb = Thumbnail8x8(shotM);
+                                double[,] photoThumb = Thumbnail8x8(photoM);
+                                using Bitmap photoMAlt = FlippedCopy(photoM);
+                                double[,] photoThumbAlt = Thumbnail8x8(photoMAlt);
+                                double mad = MeanAbsDiff(shotThumb, photoThumb);
+                                double madAlt = MeanAbsDiff(shotThumb, photoThumbAlt);
+                                log.Add($"  photo mirror: {(mad < madAlt ? "matches preview" : "MISMATCH (direction reversed?)")}  mad={mad:F1} alt={madAlt:F1}");
+                            }
+                            else
+                            {
+                                log.Add("  photo mirror: skipped (photo or screen snapshot unavailable)");
+                            }
+                        }
                         engine.SetMirror(false);
 
                         // Version ordering drives the updater; a string compare
@@ -455,6 +518,49 @@ internal static class Program
             return $"{verdict}  size={a.Width}x{a.Height} spread={maxL - minL} movingPoints={changed}/{samples}";
         }
         catch (Exception ex) { return "verify error: " + ex.Message; }
+    }
+
+    /// <summary>8x8 grayscale luminance thumbnail, used to compare two images
+    /// cheaply for the rotation/mirror direction check in RunSelfTest.</summary>
+    private static double[,] Thumbnail8x8(Bitmap src)
+    {
+        using var thumb = new Bitmap(8, 8);
+        using (var g = Graphics.FromImage(thumb))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear;
+            g.DrawImage(src, 0, 0, 8, 8);
+        }
+        var lum = new double[8, 8];
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                Color c = thumb.GetPixel(x, y);
+                lum[x, y] = (c.R + c.G + c.B) / 3.0;
+            }
+        return lum;
+    }
+
+    private static double MeanAbsDiff(double[,] a, double[,] b)
+    {
+        double sum = 0;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+                sum += Math.Abs(a[x, y] - b[x, y]);
+        return sum / 64.0;
+    }
+
+    private static Bitmap Rotated180Copy(Bitmap src)
+    {
+        var copy = (Bitmap)src.Clone();
+        copy.RotateFlip(RotateFlipType.Rotate180FlipNone);
+        return copy;
+    }
+
+    private static Bitmap FlippedCopy(Bitmap src)
+    {
+        var copy = (Bitmap)src.Clone();
+        copy.RotateFlip(RotateFlipType.RotateNoneFlipX);
+        return copy;
     }
 
     /// <summary>Sample the true displayed centre pixel via the compositor (screen copy).</summary>

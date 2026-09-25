@@ -45,6 +45,10 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const uint LwaAlpha = 0x2;
     [DllImport("user32.dll")] private static extern int SetWindowLong(IntPtr hWnd, int index, int value);
     [DllImport("user32.dll")] private static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint key, byte alpha, uint flags);
+
+    // Dark title bar, matching the dark menu/status chrome (see Ui.DarkRenderer).
+    [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hWnd, int attr, ref int attrValue, int attrSize);
+    private const int DwmwaUseImmersiveDarkMode = 20;
     private const int WmszLeft = 1, WmszRight = 2, WmszTop = 3, WmszTopLeft = 4,
         WmszTopRight = 5, WmszBottom = 6, WmszBottomLeft = 7, WmszBottomRight = 8;
 
@@ -62,6 +66,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly ToolStripStatusLabel _lblVideo = new();
     private readonly ToolStripStatusLabel _lblAudio = new();
     private readonly ToolStripStatusLabel _lblVolume = new();
+    private readonly ToolStripStatusLabel _lblState = new();
     private readonly ContextMenuStrip _ctx = new();
     private readonly System.Windows.Forms.Timer _osdTimer = new();
     private readonly System.Windows.Forms.Timer _uiTimer = new();
@@ -94,6 +99,11 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miCursorHide = null!;
     private ToolStripMenuItem _miUpdateCheck = null!;
     private ToolStripMenuItem _miCheckUpdate = null!; // help menu "更新を確認..."; disabled while a check is in flight
+    // Bold when an update is pending, to catch the eye without a dialog the
+    // user has to dismiss on every launch. Cached because a Font per UpdateChecks
+    // call (which runs often — every menu open) would leak GDI handles.
+    private Font? _checkUpdateNormalFont;
+    private Font? _checkUpdateBoldFont;
     private ToolStripMenuItem _miBurst = null!;
     private ToolStripMenuItem _miRestoreLevel = null!;
     private readonly List<ToolStripMenuItem> _cursorSecItems = new();
@@ -134,15 +144,19 @@ public sealed partial class MainForm : Form, IMessageFilter
     private bool _panning;
     private Point _panOrigin;
 
-    // Freeze frame.
-    private readonly PictureBox _freezeBox = new();
+    // Freeze frame. FreezeView clips the still to its own client area, so a
+    // zoomed-in overflow can no longer paint over the menu/status bars.
+    private readonly FreezeView _freezeView = new();
     private bool _frozen;
     private bool _mutedBeforeFreeze;
     // True when the frozen still came from the capture engine's photo sink
     // (video pixels only, no letterbox) rather than the compositor screen
     // copy (which already includes the letterbox). The two need different
-    // positioning — see FreezeBounds.
+    // positioning — see FreezeImageRect.
     private bool _freezeIsPhoto;
+    // The still currently shown while paused. Owned by MainForm; anyone else
+    // (GrabFrame) must CLONE it, never dispose it.
+    private Bitmap? _freezeImage;
 
     // Sleep inhibition.
     private bool _keepAwake;
@@ -161,12 +175,21 @@ public sealed partial class MainForm : Form, IMessageFilter
     // Command-line video mode (session-only; never persisted).
     private CaptureMode? _cliMode;
 
+    // ---- Command-line overrides (session-only; see SaveSettings) ---------
+    // --volume/--borderless/--topmost/--fullscreen used to be written straight
+    // into _settings in OnLoad, which meant a one-off launch flag became a
+    // permanent setting the next time the app saved. Instead: remember the
+    // persisted value and whether the property is currently CLI-overridden;
+    // any user action that changes the property clears the override so the
+    // user's own choice sticks, and SaveSettings writes the remembered value
+    // back for anything still overridden.
+    private bool _volumeOverridden, _borderlessOverridden, _topmostOverridden, _fullscreenOverridden;
+    private int _persistVolume;
+    private bool _persistBorderless, _persistTopmost, _persistFullscreen;
+
     // Set when an update has already persisted settings and torn down the
     // engines; the closing handler must not run that work a second time.
     private bool _skipSaveOnClose;
-
-    // Most recent snapshot file name, so the OSD can act as a shortcut to it.
-    private string? _lastSavedSnapshot;
 
     // Where the most recent snapshot actually landed. Not the configured
     // folder: a save can fall back to the default one when the configured
@@ -215,15 +238,23 @@ public sealed partial class MainForm : Form, IMessageFilter
     // field on exit.
     private static readonly Size NormalMinimumSize = new(320, 240);
 
-    // The Windows-wide recording level before "入力レベルを最大にする" changed
-    // it, so "入力レベルを元に戻す" has something to restore to. -1 = nothing
-    // to restore (either never raised, or already restored this session).
-    private int _captureLevelBefore = -1;
+    // Text shown in place of the video while a device is (re)starting — see
+    // RunDeviceStart. Distinct from _startingUp, which covers only the very
+    // first paint before the startup timer has even run.
+    private string? _busyText;
+
+    // Set (localized) when InitVideo fails, so the empty canvas can show WHY
+    // instead of just "no video"; cleared on the next successful start.
+    private string? _videoError;
 
     public MainForm()
     {
-        // Settings are needed BEFORE building menus (UI language).
-        _settings = SettingsStore.Load();
+        // Settings are loaded exactly once in Program.Main; every other place
+        // (including here) reuses that instance. Calling SettingsStore.Load()
+        // a second time here used to move a corrupt file aside on the FIRST
+        // call and then report "first run" on this second one, silently
+        // swallowing the corrupt-settings notice.
+        _settings = Program.Settings;
         L.English = _settings.Language == "en";
 
         Text = L.T("YuCap - キャプチャビューア");
@@ -239,18 +270,31 @@ public sealed partial class MainForm : Form, IMessageFilter
         BuildStatusBar();
         BuildContextMenu();
 
-        // Freeze-frame overlay: shows the captured still exactly over the canvas.
-        _freezeBox.Visible = false;
-        _freezeBox.BackColor = Color.Black;
-        _freezeBox.SizeMode = PictureBoxSizeMode.StretchImage;
-        _freezeBox.ContextMenuStrip = _ctx;
-        _freezeBox.DoubleClick += OnCanvasDoubleClick;
-        _freezeBox.MouseDown += OnCanvasMouseDown;
-        _freezeBox.MouseMove += OnCanvasMouseMove;
-        _freezeBox.MouseUp += OnCanvasMouseUp;
+        // Dark chrome: the picture itself is black, and the previous light
+        // (system-themed) menu/status bars framed it with bright bands that
+        // fought the video for attention. Dropdowns opened from a dark strip
+        // inherit its Renderer automatically; ToolStripManager.Renderer is set
+        // too as a safety net for any submenu built later (device/mode lists,
+        // RebuildMenus).
+        _menu.Renderer = Ui.DarkRenderer;
+        _ctx.Renderer = Ui.DarkRenderer;
+        _status.Renderer = Ui.DarkRenderer;
+        ToolStripManager.Renderer = Ui.DarkRenderer;
+        _menu.BackColor = _status.BackColor = Ui.Colors.Back;
+        _menu.ForeColor = _status.ForeColor = Ui.Colors.Text;
+
+        // Freeze-frame overlay: shows the captured still exactly over the canvas,
+        // clipped to its own bounds so a zoomed-in still can't overflow onto the
+        // menu/status bars (see FreezeView).
+        _freezeView.Visible = false;
+        _freezeView.ContextMenuStrip = _ctx;
+        _freezeView.DoubleClick += OnCanvasDoubleClick;
+        _freezeView.MouseDown += OnCanvasMouseDown;
+        _freezeView.MouseMove += OnCanvasMouseMove;
+        _freezeView.MouseUp += OnCanvasMouseUp;
 
         Controls.Add(_canvas);
-        Controls.Add(_freezeBox);
+        Controls.Add(_freezeView);
         Controls.Add(_menu);
         Controls.Add(_status);
         Controls.Add(_osd);
@@ -259,17 +303,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         _osd.BringToFront();
 
         _osdTimer.Interval = OsdMilliseconds;
-        _osdTimer.Tick += (_, _) => { _osdTimer.Stop(); _osd.Visible = false; };
+        _osdTimer.Tick += (_, _) => OsdTimerTick();
 
-        // Clicking a "saved" notice reveals the file in Explorer.
-        _osd.Cursor = Cursors.Hand;
-        _osd.Click += (_, _) =>
-        {
-            if (_lastSavedSnapshot == null) return;
-            OpenFolder(_lastSaveDir ?? SnapshotDirectory, _lastSavedSnapshot);
-            _osdTimer.Stop();
-            _osd.Visible = false;
-        };
+        // OSD click behaviour (mute toggle, "open the saved file", etc.) is
+        // driven per-item by ShowOsd's onClick — see OsdClick().
+        _osd.Click += (_, _) => OsdClick();
 
         _uiTimer.Interval = 500;
         _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); };
@@ -324,6 +362,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         Shown += (_, _) => LayoutCanvas(); // ensure correct fit once fully laid out
     }
 
+    /// <summary>Dark title bar to match the dark menu/status chrome — a light
+    /// system title bar over a dark window otherwise looks unfinished. Fails
+    /// harmlessly (no-op) on Windows builds that predate this attribute.</summary>
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        try
+        {
+            int one = 1;
+            DwmSetWindowAttribute(Handle, DwmwaUseImmersiveDarkMode, ref one, sizeof(int));
+        }
+        catch { /* older Windows without this attribute — light title bar is fine */ }
+    }
+
     // ---- UI construction -------------------------------------------------
 
     private void BuildCanvas()
@@ -345,21 +397,39 @@ public sealed partial class MainForm : Form, IMessageFilter
         Graphics g = e.Graphics;
         g.Clear(Color.Black);
 
-        string main = _startingUp ? L.T("接続しています...") : L.T("映像なし");
+        string main = _busyText ?? (_startingUp ? L.T("接続しています...") : L.T("映像が入力されていません"));
+        // RGB(200,200,200) on black is ~10.6:1 — the old Brushes.Gray (128,128,128)
+        // was only ~4.5:1, borderline for a large-ish message like this.
         using var font = new Font("Segoe UI", 14f);
-        SizeF sz = g.MeasureString(main, font);
-        float mainX = (_canvas.ClientSize.Width - sz.Width) / 2;
-        float mainY = (_canvas.ClientSize.Height - sz.Height) / 2;
-        g.DrawString(main, font, Brushes.Gray, mainX, mainY);
+        using var mainBrush = new SolidBrush(Color.FromArgb(255, 200, 200, 200));
+        var bounds = new Rectangle(0, 0, _canvas.ClientSize.Width, _canvas.ClientSize.Height);
+        int wrapWidth = Math.Max(1, (int)(bounds.Width * 0.9));
+        var wrapRect = new Rectangle((bounds.Width - wrapWidth) / 2, 0, wrapWidth, bounds.Height);
+        var mainFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
+        Size mainSz = TextRenderer.MeasureText(g, main, font, new Size(wrapWidth, int.MaxValue), mainFlags);
 
-        if (!_startingUp)
+        // Second line only while not busy: a busy message ("接続しています: X")
+        // is self-explanatory and _videoError would otherwise talk about a
+        // PREVIOUS failure while a new connection attempt is in flight.
+        string? second = _busyText == null
+            ? (_videoError ?? (_startingUp ? null : L.T("キャプチャデバイスを接続すると自動的に表示されます")))
+            : null;
+        using var secondFont = new Font("Segoe UI", 10f);
+        // RGB(150,150,150) on black is ~7.7:1 (≥7:1 target); the old (96,96,96) was ~3.3:1.
+        using var secondBrush = new SolidBrush(Color.FromArgb(255, 150, 150, 150));
+        Size secondSz = second != null
+            ? TextRenderer.MeasureText(g, second, secondFont, new Size(wrapWidth, int.MaxValue), mainFlags)
+            : Size.Empty;
+
+        int totalH = mainSz.Height + (second != null ? 4 + secondSz.Height : 0);
+        int top = (bounds.Height - totalH) / 2;
+        TextRenderer.DrawText(g, main, font, new Rectangle(wrapRect.X, top, wrapWidth, mainSz.Height),
+            mainBrush.Color, mainFlags);
+        if (second != null)
         {
-            string hint = L.T("キャプチャデバイスを接続すると自動的に表示されます");
-            using var hintFont = new Font("Segoe UI", 9f);
-            SizeF hintSz = g.MeasureString(hint, hintFont);
-            using var dimBrush = new SolidBrush(Color.FromArgb(255, 96, 96, 96));
-            g.DrawString(hint, hintFont, dimBrush,
-                (_canvas.ClientSize.Width - hintSz.Width) / 2, mainY + sz.Height + 4);
+            int secondTop = top + mainSz.Height + 4;
+            TextRenderer.DrawText(g, second, secondFont, new Rectangle(wrapRect.X, secondTop, wrapWidth, secondSz.Height),
+                secondBrush.Color, mainFlags);
         }
     }
 
@@ -563,15 +633,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         };
         _miBurst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog());
         var openDir = new ToolStripMenuItem(L.T("保存先フォルダを開く"), null, (_, _) => OpenSnapshotFolder());
-        var snapCfg = new ToolStripMenuItem(L.T("スナップショット設定..."), null, (_, _) => ShowSnapshotSettings());
         var exit = new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close());
         file.DropDownOpening += (_, _) => UpdateChecks();
         file.DropDownItems.Add(snap);
         file.DropDownItems.Add(copy);
         file.DropDownItems.Add(_miBurst);
-        file.DropDownItems.Add(openDir);
         file.DropDownItems.Add(new ToolStripSeparator());
-        file.DropDownItems.Add(snapCfg);
+        file.DropDownItems.Add(openDir);
         file.DropDownItems.Add(new ToolStripSeparator());
         file.DropDownItems.Add(exit);
 
@@ -589,22 +657,17 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         device.DropDownItems.Add(_videoDevicesRoot);
         device.DropDownItems.Add(_audioDevicesRoot);
-        device.DropDownItems.Add(new ToolStripSeparator());
         device.DropDownItems.Add(_videoModeRoot);
-        device.DropDownItems.Add(new ToolStripMenuItem(L.T("優先デバイス設定..."), null,
-            (_, _) => ShowDeviceKeywordSettings()));
         device.DropDownItems.Add(new ToolStripSeparator());
-        device.DropDownItems.Add(new ToolStripMenuItem(L.T("音声バッファ設定..."), null,
-            (_, _) => ShowAudioBufferSettings()));
-        device.DropDownItems.Add(new ToolStripMenuItem(L.T("入力レベルを最大にする"), null,
-            (_, _) => MaximizeCaptureLevel()));
-        _miRestoreLevel = new ToolStripMenuItem(L.T("入力レベルを元に戻す"), null, (_, _) => RestoreCaptureLevel());
-        device.DropDownItems.Add(_miRestoreLevel);
         _miMute = new ToolStripMenuItem(L.T("ミュート"), null, (_, _) => ToggleMute())
         {
             ShortcutKeyDisplayString = "M",
         };
         device.DropDownItems.Add(_miMute);
+        device.DropDownItems.Add(new ToolStripMenuItem(L.T("入力レベルを最大にする"), null,
+            (_, _) => MaximizeCaptureLevel()));
+        _miRestoreLevel = new ToolStripMenuItem(L.T("入力レベルを元に戻す"), null, (_, _) => RestoreCaptureLevel());
+        device.DropDownItems.Add(_miRestoreLevel);
 
         // ---- 表示 ----
         var view = new ToolStripMenuItem(L.T("表示(&V)"));
@@ -648,8 +711,6 @@ public sealed partial class MainForm : Form, IMessageFilter
         // 上から: 画面の使い方 → 再生操作 → 映像の見え方 → ウィンドウの振る舞い
         view.DropDownItems.Add(fullscreen);
         view.DropDownItems.Add(_miPip);
-        view.DropDownItems.Add(BuildPipSettingsSubmenu());
-        view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(_miFreeze);
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildAspectSubmenu());
@@ -666,8 +727,12 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // ---- オプション: アプリ全体の動作設定 ----
         var options = new ToolStripMenuItem(L.T("オプション(&O)"));
-        _miHotkeys = new ToolStripMenuItem(L.T("グローバルホットキーを有効化"), null, (_, _) => ToggleGlobalHotkeys());
+        var snapCfg = new ToolStripMenuItem(L.T("スナップショット設定..."), null, (_, _) => ShowSnapshotSettings());
+        var audioBufCfg = new ToolStripMenuItem(L.T("音声バッファ設定..."), null, (_, _) => ShowAudioBufferSettings());
+        var deviceKeywordCfg = new ToolStripMenuItem(L.T("優先デバイス設定..."), null,
+            (_, _) => ShowDeviceKeywordSettings());
         var hotkeyCfg = new ToolStripMenuItem(L.T("ホットキー設定..."), null, (_, _) => ShowHotkeySettings());
+        _miHotkeys = new ToolStripMenuItem(L.T("グローバルホットキーを有効化"), null, (_, _) => ToggleGlobalHotkeys());
         _miStartup = new ToolStripMenuItem(L.T("Windows起動時に自動実行"), null, (_, _) => ToggleStartup());
         _miUpdateCheck = new ToolStripMenuItem(L.T("起動時に更新を確認"), null, (_, _) => ToggleUpdateCheck());
         var lang = new ToolStripMenuItem(L.T("言語 / Language"));
@@ -688,9 +753,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
 
         options.DropDownOpening += (_, _) => { _miStartup.Checked = IsStartupRegistered(); UpdateChecks(); };
-        options.DropDownItems.Add(_miHotkeys);
+        options.DropDownItems.Add(snapCfg);
+        options.DropDownItems.Add(audioBufCfg);
+        options.DropDownItems.Add(deviceKeywordCfg);
         options.DropDownItems.Add(hotkeyCfg);
+        options.DropDownItems.Add(BuildPipSettingsSubmenu());
         options.DropDownItems.Add(new ToolStripSeparator());
+        options.DropDownItems.Add(_miHotkeys);
         options.DropDownItems.Add(_miCursorHide);
         options.DropDownItems.Add(cursorSecs);
         options.DropDownItems.Add(new ToolStripSeparator());
@@ -701,10 +770,19 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // ---- ヘルプ ----
         var help = new ToolStripMenuItem(L.T("ヘルプ(&H)"));
+        var shortcuts = new ToolStripMenuItem(L.T("操作一覧..."), null, (_, _) => ShowShortcuts())
+        {
+            ShortcutKeyDisplayString = "F1",
+        };
         _miCheckUpdate = new ToolStripMenuItem(L.T("更新を確認..."), null,
             async (_, _) => await CheckForUpdatesAsync(manual: true));
-        help.DropDownItems.Add(_miCheckUpdate);
+        _checkUpdateNormalFont?.Dispose();
+        _checkUpdateBoldFont?.Dispose();
+        _checkUpdateNormalFont = new Font(_menu.Font, FontStyle.Regular);
+        _checkUpdateBoldFont = new Font(_menu.Font, FontStyle.Bold);
+        help.DropDownItems.Add(shortcuts);
         help.DropDownItems.Add(new ToolStripSeparator());
+        help.DropDownItems.Add(_miCheckUpdate);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
 
         _menu.Items.AddRange(new ToolStripItem[] { file, device, view, options, help });
@@ -812,13 +890,19 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void BuildStatusBar()
     {
-        _status.RenderMode = ToolStripRenderMode.System;
-        _status.BackColor = SystemColors.Control;
+        // RenderMode/BackColor are left at their defaults here: the dark
+        // chrome (Renderer + BackColor/ForeColor) is applied once, uniformly,
+        // in the constructor via Ui.DarkRenderer — setting System/Control here
+        // would just be overwritten.
         _lblVideo.BorderSides = ToolStripStatusLabelBorderSides.Right;
         _lblAudio.BorderSides = ToolStripStatusLabelBorderSides.Right;
         _lblVolume.BorderSides = ToolStripStatusLabelBorderSides.Right;
+        _lblVolume.ToolTipText = L.T("クリックでミュート切替 ／ 映像の上でホイールまたは ↑↓ で音量");
+        _lblVolume.Click += (_, _) => ToggleMute();
+        _lblState.BorderSides = ToolStripStatusLabelBorderSides.Right;
+        _lblState.ForeColor = Ui.Colors.Accent;
         var filler = new ToolStripStatusLabel { Spring = true, Text = string.Empty };
-        _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, filler });
+        _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, _lblState, filler });
         _status.SizingGrip = true;
     }
 
@@ -861,6 +945,67 @@ public sealed partial class MainForm : Form, IMessageFilter
         _canvas.ContextMenuStrip = _ctx;
     }
 
+    // ---- Shortcuts help (F1) ----------------------------------------------
+
+    private void ShowShortcuts()
+    {
+        using var dlg = Ui.NewDialog(L.T("操作一覧"), 520, 470);
+
+        var lv = new ListView
+        {
+            View = View.Details,
+            FullRowSelect = true,
+            HeaderStyle = ColumnHeaderStyle.Nonclickable,
+            GridLines = false,
+            Location = new Point(Ui.Pad, Ui.Pad),
+            Size = new Size(520 - 2 * Ui.Pad, 470 - 2 * Ui.Pad - Ui.ButtonHeight - Ui.Gap),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+        };
+        lv.Columns.Add(L.T("操作"), 300);
+        lv.Columns.Add(L.T("キー・マウス"), 180);
+
+        var gHere = new ListViewGroup(L.T("YuCap の画面で"));
+        var gGlobal = new ListViewGroup(L.T("どこからでも（グローバルホットキー）"));
+        lv.Groups.Add(gHere);
+        lv.Groups.Add(gGlobal);
+
+        void Row(ListViewGroup g, string action, string keys) =>
+            lv.Items.Add(new ListViewItem(new[] { action, keys }) { Group = g });
+
+        Row(gHere, L.T("全画面表示の切替"), $"F11 ／ {L.T("ダブルクリック")}");
+        Row(gHere, L.T("全画面・PiP を終了"), "Esc");
+        Row(gHere, L.T("一時停止 / 再開"), "Space");
+        Row(gHere, L.T("ミュート"), $"M ／ {L.T("中クリック")} ／ {L.T("音量表示をクリック")}");
+        Row(gHere, L.T("音量"), $"↑ ↓ ／ {L.T("ホイール")}");
+        Row(gHere, L.T("ズーム"), $"Ctrl + {L.T("ホイール")}");
+        Row(gHere, L.T("ズームをリセット"), "Ctrl+0");
+        Row(gHere, L.T("ズーム中の表示位置"), L.T("ドラッグ"));
+        Row(gHere, L.T("ウィンドウの移動"), L.T("映像をドラッグ"));
+        Row(gHere, L.T("スナップショットを保存"), "Ctrl+S");
+        Row(gHere, L.T("スナップショットをコピー"), "Ctrl+C");
+        Row(gHere, L.T("常に前面に表示"), "Ctrl+T");
+        Row(gHere, L.T("ウィンドウ枠を非表示"), "Ctrl+B");
+        Row(gHere, L.T("メニューバーの表示"), "F10");
+        Row(gHere, L.T("メニュー"), L.T("右クリック"));
+        Row(gHere, L.T("操作一覧"), "F1");
+
+        Row(gGlobal, L.T("スナップショットを保存"), FormatHotkey((Keys)_settings.HotkeySnapshot));
+        Row(gGlobal, L.T("ミュート"), FormatHotkey((Keys)_settings.HotkeyMute));
+        Row(gGlobal, L.T("PiP の切替"), FormatHotkey((Keys)_settings.HotkeyPip));
+        if (!_settings.GlobalHotkeys)
+            Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です）"));
+
+        var close = Ui.Button(L.T("閉じる"), 520 - Ui.Pad - Ui.ButtonWidth, 470 - Ui.Pad - Ui.ButtonHeight);
+        close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        close.DialogResult = DialogResult.OK;
+
+        dlg.Controls.Add(lv);
+        dlg.Controls.Add(close);
+        dlg.AcceptButton = close;
+        dlg.CancelButton = close;
+        dlg.ShowDialog(this);
+    }
+
     // ---- Startup / shutdown ---------------------------------------------
 
     private void OnLoad(object? sender, EventArgs e)
@@ -868,12 +1013,38 @@ public sealed partial class MainForm : Form, IMessageFilter
         Application.AddMessageFilter(this);
         SingleInstance.MarkWindow(Handle);   // lets a second launch find us
 
-        // Command-line switches override the saved view state for this launch.
+        // Command-line switches override the saved view state, but ONLY for
+        // this launch: remember what was actually persisted and mark the
+        // property "still overridden" so SaveSettings can write the
+        // remembered value back instead of whatever the CLI forced. A user
+        // action on the same property (NudgeVolume, ToggleBorderless,
+        // ToggleAlwaysOnTop, fullscreen by user action) clears the flag, since
+        // at that point it's the user's own choice, not the launch switch.
         var opts = Program.Options;
-        if (opts.Borderless) _settings.Borderless = true;
-        if (opts.Topmost) _settings.AlwaysOnTop = true;
-        if (opts.Fullscreen) _settings.Fullscreen = true;
-        if (opts.Volume is int vol) _settings.Volume = vol;
+        if (opts.Borderless)
+        {
+            _persistBorderless = _settings.Borderless;
+            _borderlessOverridden = true;
+            _settings.Borderless = true;
+        }
+        if (opts.Topmost)
+        {
+            _persistTopmost = _settings.AlwaysOnTop;
+            _topmostOverridden = true;
+            _settings.AlwaysOnTop = true;
+        }
+        if (opts.Fullscreen)
+        {
+            _persistFullscreen = _settings.Fullscreen;
+            _fullscreenOverridden = true;
+            _settings.Fullscreen = true;
+        }
+        if (opts.Volume is int vol)
+        {
+            _persistVolume = _settings.Volume;
+            _volumeOverridden = true;
+            _settings.Volume = vol;
+        }
         _cliMode = opts.Mode;
 
         ApplyLoadedSettings();
@@ -891,7 +1062,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Restore how the last session was being viewed. Both can be set: a PiP
         // entered FROM fullscreen — EnterPip records the fullscreen state so
         // exiting PiP returns there.
-        if (_settings.Fullscreen && !_isFullscreen) EnterFullscreen();
+        if (_settings.Fullscreen && !_isFullscreen) EnterFullscreen(userAction: false);
         if (_settings.Pip && !_isPip) EnterPip();
 
         UpdateStatus();
@@ -988,15 +1159,18 @@ public sealed partial class MainForm : Form, IMessageFilter
         _settings.LockAspect = _lockAspect;
         // While in PiP the window state is temporary — persist the pre-PiP state
         // so the restored session's "exit PiP" returns to something sensible.
-        _settings.Borderless = _isPip ? _prePipBorderless : _isBorderless;
-        _settings.AlwaysOnTop = _isPip ? _prePipTopmost : _alwaysOnTop;
+        // A property still under a --switch launch override writes back the
+        // value that was actually persisted before the switch, not this
+        // session's (CLI-forced) live state — see OnLoad.
+        _settings.Borderless = _borderlessOverridden ? _persistBorderless : (_isPip ? _prePipBorderless : _isBorderless);
+        _settings.AlwaysOnTop = _topmostOverridden ? _persistTopmost : (_isPip ? _prePipTopmost : _alwaysOnTop);
         _settings.MenuVisible = _isFullscreen ? _savedMenuVisible : (_isPip ? _prePipMenu : _menu.Visible);
         _settings.StatusVisible = _isFullscreen ? _savedStatusVisible : (_isPip ? _prePipStatus : _status.Visible);
-        _settings.Volume = _audio.VolumePercent;
+        _settings.Volume = _volumeOverridden ? _persistVolume : _audio.VolumePercent;
         _settings.AudioBufferMs = _audio.BufferMilliseconds;
         _settings.Rotation = _video.Rotation;
         _settings.Mirror = _video.Mirror;
-        _settings.Fullscreen = _isFullscreen || (_isPip && _prePipFullscreen);
+        _settings.Fullscreen = _fullscreenOverridden ? _persistFullscreen : (_isFullscreen || (_isPip && _prePipFullscreen));
         _settings.Pip = _isPip;
         _settings.SetMode(_savedMode);
 
@@ -1020,6 +1194,35 @@ public sealed partial class MainForm : Form, IMessageFilter
     // audio) meant answering the SAME question twice in a row. The empty canvas
     // state (OnCanvasPaint) and the hot-plug handler cover the "no device yet"
     // case without a dialog.
+    /// <summary>
+    /// Device start (Start()) runs synchronously on the UI thread and cannot be
+    /// moved off it — the capture-engine RCWs are apartment-bound (see
+    /// VideoEngine's own comments on this). That means the UI genuinely does
+    /// freeze for however long Start() takes; the point of this wrapper is to
+    /// never let that freeze be SILENT. It paints "接続しています: X" BEFORE
+    /// blocking (an explicit Invalidate+Update forces that paint through,
+    /// since the message loop itself is about to stall) and shows a wait
+    /// cursor, so a slow device reads as "busy" instead of "hung".
+    /// </summary>
+    private void RunDeviceStart(string deviceName, Action start)
+    {
+        _busyText = L.F("接続しています: {0}", deviceName);
+        try { _video.Stop(); } catch { /* best-effort: about to (re)start anyway */ }
+        _canvas.Invalidate();
+        _canvas.Update();
+        Cursor = Cursors.WaitCursor;
+        try
+        {
+            start();
+        }
+        finally
+        {
+            _busyText = null;
+            Cursor = Cursors.Default;
+            _canvas.Invalidate();
+        }
+    }
+
     private void InitVideo()
     {
         try
@@ -1032,14 +1235,16 @@ public sealed partial class MainForm : Form, IMessageFilter
                 return;
             }
             LayoutCanvas();               // give the canvas a valid size before Start
-            _video.Start(pick, _cliMode ?? _savedMode);
+            RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
             _currentVideoInfo = pick;
+            _videoError = null;
             LayoutCanvas();               // re-fit now that the resolution is known
         }
         catch (Exception ex)
         {
             Log.Info("InitVideo failed: " + ex.Message);
-            ShowOsd(Errors.Describe(ex), OsdLongMilliseconds);
+            _videoError = Errors.Describe(ex);
+            ShowOsd(L.F("映像: {0}", Errors.Describe(ex)), OsdLongMilliseconds);
         }
     }
 
@@ -1060,7 +1265,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         catch (Exception ex)
         {
             Log.Info("InitAudio failed: " + ex.Message);
-            ShowOsd(Errors.Describe(ex), OsdLongMilliseconds);
+            ShowOsd(L.F("音声: {0}", Errors.Describe(ex)), OsdLongMilliseconds);
         }
     }
 
@@ -1093,8 +1298,9 @@ public sealed partial class MainForm : Form, IMessageFilter
                 {
                     try
                     {
-                        _video.Start(pick, _cliMode ?? _savedMode);
+                        RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
                         _currentVideoInfo = pick;
+                        _videoError = null;
                         LayoutCanvas();
                         ShowOsd(L.F("映像を再接続しました: {0}", pick.Name), OsdLongMilliseconds);
                     }
@@ -1213,8 +1419,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         if (_frozen)
         {
-            Rectangle freezeArea = FreezeBounds();
-            if (_freezeBox.Bounds != freezeArea) _freezeBox.Bounds = freezeArea;
+            // FreezeView's own Bounds is always the video area; only its
+            // ImageRect (where the still is drawn within that) depends on the
+            // photo-vs-screen-copy distinction — see FreezeBounds/ImageRect.
+            if (_freezeView.Bounds != _canvas.Bounds) _freezeView.Bounds = _canvas.Bounds;
+            _freezeView.ImageRect = FreezeImageRect();
         }
         PositionOsd();
     }
@@ -1283,6 +1492,89 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         if (_osd.Visible)
             _osd.Location = new Point(_canvas.Left + 12, _canvas.Top + 12);
+    }
+
+    // ---- OSD queue --------------------------------------------------------
+    // Startup used to be able to fire several notices back to back (settings
+    // load failure, device reconnect, new-version banner, ...) and only the
+    // LAST one survived, because ShowOsd just overwrote whatever was showing.
+    // A queue lets every long ("read me") notice get its turn, while short
+    // status flips (volume, zoom, mute) still interrupt instantly instead of
+    // waiting in line behind something the user is mid-read on.
+    private readonly List<(string Text, int? Ms, Action? OnClick)> _osdQueue = new();
+    private (string Text, int? Ms, Action? OnClick)? _osdCurrent;
+    private int _osdShownTick;
+
+    private static bool IsLongOsd(int? ms) => ms.HasValue && ms.Value > OsdMilliseconds;
+
+    private void ShowOsd(string text, int? ms = null, Action? onClick = null)
+    {
+        var item = (text, ms, onClick);
+
+        if (IsLongOsd(ms))
+        {
+            if (_osd.Visible && _osdCurrent is { } cur && IsLongOsd(cur.Ms))
+            {
+                // A long item is already showing: queue behind it rather than
+                // stomping it, but never pile up duplicates of the same text.
+                if (cur.Text == text || _osdQueue.Any(q => q.Text == text)) return;
+                _osdQueue.Add(item);
+                return;
+            }
+            DisplayOsdItem(item);
+            return;
+        }
+
+        // Short item: always interrupts immediately. If it's cutting off a
+        // long item that has barely had time to be read, put that item back
+        // at the FRONT of the queue so it resumes once the short flip is done.
+        if (_osd.Visible && _osdCurrent is { } current && IsLongOsd(current.Ms)
+            && Environment.TickCount - _osdShownTick < 1500)
+        {
+            _osdQueue.Insert(0, current);
+        }
+        DisplayOsdItem(item);
+    }
+
+    private void DisplayOsdItem((string Text, int? Ms, Action? OnClick) item)
+    {
+        _osdCurrent = item;
+        _osdShownTick = Environment.TickCount;
+        int maxWidth = Math.Max(120, _canvas.Width - 24);
+        _osd.ShowText(item.Text, maxWidth, clickable: item.OnClick != null);
+        PositionOsd();
+        _osdTimer.Stop();
+        _osdTimer.Interval = Math.Max(1, item.Ms ?? OsdMilliseconds);
+        _osdTimer.Start();
+    }
+
+    private void OsdTimerTick()
+    {
+        _osdTimer.Stop();
+        AdvanceOsd();
+    }
+
+    private void AdvanceOsd()
+    {
+        if (_osdQueue.Count > 0)
+        {
+            var next = _osdQueue[0];
+            _osdQueue.RemoveAt(0);
+            DisplayOsdItem(next);
+        }
+        else
+        {
+            _osdCurrent = null;
+            _osd.Visible = false;
+        }
+    }
+
+    private void OsdClick()
+    {
+        Action? onClick = _osdCurrent?.OnClick;
+        _osdTimer.Stop();
+        onClick?.Invoke();
+        AdvanceOsd();
     }
 
     // ---- Idle cursor hiding ---------------------------------------------
@@ -1427,24 +1719,31 @@ public sealed partial class MainForm : Form, IMessageFilter
         _settingsSaveTimer.Start();
     }
 
-    private void ShowOsd(string text, int? ms = null)
-    {
-        _lastSavedSnapshot = null;   // only a "saved" notice is clickable
-        _osd.ShowText(text);
-        PositionOsd();
-        _osdTimer.Stop();
-        // Set on every call (not just when ms is given): otherwise a long
-        // message would leave the timer at 4000ms and leak that duration into
-        // whatever short status flip shows next.
-        _osdTimer.Interval = ms ?? OsdMilliseconds;
-        _osdTimer.Start();
-    }
-
     // ---- Volume (hover + wheel) -----------------------------------------
+
+    /// <summary>
+    /// PreFilterMessage sees EVERY WM_MOUSEWHEEL in the app, not just ones over
+    /// our own window — including wheel messages bubbling up from a
+    /// NumericUpDown in a settings dialog (dialogs open centred over the
+    /// video) and from a scrolling dropdown menu. Restricting to our own
+    /// handles, and refusing while a menu dropdown is open, stops the video's
+    /// wheel handling from hijacking those.
+    /// </summary>
+    private bool IsOwnWheelTarget(IntPtr hwnd) =>
+        hwnd == _canvas.Handle || hwnd == _freezeView.Handle || hwnd == _osd.Handle || hwnd == Handle;
+
+    private bool IsMenuDropdownOpen()
+    {
+        if (_ctx.Visible) return true;
+        foreach (ToolStripMenuItem item in _menu.Items.OfType<ToolStripMenuItem>())
+            if (item.IsOnDropDown || item.DropDown.Visible) return true;
+        return false;
+    }
 
     public bool PreFilterMessage(ref Message m)
     {
         if (m.Msg != WmMouseWheel) return false;
+        if (!IsOwnWheelTarget(m.HWnd) || IsMenuDropdownOpen()) return false;
 
         Rectangle screenRect = _canvas.RectangleToScreen(_canvas.ClientRectangle);
         if (!screenRect.Contains(Cursor.Position)) return false;
@@ -1469,10 +1768,20 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void NudgeVolume(int delta)
     {
         if (!_audio.IsRunning) { ShowOsd(L.T("音声がありません")); return; }
-        if (_audio.Muted) { _audio.Muted = false; UpdateChecks(); } // adjusting volume unmutes
+        _volumeOverridden = false; // the user is now choosing the volume themselves
         int newVol = Math.Clamp(_audio.VolumePercent + delta, 0, AudioEngine.MaxVolumePercent);
         _audio.VolumePercent = newVol;
-        ShowOsd(L.F("音量 {0}%", newVol));
+        if (_frozen)
+        {
+            // Audio stays silent while paused — changing volume must not
+            // unmute it out from under the pause, unlike the normal path.
+            ShowOsd(L.F("音量 {0}%（一時停止中）", newVol));
+        }
+        else
+        {
+            if (_audio.Muted) { _audio.Muted = false; UpdateChecks(); } // adjusting volume unmutes
+            ShowOsd(L.F("音量 {0}%", newVol));
+        }
         UpdateStatus();
         MarkSettingsDirty();
     }
@@ -1499,27 +1808,37 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // This is a Windows-wide recording-level change, not an app setting: it
         // affects every other application using this device and survives YuCap
-        // exiting. Ask first, and remember the previous value so it can be put
-        // back via "入力レベルを元に戻す".
+        // exiting. Ask first, and remember the previous value — in settings.json,
+        // tied to the device it was taken on — so it can be put back via
+        // "入力レベルを元に戻す" even after a restart, matching what this dialog
+        // promises ("メニューから戻せます").
         if (MessageBox.Show(this,
                 L.T("入力レベルを最大にしますか？\n\nWindows の録音デバイスの音量を 100% に変更します。\nこの設定は他のアプリにも影響し、YuCap を終了しても元に戻りません。\n（メニューの「入力レベルを元に戻す」で戻せます）"),
                 "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return;
 
-        _captureLevelBefore = before;
+        _settings.CaptureLevelBefore = before;
+        _settings.CaptureLevelDeviceId = _audio.CurrentDeviceId;
+        MarkSettingsDirty();
         _audio.CaptureLevelPercent = 100;
         ShowOsd(L.F("入力レベル {0}% → 100%", before));
         UpdateStatus();
         UpdateChecks();
     }
 
-    /// <summary>Undo the Windows-wide change made by MaximizeCaptureLevel.</summary>
+    /// <summary>Undo the Windows-wide change made by MaximizeCaptureLevel. Only
+    /// offered while the CURRENT device matches the one the level was raised
+    /// on (see _miRestoreLevel.Enabled in UpdateChecks) — restoring a value
+    /// captured on a different device would silently mis-set it.</summary>
     private void RestoreCaptureLevel()
     {
-        if (_captureLevelBefore < 0 || !_audio.IsRunning) return;
-        _audio.CaptureLevelPercent = _captureLevelBefore;
-        ShowOsd(L.F("入力レベルを {0}% に戻しました", _captureLevelBefore));
-        _captureLevelBefore = -1;
+        if (_settings.CaptureLevelBefore < 0 || !_audio.IsRunning
+            || _audio.CurrentDeviceId != _settings.CaptureLevelDeviceId) return;
+        _audio.CaptureLevelPercent = _settings.CaptureLevelBefore;
+        ShowOsd(L.F("入力レベルを {0}% に戻しました", _settings.CaptureLevelBefore));
+        _settings.CaptureLevelBefore = -1;
+        _settings.CaptureLevelDeviceId = null;
+        MarkSettingsDirty();
         UpdateStatus();
         UpdateChecks();
     }
@@ -1527,6 +1846,16 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void ToggleMute()
     {
         if (!_audio.IsRunning) { ShowOsd(L.T("音声がありません")); return; }
+        if (_frozen)
+        {
+            // Audio is already forced silent while paused (see ToggleFreeze);
+            // flip what happens on resume instead of the live mute state.
+            _mutedBeforeFreeze = !_mutedBeforeFreeze;
+            ShowOsd(_mutedBeforeFreeze ? L.T("再開時にミュート: オン") : L.T("再開時にミュート: オフ"));
+            UpdateChecks();
+            UpdateStatus();
+            return;
+        }
         _audio.Muted = !_audio.Muted;
         ShowOsd(_audio.Muted ? L.T("ミュート") : L.F("ミュート解除 ({0}%)", _audio.VolumePercent));
         UpdateChecks();
@@ -1541,10 +1870,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             _frozen = false;
             _freezeIsPhoto = false;
-            _freezeBox.Visible = false;
-            Image? old = _freezeBox.Image;
-            _freezeBox.Image = null;
-            old?.Dispose();
+            _freezeView.Visible = false;
+            _freezeView.Image = null;
+            _freezeImage?.Dispose();
+            _freezeImage = null;
             if (!_mutedBeforeFreeze && _audio.IsRunning) _audio.Muted = false;
             ShowOsd(L.T("再開"));
         }
@@ -1554,15 +1883,23 @@ public sealed partial class MainForm : Form, IMessageFilter
             // video pixels only, so it cannot pick up whatever else happens to be
             // on screen over/behind the window (another overlapping window, or a
             // translucent PiP background) the way the compositor screen copy can.
+            // It is also already rotated/mirrored to match the preview — no extra
+            // orientation handling needed here.
             Bitmap? still = _video.PhotoSnapshot();
             _freezeIsPhoto = still != null;
             if (still == null)
                 still = _video.Snapshot(cropToVideo: false); // fallback: includes letterbox → 1:1 overlay
-            if (still == null) { ShowOsd(L.T("映像がありません")); return; }
-            _freezeBox.Image = still;
-            _freezeBox.Bounds = FreezeBounds();
-            _freezeBox.Visible = true;
-            _freezeBox.BringToFront();
+            if (still == null)
+            {
+                ShowOsd(_video.LastSnapshotError ?? L.T("映像がありません"), OsdLongMilliseconds);
+                return;
+            }
+            _freezeImage = still;
+            _freezeView.Image = still;
+            _freezeView.Bounds = _canvas.Bounds;
+            _freezeView.ImageRect = FreezeImageRect();
+            _freezeView.Visible = true;
+            _freezeView.BringToFront();
             _osd.BringToFront();
             _frozen = true;
             _mutedBeforeFreeze = _audio.Muted;
@@ -1573,16 +1910,15 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateStatus();
     }
 
-    /// <summary>Where the freeze overlay belongs, in form coordinates. The
-    /// screen-copy fallback already includes the letterbox, so it maps 1:1 onto
-    /// the whole canvas; the photo-sink still is video pixels only and must be
-    /// placed at the video's own destination rectangle instead.</summary>
-    private Rectangle FreezeBounds()
-    {
-        if (!_freezeIsPhoto) return _canvas.Bounds;
-        Rectangle dest = ComputeDest(_canvas.ClientSize);
-        return new Rectangle(dest.X + _canvas.Location.X, dest.Y + _canvas.Location.Y, dest.Width, dest.Height);
-    }
+    /// <summary>Where the still belongs within FreezeView's own client area
+    /// (FreezeView.Bounds is always the full canvas area — see LayoutCanvas).
+    /// The screen-copy fallback already includes the letterbox, so it maps 1:1
+    /// onto the whole view; the photo-sink still is video pixels only and must
+    /// be placed at the video's own destination rectangle instead. Anything
+    /// outside this rect (e.g. while zoomed in) is naturally clipped by
+    /// FreezeView rather than overflowing onto the menu/status bars.</summary>
+    private Rectangle FreezeImageRect() =>
+        _freezeIsPhoto ? ComputeDest(_canvas.ClientSize) : new Rectangle(Point.Empty, _canvas.ClientSize);
 
 
     // ---- Burst snapshots -------------------------------------------------
@@ -1596,39 +1932,22 @@ public sealed partial class MainForm : Form, IMessageFilter
             return;
         }
 
-        using var dlg = new Form
-        {
-            Text = L.T("連写スナップショット"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(300, 130),
-            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
-            // were drawn against at 100% — WinForms then scales every
-            // Location/Size by the same factor as the font, so the layout
-            // still holds together at 125-200% display scaling.
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
-        var lblInt = new Label { Text = L.T("間隔 (秒):"), AutoSize = true, Location = new Point(16, 20) };
+        using var dlg = Ui.NewDialog(L.T("連写スナップショット"), 300, 130);
+
+        var lblInt = Ui.Label(L.T("間隔 (秒):"), Ui.Pad, 20);
         var numInt = new NumericUpDown
         {
             Minimum = 0.5m, Maximum = 3600, DecimalPlaces = 1, Increment = 0.5m,
             Value = 5, Location = new Point(110, 16), Width = 100,
         };
-        var lblCnt = new Label { Text = L.T("枚数:"), AutoSize = true, Location = new Point(16, 56) };
+        var lblCnt = Ui.Label(L.T("枚数:"), Ui.Pad, 56);
         var numCnt = new NumericUpDown
         {
             Minimum = 1, Maximum = 999, Value = 10,
             Location = new Point(110, 52), Width = 100,
         };
-        var ok = new Button { Text = L.T("開始"), DialogResult = DialogResult.OK, Location = new Point(104, 92), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(195, 92), Width = 90 };
-        dlg.Controls.AddRange(new Control[] { lblInt, numInt, lblCnt, numCnt, ok, cancel });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
+        dlg.Controls.AddRange(new Control[] { lblInt, numInt, lblCnt, numCnt });
+        Ui.AddOkCancel(dlg, L.T("開始"));
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         _burstTotal = (int)numCnt.Value;
@@ -1692,7 +2011,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Info("ToggleStartup failed: " + ex);
+            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         _miStartup.Checked = IsStartupRegistered();
     }
@@ -1701,41 +2021,40 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowDeviceKeywordSettings()
     {
-        using var dlg = new Form
-        {
-            Text = L.T("優先デバイス設定"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(340, 130),
-            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
-            // were drawn against at 100% — WinForms then scales every
-            // Location/Size by the same factor as the font, so the layout
-            // still holds together at 125-200% display scaling.
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
-        var lbl = new Label { Text = L.T("キーワード:"), AutoSize = true, Location = new Point(16, 20) };
+        using var dlg = Ui.NewDialog(L.T("優先デバイス設定"), 340, 130);
+
+        var lbl = Ui.Label(L.T("キーワード:"), Ui.Pad, 20);
         var txt = new TextBox { Text = _settings.DeviceKeyword, Location = new Point(110, 16), Width = 210 };
-        var hint = new Label
-        {
-            Text = L.T("デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）"),
-            AutoSize = true,
-            // SystemColors.GrayText (not Color.Gray, ~2.9:1) is the theme's
-            // intended hint colour and reads at a proper contrast ratio.
-            ForeColor = SystemColors.GrayText,
-            Location = new Point(16, 50),
-        };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(144, 92), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(235, 92), Width = 90 };
-        dlg.Controls.AddRange(new Control[] { lbl, txt, hint, ok, cancel });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
+        var hint = Ui.Hint(
+            L.T("デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）"),
+            Ui.Pad, 50, 340 - 2 * Ui.Pad);
+        dlg.Controls.AddRange(new Control[] { lbl, txt, hint });
+        Ui.AddOkCancel(dlg);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        _settings.DeviceKeyword = string.IsNullOrWhiteSpace(txt.Text) ? "JVA14" : txt.Text.Trim();
+
+        string keyword = string.IsNullOrWhiteSpace(txt.Text) ? "JVA14" : txt.Text.Trim();
+        _settings.DeviceKeyword = keyword;
         SaveSettings();
+
+        // Applying the new keyword right away (rather than only on the next
+        // device/app start) matches what the dialog implies it just did.
+        var videoMatch = VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), keyword);
+        bool switched = false;
+        if (videoMatch != null && videoMatch.Id != _currentVideoInfo?.Id)
+        {
+            SwitchVideoDevice(videoMatch);
+            switched = true;
+        }
+        var audioMatch = AudioEngine.PickPreferred(AudioEngine.EnumerateDevices(), keyword);
+        if (audioMatch != null && audioMatch.Id != _currentAudioInfo?.Id)
+        {
+            SwitchAudioDevice(audioMatch);
+            switched = true;
+        }
+
+        ShowOsd(switched
+            ? L.F("優先デバイス: {0}", keyword)
+            : L.F("優先デバイスを「{0}」に設定しました", keyword), OsdLongMilliseconds);
     }
 
     /// <summary>
@@ -1932,13 +2251,21 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleFullscreen()
     {
-        if (_isFullscreen) ExitFullscreen();
-        else EnterFullscreen();
+        // F11 / double-click: a deliberate user action, so a --fullscreen
+        // launch override no longer applies once the user has touched it.
+        if (_isFullscreen) ExitFullscreen(userAction: true);
+        else EnterFullscreen(userAction: true);
     }
 
-    private void EnterFullscreen()
+    /// <param name="userAction">True when this is the user's own decision to
+    /// enter fullscreen (F11, double-click, forwarded --fullscreen from a
+    /// second launch) — clears a --fullscreen launch override so SaveSettings
+    /// persists the user's own choice. False for internal restores (initial
+    /// OnLoad restore, PiP transitions preserving pre-PiP state).</param>
+    private void EnterFullscreen(bool userAction = true)
     {
         Log.Info("EnterFullscreen: begin");
+        if (userAction) _fullscreenOverridden = false;
         // PiP's opacity/topmost/small-window state must not leak into fullscreen.
         if (_isPip) ExitPip();
         // The second click of the fullscreen double-click also started a drag;
@@ -1964,9 +2291,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         Log.Info("EnterFullscreen: done (video rect deferred)");
     }
 
-    private void ExitFullscreen()
+    private void ExitFullscreen(bool userAction = true)
     {
         Log.Info("ExitFullscreen: begin");
+        if (userAction) _fullscreenOverridden = false;
         _isFullscreen = false;
         _menu.Visible = _savedMenuVisible;
         _status.Visible = _savedStatusVisible;
@@ -1989,6 +2317,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleBorderless()
     {
+        _borderlessOverridden = false; // the user is now choosing this themselves
         // Capture the video (client) area to preserve BEFORE changing the frame,
         // while ClientSize is still accurate for the current frame style.
         bool normal = !_isFullscreen && WindowState == FormWindowState.Normal;
@@ -2039,6 +2368,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleAlwaysOnTop()
     {
+        _topmostOverridden = false; // the user is now choosing this themselves
         _alwaysOnTop = !_alwaysOnTop;
         if (!_isFullscreen)
             TopMost = _alwaysOnTop;
@@ -2128,14 +2458,15 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_frozen) ToggleFreeze();
         try
         {
-            _video.Start(info, _savedMode);
+            RunDeviceStart(info.Name, () => _video.Start(info, _savedMode));
             _currentVideoInfo = info;
+            _videoError = null;
             LayoutCanvas();
             ShowOsd(L.F("映像: {0}", info.Name));
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("映像デバイスの切り替えに失敗しました。\n\n{0}", ex.Message),
+            MessageBox.Show(this, L.F("映像デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             RecoverVideo(); // best-effort: bring the previous device back
         }
@@ -2149,17 +2480,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_currentVideoInfo == null || _video.IsRunning) return;
         try
         {
-            _video.Start(_currentVideoInfo, _savedMode);
+            RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, _savedMode));
             LayoutCanvas();
         }
-        catch { /* the error was already reported; leave the "映像なし" canvas */ }
+        catch { /* the error was already reported; leave the empty canvas */ }
     }
 
     private void RebuildVideoModeList(ToolStripMenuItem root)
     {
         root.DropDownItems.Clear();
 
-        var auto = new ToolStripMenuItem(L.T("自動 (最大解像度)"), null, (_, _) => ClearModePreference())
+        // Renamed from "自動 (最大解像度)": the code keeps the device's OWN
+        // default mode, it never picks the maximum resolution — the old label
+        // promised something this never actually did.
+        var auto = new ToolStripMenuItem(L.T("自動（機器の既定）"), null, (_, _) => ClearModePreference())
         {
             Checked = _savedMode == null,
         };
@@ -2197,7 +2531,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cliMode = null; // an explicit choice overrides the --mode switch
         try
         {
-            _video.Start(_currentVideoInfo, mode);
+            RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, mode));
+            _videoError = null;
             _savedMode = _video.CurrentMode;
             SaveSettings();
             LayoutCanvas();
@@ -2205,7 +2540,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", ex.Message),
+            MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             RecoverVideo();
         }
@@ -2221,13 +2556,14 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_frozen) ToggleFreeze();
         try
         {
-            _video.Start(_currentVideoInfo, null);
+            RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, null));
+            _videoError = null;
             LayoutCanvas();
             ShowOsd(L.T("映像モード: 自動"));
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", ex.Message),
+            MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             RecoverVideo();
         }
@@ -2244,7 +2580,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("音声デバイスの切り替えに失敗しました。\n\n{0}", ex.Message),
+            MessageBox.Show(this, L.F("音声デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         UpdateStatus();
@@ -2254,24 +2590,9 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowAudioBufferSettings()
     {
-        using var dlg = new Form
-        {
-            Text = L.T("音声バッファ設定"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(360, 210),
-            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
-            // were drawn against at 100% — WinForms then scales every
-            // Location/Size by the same factor as the font, so the layout
-            // still holds together at 125-200% display scaling.
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
+        using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 360, 210);
 
-        var lbl = new Label { Text = L.T("バッファ長 (ms):"), AutoSize = true, Location = new Point(16, 22) };
+        var lbl = Ui.Label(L.T("バッファ長 (ms):"), Ui.Pad, 22);
         var num = new NumericUpDown
         {
             Minimum = AudioEngine.MinBufferMs,
@@ -2284,29 +2605,20 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // Presets: this value is now an actively-held latency target, so these
         // map directly to the delay you hear.
-        var lblPreset = new Label { Text = L.T("プリセット:"), AutoSize = true, Location = new Point(16, 58) };
-        var btnLow = new Button { Text = L.T("低遅延 60"), Location = new Point(16, 78), Width = 100 };
-        var btnMid = new Button { Text = L.T("標準 120"), Location = new Point(126, 78), Width = 100 };
-        var btnSafe = new Button { Text = L.T("安定 250"), Location = new Point(236, 78), Width = 100 };
+        var lblPreset = Ui.Label(L.T("プリセット:"), Ui.Pad, 58);
+        var btnLow = Ui.Button(L.T("低遅延 60"), Ui.Pad, 78, 100);
+        var btnMid = Ui.Button(L.T("標準 120"), 126, 78, 100);
+        var btnSafe = Ui.Button(L.T("安定 250"), 236, 78, 100);
         btnLow.Click += (_, _) => num.Value = 60;
         btnMid.Click += (_, _) => num.Value = 120;
         btnSafe.Click += (_, _) => num.Value = 250;
 
-        var hint = new Label
-        {
-            Text = L.T("この値が実際の音声遅延の目安になります。\n小さいほど低遅延ですが、音切れが出たら上げてください。\n実測値はステータスバーの「遅延」に表示されます。"),
-            AutoSize = true,
-            // SystemColors.GrayText (not Color.Gray, ~2.9:1) is the theme's
-            // intended hint colour and reads at a proper contrast ratio.
-            ForeColor = SystemColors.GrayText,
-            Location = new Point(16, 114),
-        };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(164, 170), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(255, 170), Width = 90 };
+        var hint = Ui.Hint(
+            L.T("この値が実際の音声遅延の目安になります。\n小さいほど低遅延ですが、音切れが出たら上げてください。\n実測値はステータスバーの「遅延」に表示されます。"),
+            Ui.Pad, 114, 360 - 2 * Ui.Pad);
 
-        dlg.Controls.AddRange(new Control[] { lbl, num, lblPreset, btnLow, btnMid, btnSafe, hint, ok, cancel });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
+        dlg.Controls.AddRange(new Control[] { lbl, num, lblPreset, btnLow, btnMid, btnSafe, hint });
+        Ui.AddOkCancel(dlg);
 
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
@@ -2316,7 +2628,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             try { _audio.Start(_currentAudioInfo); }
             catch (Exception ex)
             {
-                MessageBox.Show(this, L.F("音声の再初期化に失敗しました。\n\n{0}", ex.Message),
+                MessageBox.Show(this, L.F("音声の再初期化に失敗しました。\n\n{0}", Errors.Describe(ex)),
                     "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
@@ -2532,6 +2844,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         _lblVolume.Text = _audio.Muted
             ? $"{volLabel}: {L.T("ミュート")}"
             : $"{volLabel}: {_audio.VolumePercent}%{(_audio.IsLimiting ? " !" : string.Empty)}";
+        _lblVolume.ToolTipText = L.T("クリックでミュート切替 ／ 映像の上でホイールまたは ↑↓ で音量")
+            + (!_audio.Muted && _audio.IsLimiting
+                ? "\n" + L.T("! = 音量が大きすぎるため、音割れを防ぐ処理が働いています")
+                : string.Empty);
+
+        // Current-mode label: at most one relevant note at a time, so the bar
+        // never crowds out the device labels next to it.
+        var stateParts = new List<string>();
+        if (_frozen) stateParts.Add(L.T("一時停止中"));
+        if (_isPip) stateParts.Add(L.T("PiP"));
+        if (_burstTimer.Enabled) stateParts.Add(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
+        if (_zoom > 1.001) stateParts.Add(L.F("ズーム {0}%", (int)Math.Round(_zoom * 100)));
+        _lblState.Text = string.Join("  ", stateParts);
+        _lblState.Visible = stateParts.Count > 0;
 
         // Title bar mirrors the negotiated mode (handy when the bars are hidden).
         Size res = _video.CurrentResolution;
@@ -2572,7 +2898,21 @@ public sealed partial class MainForm : Form, IMessageFilter
         _miHotkeys.Checked = _settings.GlobalHotkeys;
         _miCursorHide.Checked = _settings.CursorAutoHide;
         _miUpdateCheck.Checked = _settings.UpdateCheckOnStartup;
-        _miRestoreLevel.Enabled = _captureLevelBefore >= 0 && _audio.IsRunning;
+        _miRestoreLevel.Enabled = _settings.CaptureLevelBefore >= 0 && _audio.IsRunning
+            && _audio.CurrentDeviceId == _settings.CaptureLevelDeviceId;
+
+        // A found-but-not-skipped update relabels the help menu item so it's
+        // discoverable without a startup dialog the user has to dismiss.
+        if (_pendingUpdate != null)
+        {
+            _miCheckUpdate.Text = L.F("更新があります: {0}...", _pendingUpdate.Version);
+            _miCheckUpdate.Font = _checkUpdateBoldFont;
+        }
+        else
+        {
+            _miCheckUpdate.Text = L.T("更新を確認...");
+            _miCheckUpdate.Font = _checkUpdateNormalFont;
+        }
 
         // Burst mode is started and stopped by the same menu item; say which.
         _miBurst.Text = _burstTimer.Enabled
@@ -2609,6 +2949,12 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (keyData == (Keys)_settings.HotkeyPip) { TogglePip(); return true; }
         }
 
+        // Bit 30 of lParam ("previous key state") is set on every WM_KEYDOWN
+        // generated by the key still being held down — i.e. auto-repeat, not a
+        // fresh press. Holding Ctrl+S must fire ONE snapshot, not one per
+        // repeat interval.
+        bool isRepeat = ((long)msg.LParam & 0x40000000) != 0;
+
         switch (keyData)
         {
             case Keys.F11:
@@ -2617,11 +2963,14 @@ public sealed partial class MainForm : Form, IMessageFilter
             case Keys.F10:
                 ToggleMenuBar();
                 return true;
+            case Keys.F1:
+                ShowShortcuts();
+                return true;
             case Keys.Control | Keys.S:
-                SaveSnapshot();
+                if (!isRepeat) SaveSnapshot();
                 return true;
             case Keys.Control | Keys.C:
-                CopySnapshotToClipboard();
+                if (!isRepeat) CopySnapshotToClipboard();
                 return true;
             case Keys.Control | Keys.T:
                 ToggleAlwaysOnTop();
@@ -2650,6 +2999,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 return true;
             case Keys.Escape:
                 if (_isFullscreen) { ExitFullscreen(); return true; }
+                if (_isPip) { ExitPip(); return true; }
                 break;
         }
         return base.ProcessCmdKey(ref msg, keyData);
@@ -2671,6 +3021,9 @@ public sealed partial class MainForm : Form, IMessageFilter
             _cursorTimer.Dispose();
             _settingsSaveTimer.Dispose();
             _startupTimer.Dispose();
+            _checkUpdateNormalFont?.Dispose();
+            _checkUpdateBoldFont?.Dispose();
+            _freezeImage?.Dispose();
             ShowCursorIfHidden();   // belt and braces: Cursor.Hide() is process-wide
         }
         base.Dispose(disposing);

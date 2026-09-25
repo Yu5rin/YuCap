@@ -54,10 +54,15 @@ internal static class L
         ["スナップショット:"] = "Snapshot:",
         ["ミュート:"] = "Mute:",
         ["PiP切替:"] = "Toggle PiP:",
-        ["欄をクリックしてキーを押してください。Esc で無効化できます。"] =
-            "Click a field and press a key combo. Esc disables it.",
         ["同じキーが複数の操作に割り当てられています。"] =
             "The same key is assigned to more than one action.",
+        ["{0} は Windows の基本操作と重なるため使えません。"] =
+            "{0} can't be used because it conflicts with a basic Windows shortcut.",
+        ["欄を選んでキーの組み合わせを押してください。［解除］または Backspace で割り当てを外せます。"] =
+            "Select a field and press a key combination. Use [Clear] or Backspace to unassign.",
+        ["解除"] = "Clear",
+        ["閉じる"] = "Close",
+        ["（グローバルホットキーは無効です）"] = "(Global hotkeys are disabled)",
         ["終了"] = "Exit",
         ["デバイス(&D)"] = "&Device",
         ["映像デバイス"] = "Video device",
@@ -108,6 +113,7 @@ internal static class L
         ["ステータスバーを表示"] = "Show status bar",
         ["ヘルプ(&H)"] = "&Help",
         ["言語 / Language"] = "言語 / Language",
+        ["操作一覧..."] = "Controls...",
         ["バージョン情報..."] = "About...",
         ["更新を確認..."] = "Check for updates...",
 
@@ -149,27 +155,40 @@ internal static class L
         ["更新のダウンロードに失敗しました。\n\n{0}"] = "Failed to download the update.\n\n{0}",
         ["更新の適用に失敗しました。元の状態に戻しました。\n\n{0}"] =
             "Failed to apply the update; the previous version was restored.\n\n{0}",
+        ["更新があります"] = "Update available",
+        ["更新があります: {0}..."] = "Update available: {0}...",
+        ["新しいバージョン {0} があります（クリックで詳細）"] =
+            "Version {0} is available (click for details)",
 
 
         // ---- Device lists ----
         ["（デバイスなし）"] = "(no devices)",
-        ["自動 (最大解像度)"] = "Auto (max resolution)",
+        ["自動（機器の既定）"] = "Auto (device default)",
         ["（利用可能なモードなし）"] = "(no modes available)",
 
         // ---- OSD ----
         ["音量 {0}%"] = "Volume {0}%",
+        ["音量 {0}%（一時停止中）"] = "Volume {0}% (paused)",
+        ["! = 音量が大きすぎるため、音割れを防ぐ処理が働いています"] =
+            "! = the volume is so high that clipping protection is active",
         ["ミュート解除 ({0}%)"] = "Unmuted ({0}%)",
         ["音声がありません"] = "No audio",
         ["映像がありません"] = "No video",
-        ["映像なし"] = "No video",
+        ["映像が入力されていません"] = "No video input",
         ["接続しています..."] = "Connecting...",
+        ["接続しています: {0}"] = "Connecting: {0}",
+        ["優先デバイス: {0}"] = "Preferred device: {0}",
+        ["優先デバイスを「{0}」に設定しました"] = "Preferred device set to \"{0}\"",
         ["キャプチャデバイスを接続すると自動的に表示されます"] =
             "Connect a capture device and it appears automatically",
         ["設定ファイルを読み込めませんでした。既定値で起動しています。"] =
             "The settings file could not be read; started with defaults.",
         ["ズーム {0}%"] = "Zoom {0}%",
         ["一時停止"] = "Paused",
+        ["一時停止中"] = "Paused",
         ["再開"] = "Resumed",
+        ["再開時にミュート: オン"] = "Mute on resume: on",
+        ["再開時にミュート: オフ"] = "Mute on resume: off",
         ["保存に失敗しました"] = "Save failed",
         ["保存に失敗しました。\n\n{0}"] = "Failed to save the snapshot.\n\n{0}",
         ["保存先フォルダを使えないため、既定のフォルダに保存しました。"] =
@@ -207,6 +226,11 @@ internal static class L
         ["音量"] = "Volume",
         ["なし"] = "none",
         ["遅延"] = "delay",
+        ["音量表示をクリック"] = "Click the volume display",
+        ["クリックでミュート切替 ／ 映像の上でホイールまたは ↑↓ で音量"] =
+            "Click to toggle mute / wheel or ↑↓ over the video for volume",
+        ["PiP"] = "PiP",
+        ["右クリックでメニュー、F1 で操作一覧を表示できます"] = "Right-click for the menu, F1 for the controls list",
 
         // ---- Dialogs ----
         ["音声バッファ設定"] = "Audio buffer settings",
@@ -237,6 +261,8 @@ internal static class L
         ["バージョン情報"] = "About",
         ["バージョン {0}"] = "Version {0}",
         ["使用ライブラリ:"] = "Libraries:",
+        ["ウィンドウの大きさに関係なく、入力された映像の解像度で保存します。"] =
+            "Saves at the source video's resolution, regardless of the window size.",
 
         // ---- Errors shown to the user ----
         // Raw HRESULT text ("Exception from HRESULT: 0x80070005") tells nobody
@@ -249,8 +275,24 @@ internal static class L
             "The device is not responding. Reconnect the USB cable.",
         ["デバイスが使用中です。他のアプリを閉じてから再試行してください。"] =
             "The device is busy. Close other applications and try again.",
-        ["映像デバイスのエラーが発生しました。"] = "A video device error occurred.",
-        ["エラーが発生しました。"] = "An error occurred.",
+        ["映像デバイスのエラーが発生しました。（コード 0x{0:X8}）"] =
+            "A video device error occurred. (code 0x{0:X8})",
+        ["エラーが発生しました。（コード 0x{0:X8}）"] = "An error occurred. (code 0x{0:X8})",
+        ["サーバーに接続できませんでした。ネットワーク接続を確認してください。"] =
+            "Could not connect to the server. Check your network connection.",
+        ["応答がありませんでした（タイムアウト）。"] = "There was no response (timed out).",
+        ["ディスクの空き容量が足りません。"] = "There is not enough free disk space.",
+        ["保存先に書き込む権限がありません。別のフォルダを選んでください。"] =
+            "You don't have permission to write to that folder. Choose a different one.",
+        ["保存先のパスが長すぎます。"] = "The destination path is too long.",
+        ["保存先のフォルダが見つかりません。"] = "The destination folder was not found.",
+        ["最小化中は画面から取得できません。"] = "Can't capture the screen while minimized.",
+        ["他のウィンドウに隠れているため、画面から取得できません。YuCap を前面に出してください。"] =
+            "Can't capture the screen because another window is covering it. Bring YuCap to the front.",
+        ["音声デバイスが他のアプリに占有されています。そのアプリを閉じてから再試行してください。"] =
+            "The audio device is in use by another application. Close that application and try again.",
+        ["音声デバイスが取り外されたか、無効になりました。"] = "The audio device was removed or disabled.",
+        ["音声デバイスの形式に対応していません。"] = "The audio device's format is not supported.",
         ["予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。"] =
             "An unexpected error occurred.\n\n{0}\n\nDetails were written to error.log.",
         ["映像デバイスが見つかりません。"] = "Video device not found.",
@@ -293,5 +335,26 @@ internal static class L
             "Current: {0}\nThe update check failed.\n\n{1}\n\nEndpoint:\n{2}",
         ["現在: {0}\n最新: {1} ({2})\n\n{3}  {4} bytes\nSHA256: {5}\n{6}"] =
             "Current: {0}\nLatest: {1} ({2})\n\n{3}  {4} bytes\nSHA256: {5}\n{6}",
+
+        // ---- Shortcuts dialog ----
+        ["操作一覧"] = "Controls",
+        ["操作"] = "Action",
+        ["キー・マウス"] = "Key / mouse",
+        ["YuCap の画面で"] = "In the YuCap window",
+        ["どこからでも（グローバルホットキー）"] = "Anywhere (global hotkeys)",
+        ["全画面表示の切替"] = "Toggle fullscreen",
+        ["ダブルクリック"] = "Double-click",
+        ["全画面・PiP を終了"] = "Exit fullscreen / PiP",
+        ["中クリック"] = "Middle-click",
+        ["ホイール"] = "Wheel",
+        ["ズーム"] = "Zoom",
+        ["ズーム中の表示位置"] = "Pan while zoomed",
+        ["ドラッグ"] = "Drag",
+        ["ウィンドウの移動"] = "Move window",
+        ["映像をドラッグ"] = "Drag the video",
+        ["メニューバーの表示"] = "Show menu bar",
+        ["メニュー"] = "Menu",
+        ["右クリック"] = "Right-click",
+        ["PiP の切替"] = "Toggle PiP",
     };
 }

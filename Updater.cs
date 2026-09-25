@@ -248,7 +248,7 @@ internal static class Updater
             {
                 DiscardStaging();
                 Log.Info($"update: SHA256 mismatch (expected {info.Sha256}, got {actual})");
-                throw new InvalidDataException(L.T("ダウンロードしたファイルの検証に失敗しました。"));
+                throw new UserFacingException(L.T("ダウンロードしたファイルの検証に失敗しました。"));
             }
             Log.Info("update: SHA256 verified");
         }
@@ -294,7 +294,7 @@ internal static class Updater
     public static void Apply(string downloadedExe)
     {
         string? cur = ExePath;
-        if (cur == null) throw new InvalidOperationException(L.T("実行ファイルの場所を特定できません。"));
+        if (cur == null) throw new UserFacingException(L.T("実行ファイルの場所を特定できません。"));
         string old = cur + OldSuffix;
 
         // A leftover from a previous update would block the rename.

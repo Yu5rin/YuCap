@@ -111,6 +111,11 @@ public sealed class VideoEngine : IDisposable
     /// misses instead of never.</summary>
     private int _photoTimeouts;
 
+    /// <summary>Set (localized) when Snapshot() returns null — e.g. the window is
+    /// minimized or another window is covering it — and cleared to null on success.
+    /// Lets callers show the user why a screen-copy snapshot did not happen.</summary>
+    public string? LastSnapshotError { get; private set; }
+
     public string? CurrentDeviceName { get; private set; }
     public Size CurrentResolution { get; private set; }
     public CaptureMode? CurrentMode { get; private set; }
@@ -219,7 +224,10 @@ public sealed class VideoEngine : IDisposable
             else
                 act.Dispose();
         }
-        return match ?? throw new InvalidOperationException(L.T("映像デバイスが見つかりません。"));
+        // Own message for the user, not a framework exception: Errors.Describe only
+        // passes UserFacingException's text through verbatim (see Errors.cs) — a
+        // bare InvalidOperationException would instead show generic English text.
+        return match ?? throw new UserFacingException(L.T("映像デバイスが見つかりません。"));
     }
 
     // ---- Start / Stop ----------------------------------------------------
@@ -230,7 +238,7 @@ public sealed class VideoEngine : IDisposable
         Stop();
         EnsureStartup();
         if (_hwnd == IntPtr.Zero)
-            throw new InvalidOperationException(L.T("表示ウィンドウが設定されていません。"));
+            throw new UserFacingException(L.T("表示ウィンドウが設定されていません。"));
 
         using IMFActivate activate = FindActivate(info);
 
@@ -248,7 +256,7 @@ public sealed class VideoEngine : IDisposable
         Marshal.ThrowExceptionForHR(
             _engine.Initialize(_callback, IntPtr.Zero, IntPtr.Zero, activate.NativePointer));
         if (!_callback.Initialized.Wait(5000))
-            throw new TimeoutException(L.T("キャプチャエンジンの初期化がタイムアウトしました。"));
+            throw new UserFacingException(L.T("キャプチャエンジンの初期化がタイムアウトしました。"));
         if (_callback.LastHr < 0)
             Marshal.ThrowExceptionForHR(_callback.LastHr);
 
@@ -297,7 +305,7 @@ public sealed class VideoEngine : IDisposable
         _callback.PreviewStarted.Reset();
         Marshal.ThrowExceptionForHR(_engine.StartPreview());
         if (!_callback.PreviewStarted.Wait(5000))
-            throw new TimeoutException(L.T("プレビュー開始がタイムアウトしました。"));
+            throw new UserFacingException(L.T("プレビュー開始がタイムアウトしました。"));
         if (_callback.LastHr < 0)
             Marshal.ThrowExceptionForHR(_callback.LastHr);
 
@@ -764,6 +772,11 @@ public sealed class VideoEngine : IDisposable
                 else
                 {
                     _photoTimeouts = 0;
+                    // The photo sink delivers the source's raw orientation — rotation
+                    // and mirror (SetRotation/SetMirrorState) are only ever applied to
+                    // the PREVIEW sink, so without this the saved photo disagrees with
+                    // what the user is looking at whenever rotation/mirror is on.
+                    OrientLikePreview(bmp);
                 }
                 return bmp;
             }
@@ -774,6 +787,27 @@ public sealed class VideoEngine : IDisposable
                 return null;
             }
         }
+    }
+
+    /// <summary>
+    /// Rotate/mirror a photo-sink bitmap to match what the preview sink is
+    /// showing (SetRotation/SetMirrorState only ever touch the preview sink —
+    /// the photo sink always delivers the source's raw orientation). Rotate
+    /// clockwise by _rotation first, then mirror horizontally if _mirror is on.
+    /// WORKING ASSUMPTION: this direction/order has not been verified against
+    /// every driver. `--selftest` compares the saved photo against the
+    /// on-screen picture ("photo orientation @90°" / "photo mirror" lines) — if
+    /// it reports MISMATCH, this is the method to change.
+    /// </summary>
+    private void OrientLikePreview(Bitmap bmp)
+    {
+        switch (_rotation)
+        {
+            case 90: bmp.RotateFlip(RotateFlipType.Rotate90FlipNone); break;
+            case 180: bmp.RotateFlip(RotateFlipType.Rotate180FlipNone); break;
+            case 270: bmp.RotateFlip(RotateFlipType.Rotate270FlipNone); break;
+        }
+        if (_mirror) bmp.RotateFlip(RotateFlipType.RotateNoneFlipX);
     }
 
     /// <summary>Called with _photoLock held. This method runs on the UI thread
@@ -923,10 +957,35 @@ public sealed class VideoEngine : IDisposable
     /// </summary>
     public Bitmap? Snapshot(bool cropToVideo = true)
     {
-        if (_hwnd == IntPtr.Zero || !IsRunning) return null;
-        if (!GetWindowRect(_hwnd, out RECT rc)) return null;
+        LastSnapshotError = null;
+        if (_hwnd == IntPtr.Zero || !IsRunning)
+        {
+            LastSnapshotError = L.T("映像がありません");
+            return null;
+        }
+        if (!GetWindowRect(_hwnd, out RECT rc))
+        {
+            LastSnapshotError = L.T("映像がありません");
+            return null;
+        }
         var win = new Rectangle(rc.Left, rc.Top, rc.Right - rc.Left, rc.Bottom - rc.Top);
-        if (win.Width <= 0 || win.Height <= 0) return null;
+        if (win.Width <= 0 || win.Height <= 0)
+        {
+            LastSnapshotError = L.T("映像がありません");
+            return null;
+        }
+
+        // PRIVACY: this fallback copies whatever is on screen at our window's
+        // rectangle. If YuCap is minimized it captures garbage; if it is covered
+        // by another window (a global hotkey makes this easy to trigger without
+        // looking at the screen) it saves THAT window's pixels — e.g. a password
+        // manager — into the user's Pictures folder. Refuse rather than risk that.
+        IntPtr root = GetAncestor(_hwnd, GA_ROOT);
+        if (IsIconic(root) || !IsWindowVisible(root))
+        {
+            LastSnapshotError = L.T("最小化中は画面から取得できません。");
+            return null;
+        }
 
         // Crop to the video destination rect so letterbox bars are not saved.
         // _lastDest is in host-window client pixels; the host is a plain child
@@ -940,21 +999,69 @@ public sealed class VideoEngine : IDisposable
             if (d.Width > 0 && d.Height > 0) crop = d;
         }
 
+        // Sample a 3x3 grid inside the crop rect and make sure every sampled
+        // point's top-level window is still ours. Our own child windows (OSD,
+        // freeze overlay) share our root via GetAncestor, so they pass; a
+        // window belonging to something else means we are (partly) covered.
+        for (int gx = 1; gx <= 5; gx += 2)
+        {
+            for (int gy = 1; gy <= 5; gy += 2)
+            {
+                var pt = new POINT
+                {
+                    X = crop.Left + crop.Width * gx / 6,
+                    Y = crop.Top + crop.Height * gy / 6,
+                };
+                bool onScreen = Screen.AllScreens.Any(s => s.Bounds.Contains(pt.X, pt.Y));
+                if (!onScreen) continue;
+                IntPtr hit = WindowFromPoint(pt);
+                if (hit == IntPtr.Zero) continue;
+                IntPtr hitRoot = GetAncestor(hit, GA_ROOT);
+                if (hitRoot != IntPtr.Zero && hitRoot != root)
+                {
+                    LastSnapshotError = L.T("他のウィンドウに隠れているため、画面から取得できません。YuCap を前面に出してください。");
+                    return null;
+                }
+            }
+        }
+
         var bmp = new Bitmap(crop.Width, crop.Height, PixelFormat.Format32bppArgb);
         try
         {
             using Graphics g = Graphics.FromImage(bmp);
             g.CopyFromScreen(crop.Left, crop.Top, 0, 0, crop.Size);
         }
-        catch { bmp.Dispose(); return null; }
+        catch (Exception ex)
+        {
+            bmp.Dispose();
+            LastSnapshotError = Errors.Describe(ex);
+            return null;
+        }
         return bmp;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT { public int X, Y; }
+
+    private const int GA_ROOT = 2;
+
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hWnd, int gaFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
 
     public void Dispose() => Stop(); // Stop retires the session and wakes its worker
 }

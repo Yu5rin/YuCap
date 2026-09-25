@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace YuCap;
@@ -57,5 +58,59 @@ public sealed class VideoBox : Control
             }
         }
         base.WndProc(ref m);
+    }
+}
+
+/// <summary>
+/// Host for the freeze-frame still. A plain PictureBox (the previous
+/// implementation) stretches its Image to fill its whole Bounds, so when the
+/// user was zoomed in the still overflowed past the canvas and painted over
+/// the menu/status bars. FreezeView instead draws <see cref="Image"/> into
+/// <see cref="ImageRect"/> — a sub-rectangle of its OWN client area — and
+/// anything outside that rectangle is naturally clipped by GDI+ rather than
+/// drawn, since ImageRect is expected to be sized/positioned within Bounds
+/// (MainForm keeps FreezeView.Bounds equal to the canvas area at all times).
+/// </summary>
+public sealed class FreezeView : Control
+{
+    private Image? _image;
+    private Rectangle _imageRect;
+
+    /// <summary>The still to draw. NOT owned by this control — the caller
+    /// (MainForm._freezeImage) is responsible for disposing it.</summary>
+    public Image? Image
+    {
+        get => _image;
+        set { _image = value; Invalidate(); }
+    }
+
+    /// <summary>Where to draw <see cref="Image"/>, in THIS control's own
+    /// client coordinates.</summary>
+    public Rectangle ImageRect
+    {
+        get => _imageRect;
+        set { if (_imageRect != value) { _imageRect = value; Invalidate(); } }
+    }
+
+    public FreezeView()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint
+                 | ControlStyles.UserPaint
+                 | ControlStyles.OptimizedDoubleBuffer
+                 | ControlStyles.ResizeRedraw, true);
+        BackColor = Color.Black;
+        TabStop = false;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.Clear(Color.Black);
+        if (_image == null || _imageRect.Width <= 0 || _imageRect.Height <= 0) return;
+        g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+        // GDI+ clips drawing to the control's own client rectangle regardless
+        // of how much of ImageRect falls outside it — this is what stops a
+        // zoomed-in still from overflowing onto the surrounding chrome.
+        g.DrawImage(_image, _imageRect);
     }
 }

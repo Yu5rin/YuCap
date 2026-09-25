@@ -37,6 +37,15 @@ public sealed partial class MainForm
             _osd.Update();
         }
 
+        // While paused on a photo-sink still, that still is already the source
+        // resolution frame in memory — reuse it instead of falling through to
+        // the (window-sized) screen copy. Clone it: MainForm owns _freezeImage
+        // and disposes it on resume/exit.
+        if (_frozen && _freezeIsPhoto && _freezeImage != null)
+        {
+            return new Bitmap(_freezeImage);
+        }
+
         if (!_frozen)
         {
             Bitmap? photo = _video.PhotoSnapshot();
@@ -62,19 +71,24 @@ public sealed partial class MainForm
             return;
         }
 
+        // Capture in locals: _lastSaveDir may be overwritten by a later save
+        // (burst mode) before this OSD bubble is clicked.
+        string dir = _lastSaveDir ?? SnapshotDirectory;
+        string savedFile = file;
+
         if (_snapshotDirFellBack && !fellBackBefore)
         {
             // The configured folder just proved unusable for the first time
             // this session — say so once instead of silently redirecting saves.
-            ShowOsd(L.T("保存先フォルダを使えないため、既定のフォルダに保存しました。"), OsdLongMilliseconds);
+            ShowOsd(L.T("保存先フォルダを使えないため、既定のフォルダに保存しました。"), OsdLongMilliseconds,
+                () => OpenFolder(dir, savedFile));
         }
         else
         {
-            // The OSD becomes a shortcut to the file until it fades. Set the target
-            // after ShowOsd, which clears it for any other kind of message.
-            ShowOsd(L.F("保存しました: {0}（クリックで開く）", file), OsdLongMilliseconds);
+            // The OSD is itself the shortcut to the file until it fades.
+            ShowOsd(L.F("保存しました: {0}（クリックで開く）", file), OsdLongMilliseconds,
+                () => OpenFolder(dir, savedFile));
         }
-        _lastSavedSnapshot = file;
     }
 
     /// <summary>Save one snapshot. Never shows a MessageBox or OSD itself —
@@ -90,7 +104,10 @@ public sealed partial class MainForm
         using Bitmap? frame = GrabFrame();
         if (frame == null)
         {
-            error = L.T("映像がありません");
+            // The screen-copy fallback now refuses (and explains why) when
+            // YuCap is minimized or covered by another window — surface that
+            // specific reason instead of a generic "no video" message.
+            error = _video.LastSnapshotError ?? L.T("映像がありません");
             return false;
         }
 
@@ -202,32 +219,19 @@ public sealed partial class MainForm
 
     private void ShowSnapshotSettings()
     {
-        using var dlg = new Form
-        {
-            Text = L.T("スナップショット設定"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(420, 150),
-            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
-            // were drawn against at 100% — WinForms then scales every
-            // Location/Size by the same factor as the font, so the layout
-            // still holds together at 125-200% display scaling.
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
+        using var dlg = Ui.NewDialog(L.T("スナップショット設定"), 460, 170);
 
-        var lblDir = new Label { Text = L.T("保存先:"), AutoSize = true, Location = new Point(16, 20) };
+        var lblDir = Ui.Label(L.T("保存先:"), 16, 20);
         var txtDir = new TextBox
         {
             Text = SnapshotDirectory,
             ReadOnly = true,
-            Location = new Point(80, 16),
-            Width = 240,
+            // Leaves room for the 参照... button (width 88) plus Ui.Gap at the
+            // right edge of the dialog.
+            Location = new Point(90, 16),
+            Width = 460 - Ui.Pad - 88 - Ui.Gap - 90,
         };
-        var browse = new Button { Text = L.T("参照..."), Location = new Point(328, 14), Width = 76 };
+        var browse = Ui.Button(L.T("参照..."), 460 - Ui.Pad - 88, 14, 88);
         browse.Click += (_, _) =>
         {
             using var fb = new FolderBrowserDialog
@@ -239,30 +243,31 @@ public sealed partial class MainForm
             if (fb.ShowDialog(dlg) == DialogResult.OK) txtDir.Text = fb.SelectedPath;
         };
 
-        var lblFmt = new Label { Text = L.T("形式:"), AutoSize = true, Location = new Point(16, 62) };
+        var lblFmt = Ui.Label(L.T("形式:"), 16, 62);
         var cmbFmt = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Location = new Point(80, 58),
+            Location = new Point(90, 58),
             Width = 140,
         };
         cmbFmt.Items.AddRange(new object[] { L.T("PNG (無劣化)"), L.T("JPEG (高画質)") });
         cmbFmt.SelectedIndex =
             _settings.SnapshotFormat.Equals("jpg", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
 
-        var reset = new Button { Text = L.T("既定に戻す"), Location = new Point(16, 108), Width = 100 };
+        var hint = Ui.Hint(
+            L.T("ウィンドウの大きさに関係なく、入力された映像の解像度で保存します。"),
+            16, 86, 460 - Ui.Pad * 2);
+
+        var reset = Ui.Button(L.T("既定に戻す"), 16, 170 - Ui.Pad - Ui.ButtonHeight, 100);
         reset.Click += (_, _) =>
         {
             txtDir.Text = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CaptureViewer");
             cmbFmt.SelectedIndex = 0;
         };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(224, 108), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(315, 108), Width = 90 };
 
-        dlg.Controls.AddRange(new Control[] { lblDir, txtDir, browse, lblFmt, cmbFmt, reset, ok, cancel });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
+        dlg.Controls.AddRange(new Control[] { lblDir, txtDir, browse, lblFmt, cmbFmt, hint, reset });
+        Ui.AddOkCancel(dlg);
 
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
@@ -283,18 +288,7 @@ public sealed partial class MainForm
         int plus = ver.IndexOf('+'); // strip build metadata if present
         if (plus > 0) ver = ver[..plus];
 
-        using var dlg = new Form
-        {
-            Text = L.T("バージョン情報"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(380, 240),
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
+        using var dlg = Ui.NewDialog(L.T("バージョン情報"), 380, 240);
 
         var pic = new PictureBox
         {
@@ -326,7 +320,8 @@ public sealed partial class MainForm
             AutoSize = true,
             Location = new Point(20, 96),
         };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(280, 198), Width = 85 };
+        var ok = Ui.Button("OK", 380 - Ui.Pad - Ui.ButtonWidth, 240 - Ui.Pad - Ui.ButtonHeight);
+        ok.DialogResult = DialogResult.OK;
 
         dlg.Controls.AddRange(new Control[] { pic, title, version, libs, ok });
         dlg.AcceptButton = ok;

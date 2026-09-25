@@ -49,7 +49,8 @@ public sealed class AppSettings
     // so it can be repointed without a rebuild — and so the user can see where
     // the app talks to.
     public bool UpdateCheckOnStartup { get; set; } = true;
-    public string UpdateApiUrl { get; set; } = "https://api.github.com/repos/Yu5rin/YuCap/releases/latest";
+    public const string DefaultUpdateApiUrl = "https://api.github.com/repos/Yu5rin/YuCap/releases/latest";
+    public string UpdateApiUrl { get; set; } = DefaultUpdateApiUrl;
     /// <summary>Recorded for diagnostics only — the startup check is not throttled.</summary>
     public string? LastUpdateCheckUtc { get; set; }
     /// <summary>A version the user declined; not offered again until a newer one appears.</summary>
@@ -63,6 +64,12 @@ public sealed class AppSettings
     public bool CursorAutoHide { get; set; } = true;
     public int CursorHideSeconds { get; set; } = 3;
     public bool GlobalHotkeys { get; set; } = true;
+    // The Windows recording level we overwrote when capture started, remembered
+    // across restarts so "入力レベルを元に戻す" still works after relaunching —
+    // and tied to the device id so it is never written back to a different
+    // device than the one it was read from.
+    public string? CaptureLevelDeviceId { get; set; }
+    public int CaptureLevelBefore { get; set; } = -1; // -1 = nothing to restore
     // Hotkey combos stored as System.Windows.Forms.Keys values
     // (0x20000 = Ctrl, 0x40000 = Alt, 0x10000 = Shift, low bits = key). 0 = disabled.
     public int HotkeySnapshot { get; set; } = 0x20000 | 0x40000 | 0x53; // Ctrl+Alt+S
@@ -92,6 +99,35 @@ public sealed class AppSettings
         ModeHeight = mode?.Height;
         ModeFps = mode?.Fps;
     }
+
+    /// <summary>
+    /// Clamp ranges and replace nulls a hand-edited settings.json may hold.
+    /// System.Text.Json happily assigns null to a non-nullable string property
+    /// (it just skips validation), which used to crash every snapshot the
+    /// moment SnapshotFormat or DeviceKeyword was null instead of missing.
+    /// Called once by SettingsStore.Load on every successfully parsed file.
+    /// </summary>
+    public void Normalize()
+    {
+        DisplayMode = Math.Clamp(DisplayMode, 0, 3);
+        Volume = Math.Clamp(Volume, 0, 500);
+        AudioBufferMs = Math.Clamp(AudioBufferMs, 50, 1000);
+        if (Rotation is not (0 or 90 or 180 or 270)) Rotation = 0;
+        PipOpacity = Math.Clamp(PipOpacity, 0, 100);
+        PipOpacityHover = Math.Clamp(PipOpacityHover, 10, 100);
+        PipSizePct = Math.Clamp(PipSizePct, 5, 100);
+        PipCorner = Math.Clamp(PipCorner, 0, 3);
+        CursorHideSeconds = Math.Clamp(CursorHideSeconds, 1, 60);
+
+        SnapshotFormat = (SnapshotFormat ?? "png").Trim().ToLowerInvariant();
+        if (SnapshotFormat is not ("png" or "jpg")) SnapshotFormat = "png";
+
+        DeviceKeyword = string.IsNullOrWhiteSpace(DeviceKeyword) ? "JVA14" : DeviceKeyword;
+        Language = Language is "ja" or "en" ? Language : "ja";
+        UpdateApiUrl = string.IsNullOrWhiteSpace(UpdateApiUrl) ? DefaultUpdateApiUrl : UpdateApiUrl;
+
+        CaptureLevelBefore = Math.Clamp(CaptureLevelBefore, -1, 100);
+    }
 }
 
 public static class SettingsStore
@@ -120,7 +156,9 @@ public static class SettingsStore
             }
             AppSettings? loaded = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path));
             LastLoadFailed = false;
-            return loaded ?? new AppSettings();
+            loaded ??= new AppSettings();
+            loaded.Normalize();
+            return loaded;
         }
         catch (Exception ex)
         {

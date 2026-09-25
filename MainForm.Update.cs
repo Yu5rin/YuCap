@@ -29,7 +29,14 @@ public sealed partial class MainForm
         _settings.LastRunVersion = current;
         // A version we arrived at is obviously no longer one to skip.
         if (_settings.SkippedUpdateVersion == current) _settings.SkippedUpdateVersion = null;
-        if (!upgraded) return;
+        if (!upgraded)
+        {
+            // A brand new install has no prior version to compare against —
+            // point the user at the menu and hotkey list instead of the
+            // "updated to" notice, which would be meaningless here.
+            ShowOsd(L.T("右クリックでメニュー、F1 で操作一覧を表示できます"), 6000);
+            return;
+        }
 
         Log.Info($"update: now running {current}");
         // Long duration: this is the one confirmation that the restart the
@@ -73,6 +80,11 @@ public sealed partial class MainForm
     /// item (or an overlapping startup check) cannot stack a second check —
     /// which would mean two prompts and, worse, two downloads.</summary>
     private bool _updateCheckInFlight;
+
+    /// <summary>A newer release found by the silent startup check and not yet
+    /// skipped or acted on. MainForm.UpdateChecks relabels the help menu item
+    /// from this while it is set.</summary>
+    private UpdateInfo? _pendingUpdate;
 
     /// <summary>
     /// Look for a newer release and, with the user's consent, install it.
@@ -134,6 +146,11 @@ public sealed partial class MainForm
             {
                 if (manual)
                 {
+                    // A manual check that finds nothing means whatever was
+                    // pending is no longer news — clear it so the help menu
+                    // item goes back to "check for updates".
+                    _pendingUpdate = null;
+                    UpdateChecks();
                     MessageBox.Show(this,
                         L.F("現在のバージョンは {0} です。\n更新はありません。", Updater.CurrentVersion),
                         "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -149,28 +166,21 @@ public sealed partial class MainForm
                 return;
             }
 
-            UpdatePrompt choice = AskAboutUpdate(info);
-            if (choice == UpdatePrompt.Skip)
+            if (manual)
             {
-                _settings.SkippedUpdateVersion = info.Version.ToString();
-                SaveSettings();
-                ShowOsd(L.F("{0} をスキップします", info.Version), OsdLongMilliseconds);
-                return;
-            }
-            if (choice != UpdatePrompt.Now) return;
-
-            // Under Program Files the swap cannot work; say so instead of failing
-            // halfway through.
-            if (!Updater.CanWriteToInstallDir())
-            {
-                if (MessageBox.Show(this,
-                        L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
-                        "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
-                    OpenUrl(info.PageUrl);
+                // An explicit menu click may show the modal prompt directly —
+                // the user just asked for this.
+                PromptForUpdate(info);
                 return;
             }
 
-            DownloadAndApply(info);
+            // The silent startup check must not pop a modal over whatever the
+            // user is currently watching. Park it and offer it through the OSD
+            // (and the relabeled help menu item) instead.
+            _pendingUpdate = info;
+            UpdateChecks();
+            ShowOsd(L.F("新しいバージョン {0} があります（クリックで詳細）", info.Version), 8000,
+                () => PromptForUpdate(info));
         }
         finally
         {
@@ -183,6 +193,42 @@ public sealed partial class MainForm
         }
     }
 
+    /// <summary>
+    /// Ask the user what to do about <paramref name="info"/> and act on the
+    /// answer. Shared by the manual "check for updates" menu item and the
+    /// clickable OSD the silent startup check raises — both just need to
+    /// arrive here with an <see cref="UpdateInfo"/> in hand.
+    /// </summary>
+    private void PromptForUpdate(UpdateInfo info)
+    {
+        UpdatePrompt choice = AskAboutUpdate(info);
+        if (choice == UpdatePrompt.Skip)
+        {
+            _settings.SkippedUpdateVersion = info.Version.ToString();
+            SaveSettings();
+            // The user just resolved this one — nothing left to relabel the
+            // help menu item for.
+            _pendingUpdate = null;
+            UpdateChecks();
+            ShowOsd(L.F("{0} をスキップします", info.Version), OsdLongMilliseconds);
+            return;
+        }
+        if (choice != UpdatePrompt.Now) return;
+
+        // Under Program Files the swap cannot work; say so instead of failing
+        // halfway through.
+        if (!Updater.CanWriteToInstallDir())
+        {
+            if (MessageBox.Show(this,
+                    L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
+                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                OpenUrl(info.PageUrl);
+            return;
+        }
+
+        DownloadAndApply(info);
+    }
+
     private enum UpdatePrompt { Now, Later, Skip }
 
     /// <summary>
@@ -192,45 +238,15 @@ public sealed partial class MainForm
     /// </summary>
     private UpdatePrompt AskAboutUpdate(UpdateInfo info)
     {
-        using var dlg = new Form
-        {
-            Text = "YuCap",
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(420, 200),
-            // (7, 15) is the metric of the default Segoe UI 9pt these layouts
-            // were drawn against at 100% — WinForms then scales every
-            // Location/Size by the same factor as the font, so the layout
-            // still holds together at 125-200% display scaling.
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
-        var head = new Label
-        {
-            Text = L.F("新しいバージョン {0} があります（現在 {1}）。", info.Version, Updater.CurrentVersion),
-            AutoSize = true,
-            Location = new Point(16, 20),
-            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-        };
-        var body = new Label
-        {
-            Text = L.T("更新すると YuCap は自動的に再起動します。"),
-            AutoSize = true,
-            Location = new Point(16, 48),
-            // SystemColors.GrayText (not Color.Gray, ~2.9:1) is the theme's
-            // intended hint colour and reads at a proper contrast ratio.
-            ForeColor = SystemColors.GrayText,
-        };
-        var size = new Label
-        {
-            Text = L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0")),
-            AutoSize = true,
-            Location = new Point(16, 72),
-            ForeColor = SystemColors.GrayText,
-        };
+        using var dlg = Ui.NewDialog(L.T("更新があります"), 420, 200);
+
+        var head = Ui.Label(
+            L.F("新しいバージョン {0} があります（現在 {1}）。", info.Version, Updater.CurrentVersion), 16, 20);
+        head.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+        var body = Ui.Hint(L.T("更新すると YuCap は自動的に再起動します。"), 16, 48, 420 - Ui.Pad * 2);
+        var size = Ui.Hint(
+            L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0")),
+            16, 72, 420 - Ui.Pad * 2);
         var notes = new LinkLabel
         {
             Text = L.T("リリースノートを見る"),
@@ -239,9 +255,13 @@ public sealed partial class MainForm
         };
         notes.LinkClicked += (_, _) => OpenUrl(info.PageUrl);
 
-        var now = new Button { Text = L.T("今すぐ更新"), Location = new Point(16, 156), Width = 120 };
-        var later = new Button { Text = L.T("後で"), Location = new Point(150, 156), Width = 100 };
-        var skip = new Button { Text = L.T("この版をスキップ"), Location = new Point(258, 156), Width = 146 };
+        // Right-aligned as a group, in reading order 今すぐ更新 / 後で / この版をスキップ.
+        // Widths are sized to fit each label rather than sharing Ui.ButtonWidth.
+        int y = 200 - Ui.Pad - Ui.ButtonHeight;
+        var skip = Ui.Button(L.T("この版をスキップ"), 420 - Ui.Pad - 146, y, 146);
+        var later = Ui.Button(L.T("後で"), skip.Left - Ui.Gap - 100, y, 100);
+        var now = Ui.Button(L.T("今すぐ更新"), later.Left - Ui.Gap - 120, y, 120);
+
         var result = UpdatePrompt.Later;
         now.Click += (_, _) => { result = UpdatePrompt.Now; dlg.Close(); };
         later.Click += (_, _) => { result = UpdatePrompt.Later; dlg.Close(); };
@@ -259,27 +279,12 @@ public sealed partial class MainForm
     /// drives the download, so there is nothing here to await.</summary>
     private void DownloadAndApply(UpdateInfo info)
     {
-        using var dlg = new Form
-        {
-            Text = L.T("更新をダウンロード中"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ControlBox = false,
-            ClientSize = new Size(380, 120),
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
-        var lbl = new Label
-        {
-            Text = L.F("{0} をダウンロードしています...", info.AssetName),
-            AutoSize = true,
-            Location = new Point(16, 18),
-        };
+        using var dlg = Ui.NewDialog(L.T("更新をダウンロード中"), 380, 120);
+        dlg.ControlBox = false;   // only the Cancel button may close this while a download is in flight
+
+        var lbl = Ui.Label(L.F("{0} をダウンロードしています...", info.AssetName), 16, 18);
         var bar = new ProgressBar { Location = new Point(16, 46), Size = new Size(348, 22), Maximum = 100 };
-        var cancelBtn = new Button { Text = L.T("キャンセル"), Location = new Point(274, 80), Width = 90 };
+        var cancelBtn = Ui.Button(L.T("キャンセル"), 380 - Ui.Pad - 90, 120 - Ui.Pad - Ui.ButtonHeight, 90);
         var cts = new CancellationTokenSource();
         cancelBtn.Click += (_, _) => { cts.Cancel(); dlg.Close(); };
         dlg.Controls.AddRange(new Control[] { lbl, bar, cancelBtn });
@@ -300,7 +305,7 @@ public sealed partial class MainForm
 
         if (failure != null)
         {
-            MessageBox.Show(this, L.F("更新のダウンロードに失敗しました。\n\n{0}", failure.Message),
+            MessageBox.Show(this, L.F("更新のダウンロードに失敗しました。\n\n{0}", Errors.Describe(failure)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
@@ -322,7 +327,7 @@ public sealed partial class MainForm
         {
             Log.Info("update apply failed: " + ex.Message);
             MessageBox.Show(this,
-                L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", ex.Message),
+                L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }

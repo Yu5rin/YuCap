@@ -26,7 +26,7 @@ public sealed partial class MainForm
     {
         // Remember whether we were fullscreen so exiting PiP returns there.
         _prePipFullscreen = _isFullscreen;
-        if (_isFullscreen) ExitFullscreen();
+        if (_isFullscreen) ExitFullscreen(userAction: false);
 
         _prePipBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         _prePipBorderless = _isBorderless;
@@ -90,7 +90,7 @@ public sealed partial class MainForm
         if (_prePipFullscreen)
         {
             _prePipFullscreen = false;
-            EnterFullscreen();
+            EnterFullscreen(userAction: false);
         }
         LayoutCanvas(ModeChangeSettleMs);
         UpdateChecks();
@@ -312,6 +312,9 @@ public sealed partial class MainForm
             failed.Add(FormatHotkey(combo));
     }
 
+    /// <summary>Friendly display name for a hotkey combo (Ctrl+Alt+1, not
+    /// Ctrl+Alt+D1; Num 0 not NumPad0; etc.) — used in dialogs and lists where
+    /// showing "unassigned" explicitly is useful.</summary>
     private static string FormatHotkey(Keys combo)
     {
         if ((combo & Keys.KeyCode) == Keys.None) return L.T("なし");
@@ -319,81 +322,126 @@ public sealed partial class MainForm
         if (combo.HasFlag(Keys.Control)) parts.Add("Ctrl");
         if (combo.HasFlag(Keys.Alt)) parts.Add("Alt");
         if (combo.HasFlag(Keys.Shift)) parts.Add("Shift");
-        parts.Add((combo & Keys.KeyCode).ToString());
+        parts.Add(FriendlyKeyName(combo & Keys.KeyCode));
         return string.Join("+", parts);
+    }
+
+    /// <summary>Same as <see cref="FormatHotkey"/> but "" when unassigned, for
+    /// ShortcutKeyDisplayString — a menu item showing "なし" as its shortcut
+    /// text would just be noise.</summary>
+    private static string HotkeyMenuText(Keys combo) =>
+        (combo & Keys.KeyCode) == Keys.None ? "" : FormatHotkey(combo);
+
+    private static string FriendlyKeyName(Keys key) => key switch
+    {
+        >= Keys.D0 and <= Keys.D9 => ((int)(key - Keys.D0)).ToString(),
+        >= Keys.NumPad0 and <= Keys.NumPad9 => "Num " + (int)(key - Keys.NumPad0),
+        Keys.Oemplus => "+",
+        Keys.OemMinus => "-",
+        Keys.Oemcomma => ",",
+        Keys.OemPeriod => ".",
+        Keys.OemQuestion => "/",
+        Keys.Oemtilde => "`",
+        Keys.OemOpenBrackets => "[",
+        Keys.Oem6 => "]",
+        Keys.Oem5 => "\\",
+        Keys.Oem1 => ";",
+        Keys.Oem7 => "'",
+        Keys.OemBackslash => "\\",
+        Keys.Return => "Enter",
+        Keys.Back => "Backspace",
+        Keys.Prior => "PageUp",
+        Keys.Next => "PageDown",
+        Keys.Capital => "CapsLock",
+        Keys.Escape => "Esc",
+        Keys.Space => "Space",
+        Keys.Multiply => "Num *",
+        Keys.Add => "Num +",
+        Keys.Subtract => "Num -",
+        Keys.Divide => "Num /",
+        Keys.Decimal => "Num .",
+        _ => key.ToString(),
+    };
+
+    /// <summary>Combos that would steal a Windows-wide or universal-app basic
+    /// (copy/paste/undo/etc, Alt+Tab/F4/...) from every application while YuCap
+    /// is running, for the whole time its hotkeys are registered. Rejected on
+    /// OK in the hotkey dialog regardless of whether anything currently has
+    /// them registered — RegisterHotKey itself would happily succeed since
+    /// these aren't OS-reserved, which is exactly the problem.</summary>
+    private static bool IsReservedCombo(Keys combo)
+    {
+        Keys mods = combo & Keys.Modifiers;
+        Keys key = combo & Keys.KeyCode;
+        if (mods == Keys.Control || mods == (Keys.Control | Keys.Shift))
+        {
+            if (key is Keys.C or Keys.V or Keys.X or Keys.Z or Keys.Y or Keys.A) return true;
+        }
+        if (mods == Keys.Alt && key is Keys.F4 or Keys.Tab or Keys.Escape or Keys.Space) return true;
+        return false;
     }
 
     private void ShowHotkeySettings()
     {
-        using var dlg = new Form
-        {
-            Text = L.T("ホットキー設定"),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new Size(360, 210),
-            KeyPreview = true,
-            // The controls below are laid out with fixed pixel coordinates
-            // drawn against the default Segoe UI 9pt metric (7, 15) at 100%
-            // scaling. Without this, the font grows with display scaling but
-            // the layout doesn't, and controls overlap at 125-200%.
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
-        };
+        var dlg = Ui.NewDialog(L.T("ホットキー設定"), 440, 250);
 
         Keys snapCombo = (Keys)_settings.HotkeySnapshot;
         Keys muteCombo = (Keys)_settings.HotkeyMute;
         Keys pipCombo = (Keys)_settings.HotkeyPip;
 
-        TextBox MakeRow(string label, int y, Keys initial, Action<Keys> set)
+        const int tbX = 140, tbWidth = 200;
+        int clearX = tbX + tbWidth + Ui.Gap;
+
+        (TextBox tb, Button clear) MakeRow(string label, int y, Keys initial, Action<Keys> set)
         {
-            var lbl = new Label { Text = L.T(label), AutoSize = true, Location = new Point(16, y + 4) };
+            var lbl = Ui.Label(L.T(label), Ui.Pad, y + 4);
             var tb = new TextBox
             {
                 Text = FormatHotkey(initial),
                 ReadOnly = true,
-                Location = new Point(150, y),
-                Width = 190,
+                Location = new Point(tbX, y),
+                Width = tbWidth,
                 TabStop = true,
             };
+            var clearBtn = Ui.Button(L.T("解除"), clearX, y - 1, 64);
+            void Clear()
+            {
+                set(Keys.None);
+                tb.Text = FormatHotkey(Keys.None);
+            }
             tb.KeyDown += (_, e) =>
             {
                 e.SuppressKeyPress = true;
                 e.Handled = true;
-                if (e.KeyCode == Keys.Escape)
-                {
-                    set(Keys.None);
-                    tb.Text = FormatHotkey(Keys.None);
-                    return;
-                }
+                // Esc is intentionally NOT handled here: it is a dialog key
+                // that CancelButton intercepts in ProcessDialogKey before the
+                // TextBox ever sees KeyDown, so Esc always just cancels the
+                // whole dialog. Backspace/Delete DO reach KeyDown normally and
+                // serve as the keyboard-only way to unassign a combo.
+                if (e.KeyCode is Keys.Back or Keys.Delete) { Clear(); return; }
                 // Ignore presses of a modifier alone; require Ctrl/Alt/Shift.
                 if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu) return;
                 if (e.Modifiers == Keys.None) return;
                 set(e.KeyData);
                 tb.Text = FormatHotkey(e.KeyData);
             };
+            clearBtn.Click += (_, _) => Clear();
             dlg.Controls.Add(lbl);
             dlg.Controls.Add(tb);
-            return tb;
+            dlg.Controls.Add(clearBtn);
+            return (tb, clearBtn);
         }
 
-        var tbSnap = MakeRow("スナップショット:", 16, snapCombo, k => snapCombo = k);
-        var tbMute = MakeRow("ミュート:", 52, muteCombo, k => muteCombo = k);
-        var tbPip = MakeRow("PiP切替:", 88, pipCombo, k => pipCombo = k);
+        var (tbSnap, _) = MakeRow("スナップショット:", Ui.Pad, snapCombo, k => snapCombo = k);
+        var (tbMute, _) = MakeRow("ミュート:", Ui.Pad + 36, muteCombo, k => muteCombo = k);
+        var (tbPip, _) = MakeRow("PiP切替:", Ui.Pad + 72, pipCombo, k => pipCombo = k);
 
-        var hint = new Label
-        {
-            Text = L.T("欄をクリックしてキーを押してください。Esc で無効化できます。"),
-            AutoSize = true,
-            // Color.Gray is ~2.9:1 against the dialog background, below the
-            // 4.5:1 readability threshold; SystemColors.GrayText also respects
-            // the user's theme/contrast settings.
-            ForeColor = SystemColors.GrayText,
-            Location = new Point(16, 126),
-        };
-        var reset = new Button { Text = L.T("既定に戻す"), Location = new Point(16, 168), Width = 100 };
+        int hintY = Ui.Pad + 72 + 36;
+        Ui.Hint(L.T("欄を選んでキーの組み合わせを押してください。［解除］または Backspace で割り当てを外せます。"),
+            Ui.Pad, hintY, 440 - 2 * Ui.Pad);
+
+        Ui.AddOkCancel(dlg);
+        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 100);
         reset.Click += (_, _) =>
         {
             snapCombo = Keys.Control | Keys.Alt | Keys.S;
@@ -403,24 +451,15 @@ public sealed partial class MainForm
             tbMute.Text = FormatHotkey(muteCombo);
             tbPip.Text = FormatHotkey(pipCombo);
         };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(164, 168), Width = 85 };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel, Location = new Point(255, 168), Width = 90 };
-        dlg.Controls.AddRange(new Control[] { hint, reset, ok, cancel });
-        dlg.CancelButton = cancel;
-        // The textboxes are read-only and their KeyDown handler marks every
-        // key (including Enter) as handled, so without an AcceptButton, Enter
-        // did nothing. This makes Enter work when focus is elsewhere (e.g. on
-        // Reset); it still has no effect while a hotkey field has focus, which
-        // is fine — that field is reachable by Tab or click regardless.
-        dlg.AcceptButton = ok;
+        dlg.Controls.Add(reset);
 
-        // Loop instead of a single ShowDialog: a duplicate assignment must send
-        // the user back into the same dialog with their typed values intact,
-        // not close it — ShowDialog can be called again on the same (undisposed)
-        // Form, and none of the controls' state is reset in between.
+        // Loop instead of a single ShowDialog: a duplicate/reserved assignment
+        // must send the user back into the same dialog with their typed values
+        // intact, not close it — ShowDialog can be called again on the same
+        // (undisposed) Form, and none of the controls' state is reset in between.
         while (true)
         {
-            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            if (dlg.ShowDialog(this) != DialogResult.OK) { dlg.Dispose(); return; }
 
             // Reject the same combo assigned to two actions: RegisterHotKey
             // would only fail on the second one, and telling the user "another
@@ -435,8 +474,20 @@ public sealed partial class MainForm
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 continue;
             }
+
+            Keys reserved = IsReservedCombo(snapCombo) ? snapCombo
+                : IsReservedCombo(muteCombo) ? muteCombo
+                : IsReservedCombo(pipCombo) ? pipCombo
+                : Keys.None;
+            if ((reserved & Keys.KeyCode) != Keys.None)
+            {
+                MessageBox.Show(this, L.F("{0} は Windows の基本操作と重なるため使えません。", FormatHotkey(reserved)),
+                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                continue;
+            }
             break;
         }
+        dlg.Dispose();
 
         _settings.HotkeySnapshot = (int)snapCombo;
         _settings.HotkeyMute = (int)muteCombo;
