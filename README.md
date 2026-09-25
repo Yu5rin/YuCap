@@ -12,10 +12,21 @@ NV12/P010 をネイティブに扱えるため、DirectShow では届かなか�
 - [.NET 8 デスクトップランタイム](https://dotnet.microsoft.com/download/dotnet/8.0)
 - UVC/UAC 準拠の USB キャプチャデバイス
 
+動作確認済み: j5create JVA14（1080p120 NV12）、Windows 11
+
 ## インストール
 
-Releases から `YuCap.exe` をダウンロードして任意の場所に置くだけです（インストーラ不要）。
+[Releases](https://github.com/Yu5rin/YuCap/releases/latest) から `YuCap.exe` をダウンロードして任意の場所に置くだけです（インストーラ不要）。
 設定は `%APPDATA%\YuCap\settings.json` に保存されます。
+
+## 更新
+
+起動のたびに新しい版を確認し、見つかると通知します。確認のうえダウンロード・置換・再起動まで
+自動で行います。**ヘルプ → 更新を確認...** でいつでも手動で確認でき、起動時の確認は
+**オプション → 起動時に更新を確認** でオフにできます（詳しくは「外部通信について」を参照）。
+
+自動更新を使わない場合や、書き込めない場所に置いている場合は、YuCap を終了してから
+Releases の新しい `YuCap.exe` で置き換えてください。設定はそのまま引き継がれます。
 
 ## 主な機能
 
