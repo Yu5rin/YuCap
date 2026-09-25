@@ -1,7 +1,7 @@
 name: Release
 
 # Tagging is the whole trigger: `git tag v1.2.3 && git push origin v1.2.3`
-# builds, hashes and publishes. Doing it by hand is where mistakes creep in —
+# builds, hashes and creates a draft release. Doing it by hand is where mistakes creep in —
 # a stale exe, a forgotten SHA256, or a rate-limited CLI leaving a half-made
 # release behind.
 on:
@@ -51,24 +51,33 @@ jobs:
         id: hash
         shell: pwsh
         run: |
-          $h = (Get-FileHash publish/YuCap.exe -Algorithm SHA256).Hash
-          Write-Host "SHA256: $h"
+          $h = (Get-FileHash publish/YuCap.exe -Algorithm SHA256).Hash.ToLower()
+          $sizeMb = [math]::Round((Get-Item publish/YuCap.exe).Length / 1MB, 1)
+          Write-Host "SHA256: $h  size: $sizeMb MB"
           "sha256=$h" >> $env:GITHUB_OUTPUT
+          "size=$sizeMb" >> $env:GITHUB_OUTPUT
 
+      # 下書きのまま作る。「(ここに書く)」を変更点に書き換えてから公開する。
+      # 本文は「## 変更点」「## ダウンロード」と README への案内1行だけにし、
+      # インストール・更新・SmartScreen の説明は README に置く。
+      # 注意: 自動更新（Updater.cs）は添付の digest を優先し、無いときだけ本文で最初に
+      # 現れる64桁の16進を exe の SHA256 として使う。表は exe の1行だけにし、
+      # これより前に別の64桁の16進を書かないこと。
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
-          name: YuCap ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
           files: publish/YuCap.exe
-          generate_release_notes: true
-          append_body: true
           body: |
+            ## 変更点
 
-            ## インストール
+            (ここに書く)
 
-            `YuCap.exe` をダウンロードして任意の場所に置くだけです。
-            [.NET 8 デスクトップランタイム](https://dotnet.microsoft.com/download/dotnet/8.0) が必要です。
+            ## ダウンロード
 
-            署名していないため SmartScreen の警告が出ます。［詳細情報］→［実行］で起動できます。
+            | ファイル | サイズ | SHA256 |
+            | --- | --- | --- |
+            | YuCap.exe | ${{ steps.hash.outputs.size }} MB | `${{ steps.hash.outputs.sha256 }}` |
 
-            SHA256: `${{ steps.hash.outputs.sha256 }}`
+            インストールと更新の方法は [README](https://github.com/Yu5rin/YuCap#インストール) をご覧ください。
