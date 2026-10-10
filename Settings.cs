@@ -55,6 +55,11 @@ public sealed class AppSettings
     public string? LastUpdateCheckUtc { get; set; }
     /// <summary>A version the user declined; not offered again until a newer one appears.</summary>
     public string? SkippedUpdateVersion { get; set; }
+    /// <summary>Version and SHA256 of an update downloaded and verified in the
+    /// background. Persisted so it survives the restart: it is applied when the
+    /// app exits or, failing that (crash, forced kill, power loss), at the next launch.</summary>
+    public string? StagedUpdateVersion { get; set; }
+    public string? StagedUpdateSha256 { get; set; }
     /// <summary>Version that produced the "what's new" notice, so it shows once.</summary>
     public string? LastRunVersion { get; set; }
     /// <summary>Hotkey combos already reported as conflicting, to warn only once.</summary>

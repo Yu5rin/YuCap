@@ -203,16 +203,68 @@ internal static class Updater
         return null;
     }
 
-    /// <summary>Folder the downloaded build is staged in before being applied.</summary>
-    private static string StagingDir => Path.Combine(Path.GetTempPath(), "YuCapUpdate");
+    /// <summary>Folder the downloaded build is staged in before being applied.
+    /// Under LocalAppData rather than %TEMP%: cleanup tools can empty %TEMP%
+    /// between the download and the exit that applies it.</summary>
+    private static string StagingDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YuCap", "update");
 
-    /// <summary>Download the asset to a temp file and verify it. Throws on failure.</summary>
-    public static async Task<string> DownloadAsync(UpdateInfo info, IProgress<int>? progress,
-        CancellationToken ct = default)
+    private static string StagedPath(string version) => Path.Combine(StagingDir, $"YuCap-{version}.exe");
+
+    /// <summary>Download in the background and verify the SHA256, leaving the
+    /// file staged. Only ever used for unattended installs, so a published
+    /// hash is mandatory — installing without verification is not acceptable.
+    /// Throws on failure and discards the partial file.</summary>
+    public static Task<string> StageAsync(UpdateInfo info, CancellationToken ct = default)
+    {
+        if (info.Sha256 == null)
+            throw new InvalidOperationException("staging requires a published SHA256");
+        return DownloadCoreAsync(info, null, ct);
+    }
+
+    /// <summary>True when the staged file for <paramref name="version"/> exists
+    /// and still matches <paramref name="sha256"/>. It sat on disk between the
+    /// download and now, so this is re-checked before every swap. A mismatch or
+    /// missing file discards the staging.</summary>
+    public static bool VerifyStaged(string version, string sha256, out string path)
+    {
+        path = StagedPath(version);
+        try
+        {
+            if (!File.Exists(path))
+            {
+                Log.Info("update: staged file missing");
+                DiscardStaging();
+                return false;
+            }
+            string actual = ComputeSha256(path);
+            if (!actual.Equals(sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Info($"update: staged file SHA256 mismatch (expected {sha256}, got {actual}) — discarding");
+                DiscardStaging();
+                return false;
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Info("update: staged verify failed — " + ex.Message);
+            DiscardStaging();
+            return false;
+        }
+    }
+
+    /// <summary>Download the asset and verify it (when a hash is published).
+    /// Throws on failure.</summary>
+    public static Task<string> DownloadAsync(UpdateInfo info, IProgress<int>? progress,
+        CancellationToken ct = default) => DownloadCoreAsync(info, progress, ct);
+
+    private static async Task<string> DownloadCoreAsync(UpdateInfo info, IProgress<int>? progress,
+        CancellationToken ct)
     {
         string dir = StagingDir;
         Directory.CreateDirectory(dir);
-        string path = Path.Combine(dir, info.AssetName);
+        string path = StagedPath(info.Version.ToString());
 
         try
         {
@@ -287,11 +339,17 @@ internal static class Updater
         catch { return false; }
     }
 
+    /// <summary>True once an exe swap succeeded in this process, so the exit
+    /// path does not try to apply again.</summary>
+    public static bool AppliedThisSession { get; private set; }
+
     /// <summary>
-    /// Swap in the downloaded build and restart. Does not return on success —
-    /// the caller's process is replaced by the new one.
+    /// Swap in the downloaded build. With <paramref name="relaunch"/> the new
+    /// build is started and the caller is expected to exit; without it the
+    /// swap is done silently (the exit-time apply) and nothing is started.
+    /// Rolls back and throws if the swap fails.
     /// </summary>
-    public static void Apply(string downloadedExe)
+    public static void Apply(string downloadedExe, bool relaunch = true)
     {
         string? cur = ExePath;
         if (cur == null) throw new UserFacingException(L.T("実行ファイルの場所を特定できません。"));
@@ -319,6 +377,13 @@ internal static class Updater
             throw;
         }
 
+        AppliedThisSession = true;
+        if (!relaunch)
+        {
+            Log.Info("update: applied on exit, no relaunch");
+            return;
+        }
+
         // Hand the new process our id so it can wait for us to exit before
         // taking the single-instance mutex.
         Process.Start(new ProcessStartInfo(cur, $"{PostUpdateArg} {Environment.ProcessId}")
@@ -330,8 +395,8 @@ internal static class Updater
     }
 
     /// <summary>Delete the staged download. The applying process cannot do this
-    /// itself — it exits immediately after launching the new build — so the
-    /// staged copy is cleared at the next startup instead.</summary>
+    /// itself — it exits immediately — so Program clears it at the next startup
+    /// once the staged version is no longer newer than the running one.</summary>
     public static void DiscardStaging()
     {
         try
@@ -345,8 +410,9 @@ internal static class Updater
         catch (Exception ex) { Log.Info("update: could not remove staging — " + ex.Message); }
     }
 
-    /// <summary>Remove what a previous update left behind: the displaced
-    /// executable, and the downloaded copy staged in temp.</summary>
+    /// <summary>Remove the executable displaced by a previous update. Staging
+    /// is deliberately left alone: it may hold an update waiting to be applied,
+    /// and Program decides whether to keep it.</summary>
     public static void CleanupOld()
     {
         try
@@ -361,8 +427,6 @@ internal static class Updater
             }
         }
         catch { /* still locked; next launch will get it */ }
-
-        DiscardStaging();
     }
 
     /// <summary>Wait for the superseded process to exit so the mutex is free.</summary>

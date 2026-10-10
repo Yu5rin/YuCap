@@ -734,7 +734,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         var hotkeyCfg = new ToolStripMenuItem(L.T("ホットキー設定..."), null, (_, _) => ShowHotkeySettings());
         _miHotkeys = new ToolStripMenuItem(L.T("グローバルホットキーを有効化"), null, (_, _) => ToggleGlobalHotkeys());
         _miStartup = new ToolStripMenuItem(L.T("Windows起動時に自動実行"), null, (_, _) => ToggleStartup());
-        _miUpdateCheck = new ToolStripMenuItem(L.T("起動時に更新を確認"), null, (_, _) => ToggleUpdateCheck());
+        _miUpdateCheck = new ToolStripMenuItem(L.T("自動で更新する"), null, (_, _) => ToggleUpdateCheck());
         var lang = new ToolStripMenuItem(L.T("言語 / Language"));
         var langJa = new ToolStripMenuItem("日本語", null, (_, _) => SetLanguage("ja")) { Checked = !L.English };
         var langEn = new ToolStripMenuItem("English", null, (_, _) => SetLanguage("en")) { Checked = L.English };
@@ -2905,7 +2905,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         // discoverable without a startup dialog the user has to dismiss.
         if (_pendingUpdate != null)
         {
-            _miCheckUpdate.Text = L.F("更新があります: {0}...", _pendingUpdate.Version);
+            // Staged: the click re-checks and lands in the staged branch of
+            // CheckForUpdatesAsync(manual: true), which asks to restart now.
+            _miCheckUpdate.Text = _updateStaged
+                ? L.F("再起動して更新: {0}...", _pendingUpdate.Version)
+                : L.F("更新があります: {0}...", _pendingUpdate.Version);
             _miCheckUpdate.Font = _checkUpdateBoldFont;
         }
         else

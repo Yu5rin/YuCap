@@ -135,9 +135,14 @@ internal static class L
         ["今すぐ更新"] = "Update now",
         ["後で"] = "Later",
         ["この版をスキップ"] = "Skip this version",
-        ["起動時に更新を確認"] = "Check for updates at startup",
-        ["起動時の更新確認: オン"] = "Startup update check: on",
-        ["起動時の更新確認: オフ"] = "Startup update check: off",
+        ["自動で更新する"] = "Update automatically",
+        ["自動更新: オン"] = "Automatic updates: on",
+        ["自動更新: オフ"] = "Automatic updates: off",
+        ["再起動して更新: {0}..."] = "Restart to update: {0}...",
+        ["v{0} の準備ができました。YuCap を閉じると更新されます（クリックで今すぐ更新）"] =
+            "v{0} is ready. YuCap updates when you close it (click to update now)",
+        ["今すぐ YuCap を再起動して v{0} に更新しますか？\n\n「いいえ」を選んだ場合は、YuCap を閉じたときに更新されます。"] =
+            "Restart YuCap now to update to v{0}?\n\nIf you choose No, the update is applied when you close YuCap.",
         ["更新を確認しています..."] = "Checking for updates...",
         ["現在のバージョンは {0} です。\n更新はありません。"] =
             "You are running {0}.\nNo updates available.",

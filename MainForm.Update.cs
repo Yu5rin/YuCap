@@ -71,9 +71,40 @@ public sealed partial class MainForm
     {
         _settings.UpdateCheckOnStartup = !_settings.UpdateCheckOnStartup;
         UpdateChecks();
+        // Turning updates off must also drop anything already staged: it would
+        // otherwise be applied on exit against the user's wish.
+        if (!_settings.UpdateCheckOnStartup)
+        {
+            ClearStagedUpdate();
+            _pendingUpdate = null;
+            UpdateChecks();
+        }
         ShowOsd(_settings.UpdateCheckOnStartup
-            ? L.T("起動時の更新確認: オン")
-            : L.T("起動時の更新確認: オフ"));
+            ? L.T("自動更新: オン")
+            : L.T("自動更新: オフ"));
+    }
+
+    /// <summary>True once a verified update is staged for <see cref="_pendingUpdate"/>.
+    /// The help menu item reads this to offer "restart to update".</summary>
+    private bool _updateStaged;
+
+    /// <summary>Discard the staged download and forget it in settings.</summary>
+    private void ClearStagedUpdate()
+    {
+        Updater.DiscardStaging();
+        _settings.StagedUpdateVersion = null;
+        _settings.StagedUpdateSha256 = null;
+        _updateStaged = false;
+        SaveSettings();
+    }
+
+    /// <summary>The staged file for <paramref name="info"/>, re-verified against
+    /// the recorded SHA256 (it sat on disk since the download), or null.</summary>
+    private string? GetVerifiedStagedFile(UpdateInfo info)
+    {
+        string ver = info.Version.ToString();
+        if (_settings.StagedUpdateVersion != ver || _settings.StagedUpdateSha256 == null) return null;
+        return Updater.VerifyStaged(ver, _settings.StagedUpdateSha256, out string path) ? path : null;
     }
 
     /// <summary>True while a check is running, so a second click on the menu
@@ -169,8 +200,49 @@ public sealed partial class MainForm
             if (manual)
             {
                 // An explicit menu click may show the modal prompt directly —
-                // the user just asked for this.
-                PromptForUpdate(info);
+                // the user just asked for this. Already staged: offer the restart.
+                if (GetVerifiedStagedFile(info) != null) PromptRestartNow(info);
+                else PromptForUpdate(info);
+                return;
+            }
+
+            // Fully automatic path. Safety rules:
+            //  - only stage unattended when the release publishes a SHA256 AND the
+            //    install dir is writable; installing without hash verification is
+            //    not acceptable;
+            //  - the staged file is re-verified right before every swap;
+            //  - nothing is applied when the setting is off or the version skipped.
+            // Otherwise fall through to the old clickable-OSD behaviour.
+            if (info.Sha256 != null && Updater.CanWriteToInstallDir())
+            {
+                string ver = info.Version.ToString();
+                if (GetVerifiedStagedFile(info) == null)
+                {
+                    // A different (older) staged build is superseded.
+                    if (_settings.StagedUpdateVersion != ver) ClearStagedUpdate();
+                    try { await Updater.StageAsync(info); }
+                    catch (Exception ex)
+                    {
+                        // Silent: the next launch retries.
+                        Log.Info("update: background download failed — " + ex.Message);
+                        return;
+                    }
+                    if (IsDisposed) return;
+                    if (!_settings.UpdateCheckOnStartup)
+                    {
+                        // Switched off while downloading.
+                        Updater.DiscardStaging();
+                        return;
+                    }
+                }
+                _settings.StagedUpdateVersion = ver;
+                _settings.StagedUpdateSha256 = info.Sha256;
+                SaveSettings();
+                _pendingUpdate = info;
+                _updateStaged = true;
+                UpdateChecks();
+                ShowOsd(L.F("v{0} の準備ができました。YuCap を閉じると更新されます（クリックで今すぐ更新）", ver),
+                    8000, () => PromptRestartNow(info));
                 return;
             }
 
@@ -205,7 +277,7 @@ public sealed partial class MainForm
         if (choice == UpdatePrompt.Skip)
         {
             _settings.SkippedUpdateVersion = info.Version.ToString();
-            SaveSettings();
+            ClearStagedUpdate();   // also saves settings
             // The user just resolved this one — nothing left to relabel the
             // help menu item for.
             _pendingUpdate = null;
@@ -226,7 +298,33 @@ public sealed partial class MainForm
             return;
         }
 
-        DownloadAndApply(info);
+        // Already downloaded and verified in the background: don't fetch again.
+        string? staged = GetVerifiedStagedFile(info);
+        if (staged != null) ApplyAndClose(staged);
+        else DownloadAndApply(info);
+    }
+
+    /// <summary>
+    /// "Restart now?" for an update that is already staged. Re-verifies first;
+    /// on mismatch the staging is dropped and the normal prompt is used.
+    /// "No" leaves it staged — it is applied when YuCap is closed.
+    /// </summary>
+    private void PromptRestartNow(UpdateInfo info)
+    {
+        string? staged = Updater.CanWriteToInstallDir() ? GetVerifiedStagedFile(info) : null;
+        if (staged == null)
+        {
+            ClearStagedUpdate();
+            UpdateChecks();
+            PromptForUpdate(info);
+            return;
+        }
+        if (MessageBox.Show(this,
+                L.F("今すぐ YuCap を再起動して v{0} に更新しますか？\n\n「いいえ」を選んだ場合は、YuCap を閉じたときに更新されます。",
+                    info.Version),
+                "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+        ApplyAndClose(staged);
     }
 
     private enum UpdatePrompt { Now, Later, Skip }
@@ -311,6 +409,12 @@ public sealed partial class MainForm
         }
         if (file == null) return;   // cancelled
 
+        ApplyAndClose(file);
+    }
+
+    /// <summary>Swap in <paramref name="file"/>, relaunch, and close this window.</summary>
+    private void ApplyAndClose(string file)
+    {
         try
         {
             // Save settings and release devices before the swap: the new process

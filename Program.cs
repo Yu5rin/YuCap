@@ -49,6 +49,15 @@ internal static class Program
         Settings = SettingsStore.Load();
         L.English = Settings.Language == "en";
 
+        // A staged update that is already applied (version <= running), or that
+        // the user no longer wants (automatic updates switched off), is dropped.
+        if (Settings.StagedUpdateVersion != null
+            && (!TryGetStagedVersion(out Version? stagedAtStart) || stagedAtStart <= Updater.CurrentVersion
+                || !Settings.UpdateCheckOnStartup))
+        {
+            ClearStaged();
+        }
+
         // Crash log: keep evidence in %APPDATA%\YuCap\error.log even after the
         // dialog is dismissed.
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
@@ -141,6 +150,27 @@ internal static class Program
             return;
         }
 
+        // Crash-recovery path: an update was staged but never applied on exit
+        // (crash, forced kill, power loss). Apply it first and relaunch via the
+        // --post-update handshake. Skipped for a --post-update launch so a
+        // failing update cannot loop. The hash is re-verified inside
+        // TryGetVerifiedStaged because the file sat on disk since the download.
+        if (postUpdate < 0 && Settings.UpdateCheckOnStartup
+            && TryGetVerifiedStaged(out string stagedPath) && Updater.CanWriteToInstallDir())
+        {
+            try
+            {
+                Log.Info("update: applying staged update left over from the last run");
+                Updater.Apply(stagedPath, relaunch: true);
+                return;   // the mutex is released on return; the new build waits for our pid
+            }
+            catch (Exception ex)
+            {
+                Log.Info("update: startup apply failed — " + ex.Message);
+                ClearStaged();
+            }
+        }
+
         // Started here, not earlier: the diagnostic modes above never send the
         // heartbeat, which would look like a wedged UI thread.
         Watchdog.Start();
@@ -159,7 +189,45 @@ internal static class Program
         };
 
         Application.Run(new MainForm());
+
+        // Normal exit: swap the staged build in place, no relaunch. The fields
+        // are not cleared here — the next launch sees version <= current and
+        // cleans up. Never applied when the setting is off or the version was
+        // skipped (TryGetVerifiedStaged checks the latter).
+        if (!Updater.AppliedThisSession && Settings.UpdateCheckOnStartup
+            && TryGetVerifiedStaged(out string exitStaged) && Updater.CanWriteToInstallDir())
+        {
+            try { Updater.Apply(exitStaged, relaunch: false); }
+            catch (Exception ex) { Log.Info("update: apply on exit failed — " + ex.Message); }
+        }
         Log.Info("==== exit ====");
+    }
+
+    private static bool TryGetStagedVersion(out Version? v)
+    {
+        v = null;
+        return Settings.StagedUpdateVersion != null
+            && Version.TryParse(Settings.StagedUpdateVersion, out v);
+    }
+
+    /// <summary>True when a staged version newer than the running build exists,
+    /// is not the skipped version, and its file still matches the recorded SHA256.</summary>
+    private static bool TryGetVerifiedStaged(out string path)
+    {
+        path = "";
+        if (!TryGetStagedVersion(out Version? v) || v == null || v <= Updater.CurrentVersion) return false;
+        if (Settings.StagedUpdateSha256 == null) return false;
+        if (Settings.SkippedUpdateVersion == v.ToString()) return false;
+        return Updater.VerifyStaged(v.ToString(), Settings.StagedUpdateSha256, out path);
+    }
+
+    private static void ClearStaged()
+    {
+        Updater.DiscardStaging();
+        Settings.StagedUpdateVersion = null;
+        Settings.StagedUpdateSha256 = null;
+        try { SettingsStore.Save(Settings); }
+        catch (Exception ex) { Log.Info("could not save settings after clearing staged update: " + ex.Message); }
     }
 
     private static void ParseOptions(string[] args)
