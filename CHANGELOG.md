@@ -3,6 +3,19 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)、
 バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [1.5.0] - 2026-10-12
+
+### 追加
+- **高画質拡大（試験版）を追加しました** — オプション → 描画方式で「Direct3D（高画質拡大・試験版）」を選ぶと、
+  ウィンドウや全画面が入力映像より大きいときに、AMD FidelityFX FSR 1 で輪郭をくっきりさせながら拡大します。
+  1440p で入力して 4K のモニターで見るときなどに効果があります
+- 表示 → 拡大の画質で「標準」と「高画質（FSR）」を切り替え、シャープさを 0〜100% で調整できます（Direct3D のとき）
+
+### 変更
+- 描画方式の既定は、これまでどおり「標準」です。Direct3D に切り替えても開始できなかった場合は、自動で標準に戻ります
+- Direct3D 描画では、保存したスナップショットや一時停止の画像が、画面の表示と完全に同じ向き・色になります。
+  画面を撮影しないので、他のウィンドウが重なっていても保存できます
+
 ## [1.4.0] - 2026-10-10
 
 ### 変更
@@ -169,6 +182,7 @@
 
 初回リリース。
 
+[1.5.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.5.0
 [1.4.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.2.0

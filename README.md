@@ -37,6 +37,8 @@ NV12/P010 をネイティブに扱えるため、DirectShow では届かなか�
 - **自動デバイス選択** — 名前に指定キーワード（既定 `JVA14`）を含む機器を優先。無ければ先頭を使用
 - **抜き差し検出と自動再接続** — ケーブルを挿し直すと映像・音声が自動復帰。既定の再生デバイス変更にも追従
 - **表示モード** — アスペクト比保持／引き伸ばし／原寸／**整数倍**（ドット絵がボケない）
+- **高画質拡大（試験版）** — オプション → 描画方式で「Direct3D」を選ぶと、ウィンドウや全画面が入力より大きいときに
+  AMD FidelityFX FSR 1 で拡大します（表示 → 拡大の画質、シャープさも調整可能）。1440p 入力を 4K で見るときなどに効果があります
 - **回転・左右反転**、**デジタルズーム**（Ctrl+ホイール）とドラッグでのパン
 - **全画面 / ピクチャインピクチャ**（不透明度・クリックスルー・表示位置・サイズを設定可能）
 - **一時停止**（Space）— 映像を静止し音声も停止
@@ -175,3 +177,5 @@ MIT License — [LICENSE](LICENSE) を参照
 |---|---|---|
 | [NAudio](https://github.com/naudio/NAudio) | MIT | WASAPI 音声パススルー |
 | [Vortice.MediaFoundation](https://github.com/amerkoleci/Vortice.Windows) | MIT | Media Foundation バインディング |
+| [Vortice.Direct3D11 / DXGI / D3DCompiler / DirectComposition](https://github.com/amerkoleci/Vortice.Windows) | MIT | Direct3D 描画 |
+| [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | MIT | 高画質拡大（`third_party/FidelityFX-FSR1` に同梱） |
