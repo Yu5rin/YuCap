@@ -168,7 +168,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
     private Rectangle CurrentDst() { lock (_dstLock) return _dst; }
 
-    private static void EnsureStartup()
+    internal static void EnsureStartup()
     {
         lock (StartupLock)
         {
@@ -264,6 +264,22 @@ public sealed class D3DVideoEngine : IVideoEngine
         return s.Run(r => r.RenderOffscreen(output, quality, sharp), 5000, needFrame: true, out _);
     }
 
+    public GpuBenchResult? GpuBench(Size output, ScalingQuality quality, int frames)
+    {
+        Session? s = _s;
+        if (s == null || !s.Alive) return null;
+        float sharp = _sharpness;
+        GpuBenchResult? result = null;
+        s.Run(r =>
+        {
+            result = r.GpuBench(output, quality, sharp, frames, _rotation, _mirror, CurrentAdjustments(), Crop);
+            return null;
+        }, 60000, needFrame: true, out _);
+        return result;
+    }
+
+    public string? SourceColorInfo => _s?.ColorInfo;
+
     // =====================================================================
     //  One running session: render thread + capture thread
     // =====================================================================
@@ -315,6 +331,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         private int _dirtyCompose, _dirtyConvert;
         private volatile RenderStats? _stats;
         public RenderStats? Stats => _stats;
+        public string? ColorInfo;     // set once by OpenReader, for --hdr-probe
 
         // Video delay bookkeeping (render thread writes, anyone reads).
         private double _delayActual;
@@ -575,7 +592,11 @@ public sealed class D3DVideoEngine : IVideoEngine
                         // Wait until the swap chain has room, so latency stays at one frame.
                         if (!waitedLatency && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
                     }
-                    if (newFrame || reconvert || !drawnOnce) r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments(), _e.Crop);
+                    if (newFrame || reconvert || !drawnOnce)
+                    {
+                        r.GpuBegin();   // the GPU-time span starts with the convert pass and ends in PresentFrame
+                        r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments(), _e.Crop);
+                    }
 
                     // Before the first SetVideoRect the destination is empty. The Media
                     // Foundation preview fills the whole window in that state, so do the
@@ -622,7 +643,9 @@ public sealed class D3DVideoEngine : IVideoEngine
                 {
                     double secs = (nowTick - statTick) / 1000.0;
                     long inF = Interlocked.Read(ref _inFrames), pr = Interlocked.Read(ref _presented);
-                    _stats = new RenderStats((inF - lastIn) / secs, (pr - lastPresented) / secs, Interlocked.Read(ref _dropped));
+                    r.GpuRecent(out double gpuAvg, out double gpuMax);
+                    _stats = new RenderStats((inF - lastIn) / secs, (pr - lastPresented) / secs, Interlocked.Read(ref _dropped),
+                        gpuAvg, gpuMax);
                     lastIn = inF; lastPresented = pr; statTick = nowTick;
                 }
             }
@@ -832,8 +855,10 @@ public sealed class D3DVideoEngine : IVideoEngine
             catch { /* no "current" type: fall back to the largest */ }
 
             CaptureFormats.RawType pick = CaptureFormats.Pick(types, _wantedMode, cur)!.Value;
+            string pickedDesc, currentNativeDesc = "-", outputDesc = "-";
             using (IMFMediaType native = reader.GetNativeMediaType(VideoStream, pick.Index))
             {
+                pickedDesc = CaptureFormats.DescribeType(native);
                 IMFSourceReaderEx? ex = reader.QueryInterfaceOrNull<IMFSourceReaderEx>();
                 if (ex != null)
                 {
@@ -861,7 +886,22 @@ public sealed class D3DVideoEngine : IVideoEngine
             using (IMFMediaType outType = reader.GetCurrentMediaType(VideoStream))
             {
                 (width, height, yuv) = ReadOutputType(outType, pick.W, pick.H);
+                outputDesc = CaptureFormats.DescribeType(outType);
             }
+            try
+            {
+                using IMFMediaType curNative = reader.GetNativeMediaType(VideoStream, CurrentTypeIndex);
+                currentNativeDesc = CaptureFormats.DescribeType(curNative);
+            }
+            catch (Exception ex) { currentNativeDesc = $"(unavailable, 0x{ex.HResult:X8})"; }
+            bool tenBit = pick.Comp is "P010" or "P016" or "Y210" or "Y216" or "Y410";
+            ColorInfo =
+                $"native (selected): {pickedDesc}\n" +
+                $"native (current):  {currentNativeDesc}\n" +
+                $"output (reader):   {outputDesc}\n" +
+                $"converted to NV12: {(pick.Comp == "NV12" ? "no" : "yes")}" +
+                (tenBit ? $" ({pick.Comp} -> NV12: 10-bit precision is lost)" : string.Empty) + "\n" +
+                $"renderer assumes:  matrix={(yuv.Matrix == 2 ? "601" : yuv.Matrix is 4 or 5 ? "2020" : "709")}, {(yuv.FullRange ? "0-255" : "16-235")}, no PQ/HLG handling (shown as SDR)";
             // NV12 needs even dimensions for the chroma plane.
             width &= ~1; height &= ~1;
 

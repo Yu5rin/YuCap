@@ -4,6 +4,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DirectComposition;
@@ -81,6 +82,7 @@ internal sealed class D3DRenderer : IDisposable
     private ID3D11RasterizerState? _raster;
     private ID3D11Buffer? _cbConvert, _cbScale, _cbEasu, _cbRcas;
     private readonly IntPtr _scratch = Marshal.AllocHGlobal(256);
+    private GpuTimer? _gpu;                       // GPU time per presented frame (render thread only)
 
     // ---- per-frame input (guarded by FrameLock) ----
     private int _fw, _fh;
@@ -180,6 +182,37 @@ internal sealed class D3DRenderer : IDisposable
         _cbScale = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
+
+        try { _gpu = new GpuTimer(Device, Ctx); }
+        catch (Exception ex) { Log.Info("D3D: GPU timestamp queries unavailable: " + ex.Message.Split('\n')[0]); }
+    }
+
+    /// <summary>Open the GPU-time span of one frame (the convert pass belongs to it). PresentFrame
+    /// closes it; calling this again while a span is open does nothing.</summary>
+    public void GpuBegin() => _gpu?.Begin();
+
+    /// <summary>Average and maximum GPU milliseconds per frame over about the last second.</summary>
+    public void GpuRecent(out double avg, out double max)
+    {
+        avg = max = 0;
+        if (_gpu == null) return;
+        _gpu.Poll();
+        _gpu.Recent(out avg, out max);
+    }
+
+    /// <summary>The adapter the device lives on (for the benchmark report).</summary>
+    public string AdapterName
+    {
+        get
+        {
+            try
+            {
+                using IDXGIDevice dxgi = Device.QueryInterface<IDXGIDevice>();
+                using IDXGIAdapter a = dxgi.GetAdapter();
+                return a.Description.Description;
+            }
+            catch { return "?"; }
+        }
     }
 
     /// <summary>Create the swap chain for <paramref name="hwnd"/> and bind it to the window.
@@ -756,8 +789,9 @@ internal sealed class D3DRenderer : IDisposable
     /// <summary>Compose into the back buffer and present. Returns the Present result.</summary>
     public Result PresentFrame(Rectangle dst, ScalingQuality quality, bool pixelPerfect, float sharpness)
     {
-        if (_swap == null) return Result.Fail;
+        if (_swap == null) { _gpu?.Cancel(); return Result.Fail; }
         EnsureClientTextures(_swapSize);
+        _gpu?.Begin();   // no-op when the render loop already opened the span before Convert
         using (ID3D11Texture2D bb = _swap.GetBuffer<ID3D11Texture2D>(0))
         using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))
         {
@@ -767,9 +801,12 @@ internal sealed class D3DRenderer : IDisposable
             Ctx.CopyResource(_lastComposed!, bb);
             _composedDst = dst;
             _composedValid = true;
+            _gpu?.End();   // convert + scale/FSR + copy; the vsync wait in Present is not GPU work
         }
         Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
-        return _swap.Present(_syncInterval, _presentFlags);
+        Result pr = _swap.Present(_syncInterval, _presentFlags);
+        _gpu?.Poll();
+        return pr;
     }
 
     // =====================================================================
@@ -856,6 +893,84 @@ internal sealed class D3DRenderer : IDisposable
         return ReadBack(target, new Rectangle(Point.Empty, output));
     }
 
+    /// <summary>Benchmark (<c>--gpu-bench</c>): render the current source frame <paramref name="frames"/>
+    /// times at <paramref name="output"/> size into off-screen targets - convert, scale/FSR and the
+    /// copy that PresentFrame also makes - and return the GPU milliseconds of each, measured with the
+    /// same timestamp code as the live display. Frames are kept several deep in the GPU queue (as a
+    /// real stream keeps them) and only the results are waited for. Must run on the render thread;
+    /// null when there is no frame or no timestamp support.</summary>
+    public GpuBenchResult? GpuBench(Size output, ScalingQuality quality, float sharpness, int frames,
+        int rotation, bool mirror, VideoAdjustments adj, System.Windows.Forms.Padding crop)
+    {
+        if (output.Width <= 0 || output.Height <= 0 || frames <= 0) return null;
+        if (!Convert(rotation, mirror, adj, crop) || _orientedSrv == null) return null;
+        Size src = _orientedSize;
+        double scale = Math.Min((double)output.Width / src.Width, (double)output.Height / src.Height);
+        int dw = Math.Max(1, (int)Math.Round(src.Width * scale));
+        int dh = Math.Max(1, (int)Math.Round(src.Height * scale));
+        var dst = new Rectangle((output.Width - dw) / 2, (output.Height - dh) / 2, dw, dh);
+
+        Texture2DDescription d = new()
+        {
+            Width = (uint)output.Width, Height = (uint)output.Height, MipLevels = 1, ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        };
+        Texture2DDescription dCopy = d;
+        dCopy.BindFlags = BindFlags.ShaderResource;
+        using ID3D11Texture2D target = Device.CreateTexture2D(d);
+        using ID3D11RenderTargetView targetRtv = Device.CreateRenderTargetView(target);
+        using ID3D11Texture2D inter = Device.CreateTexture2D(d);
+        using ID3D11RenderTargetView interRtv = Device.CreateRenderTargetView(inter);
+        using ID3D11ShaderResourceView interSrv = Device.CreateShaderResourceView(inter);
+        using ID3D11Texture2D copy = Device.CreateTexture2D(dCopy);
+        GpuTimer timer;
+        try { timer = new GpuTimer(Device, Ctx, 8); }
+        catch { return null; }
+
+        using (timer)
+        {
+            void OneFrame()
+            {
+                Convert(rotation, mirror, adj, crop);
+                Compose(targetRtv, output, dst, quality, pixelPerfect: false, sharpness, interRtv, interSrv);
+                Ctx.CopyResource(copy, target);
+            }
+
+            for (int i = 0; i < 10; i++) OneFrame();   // warm-up: first use of every shader and texture
+            Ctx.Flush();
+            timer.Poll();
+            timer.TakeSamples();
+            Thread.Sleep(50);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int submitted = 0;
+            while (submitted < frames && sw.ElapsedMilliseconds < 30000)
+            {
+                if (!timer.Begin())
+                {
+                    Ctx.Flush();
+                    Thread.Sleep(0);
+                    timer.Poll();
+                    continue;
+                }
+                OneFrame();
+                timer.End();
+                Ctx.Flush();
+                submitted++;
+                timer.Poll();
+            }
+            while (timer.AnyPending && sw.ElapsedMilliseconds < 35000)
+            {
+                Ctx.Flush();
+                Thread.Sleep(1);
+                timer.Poll();
+            }
+            Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+            return new GpuBenchResult(AdapterName, timer.TakeSamples().ToArray());
+        }
+    }
+
     // =====================================================================
 
     public void Dispose() => DisposeAll(releaseDevice: true);
@@ -877,6 +992,7 @@ internal sealed class D3DRenderer : IDisposable
         if (!releaseDevice) return;
 
         lock (FrameLock) { FreeRing(); DisposeFrameTextures(); }
+        _gpu?.Dispose(); _gpu = null;
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
         _linear?.Dispose(); _point?.Dispose(); _raster?.Dispose();
         _cbConvert?.Dispose(); _cbScale?.Dispose(); _cbEasu?.Dispose(); _cbRcas?.Dispose();

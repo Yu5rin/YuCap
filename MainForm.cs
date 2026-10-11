@@ -728,6 +728,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // 上から: 画面の使い方 → 再生操作 → 映像の見え方 → ウィンドウの振る舞い
         view.DropDownItems.Add(fullscreen);
+        view.DropDownItems.Add(BuildFullscreenDisplaySubmenu());
         view.DropDownItems.Add(_miPip);
         view.DropDownItems.Add(_miFreeze);
         view.DropDownItems.Add(new ToolStripSeparator());
@@ -919,6 +920,67 @@ public sealed partial class MainForm : Form, IMessageFilter
         m.DropDownItems.Add(sharp);
         _qualityRoots.Add(m);
         return m;
+    }
+
+    /// <summary>表示 > 全画面にするモニター. The items are rebuilt every time the submenu opens, so
+    /// a monitor plugged in (or removed) since the last time shows up without a restart.</summary>
+    private ToolStripMenuItem BuildFullscreenDisplaySubmenu()
+    {
+        var m = new ToolStripMenuItem(L.T("全画面にするモニター"));
+        m.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
+        m.DropDownOpening += (_, _) =>
+        {
+            m.DropDownItems.Clear();
+            var own = new ToolStripMenuItem(L.T("ウィンドウがあるモニター"), null,
+                (_, _) => SetFullscreenDisplay("")) { Checked = _settings.FullscreenDisplay.Length == 0 };
+            m.DropDownItems.Add(own);
+            string? chosen = Displays.Find(_settings.FullscreenDisplay)?.DeviceName;
+            foreach (DisplayInfo d in Displays.List())
+            {
+                string key = d.Key;
+                m.DropDownItems.Add(new ToolStripMenuItem(d.MenuLabel(), null, (_, _) => SetFullscreenDisplay(key))
+                {
+                    Checked = chosen != null && chosen == d.DeviceName,
+                });
+            }
+        };
+        return m;
+    }
+
+    private void SetFullscreenDisplay(string key)
+    {
+        _settings.FullscreenDisplay = key;
+        _settingsSaveTimer.Stop();
+        _settingsSaveTimer.Start();
+        if (_isFullscreen) PlaceFullscreen();   // already fullscreen: move there at once
+    }
+
+    /// <summary>The screen fullscreen should cover: the chosen one, else the one the window is on.
+    /// When a chosen display is not connected, says so (once per call) and uses the window's.</summary>
+    private Screen FullscreenScreen()
+    {
+        if (_settings.FullscreenDisplay.Length == 0) return Screen.FromControl(this);
+        Screen? s = Displays.Find(_settings.FullscreenDisplay);
+        if (s != null) return s;
+        Log.Info($"fullscreen display '{_settings.FullscreenDisplay}' not found - using the window's display");
+        ShowOsd(L.T("指定のモニターが見つからないため、今のモニターで全画面にしました"), OsdLongMilliseconds);
+        return Screen.FromControl(this);
+    }
+
+    /// <summary>Put the (borderless) fullscreen window over <see cref="FullscreenScreen"/>. Moving to
+    /// a monitor with another DPI makes WinForms re-apply a suggested rectangle, so the bounds are
+    /// set again if the first assignment did not stick.</summary>
+    private void PlaceFullscreen()
+    {
+        Rectangle target = FullscreenScreen().Bounds;
+        if (Bounds != target)
+        {
+            Location = target.Location;
+            Bounds = target;
+            if (Bounds != target) Bounds = target;
+        }
+        TopMost = true;
+        LayoutCanvas(ModeChangeSettleMs);
     }
 
     /// <summary>オプション > 描画方式.</summary>
@@ -2643,7 +2705,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         _status.Visible = false;
         Log.Info("EnterFullscreen: style set, applying bounds");
         Watchdog.Mark("EnterFullscreen/Bounds");
-        Bounds = Screen.FromControl(this).Bounds;
+        Rectangle fsBounds = FullscreenScreen().Bounds;
+        Location = fsBounds.Location;   // onto the chosen monitor first (DPI changes happen here)
+        Bounds = fsBounds;
+        if (Bounds != fsBounds) Bounds = fsBounds;
         TopMost = true;
         Watchdog.Done();
         Log.Info("EnterFullscreen: bounds set, layouting");
@@ -2660,6 +2725,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _status.Visible = _savedStatusVisible;
         FormBorderStyle = FormBorderStyle.Sizable;
         Bounds = _restoreBounds;
+        if (Bounds != _restoreBounds) Bounds = _restoreBounds;   // may have crossed a DPI boundary
         WindowState = _restoreWindowState;
         TopMost = _alwaysOnTop;
         RefreshFrame();
@@ -3538,6 +3604,14 @@ public sealed partial class MainForm : Form, IMessageFilter
             ? L.F("入力 {0:0} / 表示 {1:0} / 欠落 {2}", st.InputFps, st.PresentedFps, st.DroppedFrames)
             : "—";
 
+        string gpu = "—";
+        if (_video.Stats is { GpuMsAvg: > 0 } gs)
+        {
+            double budget = 1000.0 / Math.Max(1, _video.NegotiatedFps);
+            gpu = L.F("{0:0.00}ms（最大 {1:0.00}ms）/ 1コマ {2:0.0}ms", gs.GpuMsAvg, gs.GpuMsMax, budget);
+            if (gs.GpuMsMax > budget * 0.8) gpu += " " + L.T("（余裕なし）");
+        }
+
         string screen = "—";
         try
         {
@@ -3559,6 +3633,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             L.T("描画方式") + ": " + renderer,
             L.T("入力") + ": " + input,
             "fps: " + fps,
+            "GPU: " + gpu,
             L.T("画面") + ": " + screen,
             L.T("拡大") + ": " + DescribeScaling(),
             L.T("遅延") + ": " + delay,

@@ -349,6 +349,15 @@ internal static class L
         ["映像モードの変更に失敗しました。\n\n{0}"] = "Failed to change video mode.\n\n{0}",
         ["音声の再初期化に失敗しました。\n\n{0}"] = "Failed to reinitialize audio.\n\n{0}",
 
+        // ---- Fullscreen monitor / GPU load ----
+        ["全画面にするモニター"] = "Fullscreen monitor",
+        ["ウィンドウがあるモニター"] = "Monitor with the window",
+        ["メイン"] = "Primary",
+        ["指定のモニターが見つからないため、今のモニターで全画面にしました"] =
+            "The chosen monitor was not found, so fullscreen uses the current one",
+        ["{0:0.00}ms（最大 {1:0.00}ms）/ 1コマ {2:0.0}ms"] = "{0:0.00}ms (max {1:0.00}ms) / {2:0.0}ms per frame",
+        ["（余裕なし）"] = "(no headroom)",
+
         // ---- Command line ----
         ["YuCap コマンドラインオプション:\n\n" +
          "  --fullscreen        全画面で起動\n" +
@@ -360,6 +369,8 @@ internal static class L
          "                      例: 1080p120 / 1440p60 / 1920x1080@120\n" +
          "  --list-formats [出力先]   対応フォーマットを書き出して終了\n" +
          "  --selftest [出力先]       自己診断を実行して終了\n" +
+         "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
+         "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
          "  --check-update      更新の有無を確認して終了"] =
             "YuCap command line options:\n\n" +
             "  --fullscreen        start in fullscreen\n" +
@@ -371,6 +382,8 @@ internal static class L
             "                      e.g. 1080p120 / 1440p60 / 1920x1080@120\n" +
             "  --list-formats [path]   write the supported formats and exit\n" +
             "  --selftest [path]       run the self-test and exit\n" +
+            "  --gpu-bench [path]      measure the GPU cost of 4K upscaling and exit\n" +
+            "  --hdr-probe [path]      write an HDR input report and exit\n" +
             "  --check-update      check for an update and exit",
         ["現在: {0}\n更新はありません。\n\nエンドポイント:\n{1}"] =
             "Current: {0}\nNo updates available.\n\nEndpoint:\n{1}",

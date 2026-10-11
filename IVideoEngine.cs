@@ -31,7 +31,11 @@ public readonly record struct VideoAdjustments(float Brightness, float Contrast,
 }
 
 /// <summary>Frame-rate figures measured by a renderer that presents frames itself.</summary>
-public sealed record RenderStats(double InputFps, double PresentedFps, long DroppedFrames);
+public sealed record RenderStats(double InputFps, double PresentedFps, long DroppedFrames,
+    double GpuMsAvg = 0, double GpuMsMax = 0);
+
+/// <summary>Per-frame GPU milliseconds from <see cref="IVideoEngine.GpuBench"/>.</summary>
+public sealed record GpuBenchResult(string Adapter, double[] FrameMs);
 
 /// <summary>
 /// What MainForm needs from a video engine. Two implementations exist side by side:
@@ -125,4 +129,10 @@ public interface IVideoEngine : IDisposable
     /// <summary>Render the current frame at <paramref name="output"/> size off-screen and
     /// read it back — lets the scaler be checked at 4K on a smaller monitor.</summary>
     Bitmap? RenderOffscreen(Size output, ScalingQuality quality) => null;
+    /// <summary>Debug hook for <c>--gpu-bench</c>: render the live source <paramref name="frames"/> times
+    /// at <paramref name="output"/> size off-screen and report the GPU time of each frame.</summary>
+    GpuBenchResult? GpuBench(Size output, ScalingQuality quality, int frames) => null;
+    /// <summary>Colour attributes the source reader negotiated (native and output media type), as
+    /// text lines, for <c>--hdr-probe</c>. Null when not running or not applicable.</summary>
+    string? SourceColorInfo => null;
 }

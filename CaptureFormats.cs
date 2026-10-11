@@ -119,4 +119,91 @@ internal static class CaptureFormats
         string s = new string(chars).Trim();
         return string.IsNullOrEmpty(s) ? $"0x{c:X}" : s;
     }
+
+    // ---- colour attributes (for --list-formats / --hdr-probe) -------------
+
+    private static string Attr(IMFMediaType t, Guid key, Func<int, string> name)
+    {
+        try { return name((int)t.GetUInt32(key)); }
+        catch { return "-"; }
+    }
+
+    private static string PrimariesName(int v) => v switch
+    {
+        0 => "unknown", 2 => "BT709", 3 => "BT470_2_SysM", 4 => "BT470_2_SysBG", 5 => "SMPTE170M",
+        6 => "SMPTE240M", 7 => "EBU3213", 8 => "SMPTE_C", 9 => "BT2020", 10 => "XYZ", 11 => "DCI_P3", 12 => "ACES",
+        _ => "?" + v,
+    };
+
+    private static string TransferName(int v) => v switch
+    {
+        0 => "unknown", 1 => "10(linear)", 2 => "18", 3 => "20", 4 => "22", 5 => "709", 6 => "240M",
+        7 => "sRGB", 8 => "28", 9 => "Log_100", 10 => "Log_316", 11 => "709_sym", 12 => "2020_const",
+        13 => "2020", 14 => "26", 15 => "2084(PQ)", 16 => "HLG", 17 => "10_rel",
+        _ => "?" + v,
+    };
+
+    private static string MatrixName(int v) => v switch
+    {
+        0 => "unknown", 1 => "709", 2 => "601", 3 => "240M", 4 => "BT2020_10", 5 => "BT2020_12",
+        _ => "?" + v,
+    };
+
+    private static string RangeName(int v) => v switch
+    {
+        0 => "unknown", 1 => "full(0-255)", 2 => "limited(16-235)", 3 => "48-208", 4 => "64-127",
+        _ => "?" + v,
+    };
+
+    /// <summary>"primaries=BT2020 transfer=2084(PQ) matrix=BT2020_10 range=limited(16-235)"; "-" for an
+    /// attribute the type does not carry.</summary>
+    public static string DescribeColor(IMFMediaType t) =>
+        $"primaries={Attr(t, MediaTypeAttributeKeys.VideoPrimaries, PrimariesName)} " +
+        $"transfer={Attr(t, MediaTypeAttributeKeys.TransferFunction, TransferName)} " +
+        $"matrix={Attr(t, MediaTypeAttributeKeys.YuvMatrix, MatrixName)} " +
+        $"range={Attr(t, MediaTypeAttributeKeys.VideoNominalRange, RangeName)}";
+
+    /// <summary>"P010 3840x2160@30 primaries=... transfer=... matrix=... range=...".</summary>
+    public static string DescribeType(IMFMediaType t) =>
+        (TryDescribe(t, out string comp, out int w, out int h, out int fps)
+            ? $"{comp} {w}x{h}@{fps}" : "(unreadable type)") + " " + DescribeColor(t);
+
+    /// <summary>Open <paramref name="dev"/> with a plain source reader (no Direct3D) and describe every
+    /// native media type, colour attributes included. The device must not be in use elsewhere.</summary>
+    public static List<string> ProbeDevice(VideoDeviceInfo dev)
+    {
+        D3DVideoEngine.EnsureStartup();
+        using IMFAttributes attrs = MediaFactory.MFCreateAttributes(2);
+        attrs.Set(CaptureDeviceAttributeKeys.SourceType, CaptureDeviceAttributeKeys.SourceTypeVidcap);
+        attrs.Set(CaptureDeviceAttributeKeys.SourceTypeVidcapSymbolicLink, dev.Id);
+        IMFMediaSource source = MediaFactory.MFCreateDeviceSource(attrs);
+        try
+        {
+            using IMFSourceReader reader = MediaFactory.MFCreateSourceReaderFromMediaSource(source, null);
+            const int firstVideo = unchecked((int)0xFFFFFFFC);
+            reader.SetStreamSelection(unchecked((int)0xFFFFFFFE), false);
+            reader.SetStreamSelection(firstVideo, true);
+            return DescribeAllNative(reader, firstVideo);
+        }
+        finally
+        {
+            try { source.Shutdown(); } catch { }
+            source.Dispose();
+        }
+    }
+
+    /// <summary>One line per native media type of the reader's video stream: its index and
+    /// <see cref="DescribeType"/>.</summary>
+    public static List<string> DescribeAllNative(IMFSourceReader reader, int stream)
+    {
+        var lines = new List<string>();
+        for (int i = 0; ; i++)
+        {
+            IMFMediaType type;
+            try { type = reader.GetNativeMediaType(stream, i); }
+            catch { break; }
+            using (type) lines.Add($"{i,3}: {DescribeType(type)}");
+        }
+        return lines;
+    }
 }

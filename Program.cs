@@ -19,7 +19,7 @@ internal sealed class StartupOptions
     public CaptureMode? Mode; // Compression "" = any
 }
 
-internal static class Program
+internal static partial class Program
 {
     public static readonly StartupOptions Options = new();
 
@@ -113,6 +113,18 @@ internal static class Program
             return;
         }
 
+        // GPU benchmark / HDR probe (Direct3D only; see Program.Probes.cs).
+        if (args.Length > 0 && args[0] == "--gpu-bench")
+        {
+            RunGpuBench(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_gpu_bench.txt"));
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--hdr-probe")
+        {
+            RunHdrProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_hdr_probe.txt"));
+            return;
+        }
+
         // Render test (Direct3D only): dump source frames and 4K FSR/standard renders
         // so the upscaler can be judged on a monitor smaller than 4K.
         if (args.Length > 0 && args[0] == "--render-test")
@@ -145,6 +157,8 @@ internal static class Program
                 "                      例: 1080p120 / 1440p60 / 1920x1080@120\n" +
                 "  --list-formats [出力先]   対応フォーマットを書き出して終了\n" +
                 "  --selftest [出力先]       自己診断を実行して終了\n" +
+                "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
+                "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
                 "  --check-update      更新の有無を確認して終了"),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
@@ -312,17 +326,31 @@ internal static class Program
         {
             lines.Add($"=== {dev.Name} ===");
             lines.Add($"    {dev.Id}");
-            using var probe = new VideoEngine();
+            using (var probe = new VideoEngine())
+            {
+                try
+                {
+                    // Needs a window to start a preview, so use a hidden one.
+                    using var host = new Form { ShowInTaskbar = false, Opacity = 0 };
+                    host.CreateControl();
+                    probe.Attach(host.Handle);
+                    probe.Start(dev);
+                    foreach (CaptureMode m in probe.GetModes())
+                        lines.Add($"    {m.Width,5}x{m.Height,-5} {m.Compression,-8} {m.Fps,3}fps");
+                    lines.Add($"    current: {probe.CurrentMode}");
+                }
+                catch (Exception ex)
+                {
+                    lines.Add("    ERROR: " + ex.Message);
+                }
+            }
+
+            // Every native media type with its colour attributes (the capture engine's list above
+            // hides them): what the device claims about primaries / transfer / matrix / range.
+            lines.Add("  native media types (source reader):");
             try
             {
-                // Needs a window to start a preview, so use a hidden one.
-                using var host = new Form { ShowInTaskbar = false, Opacity = 0 };
-                host.CreateControl();
-                probe.Attach(host.Handle);
-                probe.Start(dev);
-                foreach (CaptureMode m in probe.GetModes())
-                    lines.Add($"    {m.Width,5}x{m.Height,-5} {m.Compression,-8} {m.Fps,3}fps");
-                lines.Add($"    current: {probe.CurrentMode}");
+                foreach (string l in CaptureFormats.ProbeDevice(dev)) lines.Add("    " + l);
             }
             catch (Exception ex)
             {

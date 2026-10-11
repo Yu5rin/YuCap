@@ -61,6 +61,10 @@ public sealed class AppSettings
     // Low-latency presentation (Direct3D only, experimental): present at once, tear if allowed.
     public bool LowLatency { get; set; }
 
+    // Which display fullscreen uses: "" = the one the window is on; otherwise "\.\DISPLAYn|name|WxH"
+    // (see Displays.cs). Not part of the video profiles: it describes the room, not the source.
+    public string FullscreenDisplay { get; set; } = "";
+
     // Snapshots at the size shown on screen (FSR included) instead of the source size
     // (Direct3D only). Off by default: the saved file stays the exact source picture.
     public bool SaveDisplaySize { get; set; }
@@ -173,6 +177,7 @@ public sealed class AppSettings
 
         // Anything unrecognised (typo, hand edit, a value from a newer build) falls
         // back to the safe choice: the Media Foundation path / the FSR default.
+        FullscreenDisplay = (FullscreenDisplay ?? "").Trim();
         Renderer = NormalizeRenderer(Renderer);
         ScalingQuality = NormalizeQuality(ScalingQuality);
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
