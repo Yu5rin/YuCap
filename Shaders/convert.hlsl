@@ -1,12 +1,16 @@
 // NV12 -> RGB with orientation (rotate clockwise first, then mirror horizontally,
 // the same order as VideoEngine.OrientLikePreview). Each output pixel is mapped back
 // to a source pixel with integer math, so stills are exact.
+// Picture adjustments (brightness / contrast / saturation / gamma) are applied here, after
+// YUV->RGB and before any scaling, so the oriented texture - and therefore stills, the pause
+// image and the FSR input - carries exactly what is on screen.
 cbuffer Convert : register(b0)
 {
     int4   dims;    // srcW, srcH, outW, outH
-    int4   orient;  // rotation steps (0..3, clockwise x90), mirror (0/1), 0, 0
+    int4   orient;  // rotation steps (0..3, clockwise x90), mirror (0/1), adjust on (0/1), 0
     float4 coef;    // Cr->R, Cb->G, Cr->G, Cb->B
     float4 range;   // yOffset, yScale, cOffset, cScale
+    float4 adj;     // brightness (additive), contrast, 1/gamma, saturation
 };
 
 Texture2D<float>  texY  : register(t0);
@@ -37,5 +41,16 @@ float4 main(float4 pos : SV_Position) : SV_Target
     float3 rgb = float3(yy + coef.x * cr,
                         yy - coef.y * cb - coef.z * cr,
                         yy + coef.w * cb);
-    return float4(saturate(rgb), 1.0);
+    rgb = saturate(rgb);
+    // Skipped entirely when neutral (orient.z == 0) so the default path stays an exact passthrough.
+    if (orient.z != 0)
+    {
+        rgb = pow(rgb, adj.z);                                  // gamma
+        rgb = (rgb - 0.5) * adj.y + 0.5;                        // contrast around mid grey
+        rgb = rgb + adj.x;                                      // brightness
+        float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));  // BT.709 luma
+        rgb = lerp(float3(luma, luma, luma), rgb, adj.w);       // saturation
+        rgb = saturate(rgb);
+    }
+    return float4(rgb, 1.0);
 }

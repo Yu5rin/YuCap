@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Numerics;
@@ -69,6 +70,31 @@ internal sealed class D3DRenderer : IDisposable
     private ID3D11Texture2D? _lastComposed;       // copy of what was last presented
     private Rectangle _composedDst;               // destination rectangle of that frame
 
+    // ---- video delay ring (guarded by FrameLock) ----
+    // Used only while a video delay is set (A/V sync, "audio earlier"). Each slot is a full
+    // copy of one received frame plus the Stopwatch tick at which the capture thread got it.
+    // With no delay none of this exists and frames go straight into the single set of frame
+    // textures above, exactly as before. The render thread decides the ring's size and frees
+    // it; slot textures are created on first use by whichever thread writes the slot (the
+    // device is multithread-protected, as for the frame textures).
+    private sealed class Slot
+    {
+        public ID3D11Texture2D? Nv12, Y, UV;
+        public int W, H;
+        public bool Gpu;
+        public YuvInfo Yuv;
+        public long Arrival;
+        public long Seq;                       // 0 = empty
+        public void Free()
+        {
+            Nv12?.Dispose(); Nv12 = null; Y?.Dispose(); Y = null; UV?.Dispose(); UV = null;
+            Seq = 0; W = H = 0;
+        }
+    }
+    private readonly List<Slot> _ring = new();
+    private int _ringNeed;                     // slots wanted; 0 = delay not in use
+    private long _ringSeq, _shownSeq;
+
     public bool HasFrame { get { lock (FrameLock) return _hasFrame; } }
     public Size FrameSize { get { lock (FrameLock) return new Size(_fw, _fh); } }
     public bool HasComposed => _lastComposed != null && _composedValid;
@@ -117,7 +143,7 @@ internal sealed class D3DRenderer : IDisposable
         _linear = Device.CreateSamplerState(new SamplerDescription(Filter.MinMagMipLinear, TextureAddressMode.Clamp));
         _point = Device.CreateSamplerState(new SamplerDescription(Filter.MinMagMipPoint, TextureAddressMode.Clamp));
         _raster = Device.CreateRasterizerState(new RasterizerDescription(CullMode.None, FillMode.Solid));
-        _cbConvert = Device.CreateBuffer(new BufferDescription(64, BindFlags.ConstantBuffer, ResourceUsage.Default));
+        _cbConvert = Device.CreateBuffer(new BufferDescription(80, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbScale = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
@@ -253,10 +279,17 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>GPU path: copy the decoder/processor's NV12 texture into ours.</summary>
-    public void SubmitGpuFrame(ID3D11Texture2D src, uint subresource, int w, int h, YuvInfo yuv)
+    public void SubmitGpuFrame(ID3D11Texture2D src, uint subresource, int w, int h, YuvInfo yuv, long arrival)
     {
         lock (FrameLock)
         {
+            if (_ringNeed > 0)
+            {
+                Slot s = AcquireSlot(w, h, gpu: true);
+                Ctx.CopySubresourceRegion(s.Nv12!, 0, 0, 0, 0, src, subresource, new Box(0, 0, 0, w, h, 1));
+                Stamp(s, yuv, arrival);
+                return;
+            }
             EnsureFrameTextures(w, h, gpu: true);
             Ctx.CopySubresourceRegion(_nv12!, 0, 0, 0, 0, src, subresource, new Box(0, 0, 0, w, h, 1));
             _gpuFrame = true;
@@ -266,16 +299,159 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>CPU path: upload NV12 from memory (Y plane, then the interleaved UV plane).</summary>
-    public void SubmitCpuFrame(IntPtr scan0, int pitch, int w, int h, YuvInfo yuv)
+    public void SubmitCpuFrame(IntPtr scan0, int pitch, int w, int h, YuvInfo yuv, long arrival)
     {
         lock (FrameLock)
         {
+            if (_ringNeed > 0)
+            {
+                Slot s = AcquireSlot(w, h, gpu: false);
+                Ctx.UpdateSubresource(s.Y!, 0, null, scan0, (uint)pitch, 0);
+                Ctx.UpdateSubresource(s.UV!, 0, null, scan0 + pitch * h, (uint)pitch, 0);
+                Stamp(s, yuv, arrival);
+                return;
+            }
             EnsureFrameTextures(w, h, gpu: false);
             Ctx.UpdateSubresource(_texY!, 0, null, scan0, (uint)pitch, 0);
             Ctx.UpdateSubresource(_texUV!, 0, null, scan0 + pitch * h, (uint)pitch, 0);
             _gpuFrame = false;
             _yuv = yuv;
             _hasFrame = true;
+        }
+    }
+
+    // =====================================================================
+    //  Video delay ring
+    // =====================================================================
+
+    /// <summary>Render thread: size the ring for <paramref name="delayMs"/> at <paramref name="fps"/>
+    /// (fps x delay + 2 slots, so the frame that is due always still exists while newer ones
+    /// keep arriving), or free it when the delay is 0. The ring only grows while a delay is
+    /// active, so dragging a slider does not reallocate textures at every step.
+    /// Returns true when the active/inactive state or the size changed.</summary>
+    public bool ConfigureRing(int delayMs, int fps)
+    {
+        lock (FrameLock)
+        {
+            if (delayMs <= 0)
+            {
+                if (_ringNeed == 0 && _ring.Count == 0) return false;
+                FreeRing();
+                return true;
+            }
+            int need = (int)Math.Ceiling((fps > 0 ? fps : 60) * delayMs / 1000.0) + 2;
+            if (need == _ringNeed) return false;
+            if (_ringNeed == 0) _shownSeq = _ringSeq;   // nothing in the ring is "pending" yet
+            _ringNeed = need;
+            return true;
+        }
+    }
+
+    public int RingSlots { get { lock (FrameLock) return _ringNeed; } }
+
+    private void FreeRing()
+    {
+        foreach (Slot s in _ring) s.Free();
+        _ring.Clear();
+        _ringNeed = 0;
+    }
+
+    /// <summary>The slot to write next: a new one while the ring is filling, else the oldest.</summary>
+    private Slot AcquireSlot(int w, int h, bool gpu)
+    {
+        Slot slot;
+        if (_ring.Count < _ringNeed) { slot = new Slot(); _ring.Add(slot); }
+        else
+        {
+            slot = _ring[0];
+            foreach (Slot s in _ring) if (s.Seq < slot.Seq) slot = s;
+        }
+        if (slot.W != w || slot.H != h || slot.Gpu != gpu || (gpu ? slot.Nv12 : slot.Y) == null)
+        {
+            slot.Free();
+            slot.W = w; slot.H = h; slot.Gpu = gpu;
+            if (gpu)
+            {
+                slot.Nv12 = Device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
+                    Format = Format.NV12, SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+                });
+            }
+            else
+            {
+                slot.Y = Device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
+                    Format = Format.R8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+                });
+                slot.UV = Device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)(w / 2), Height = (uint)(h / 2), MipLevels = 1, ArraySize = 1,
+                    Format = Format.R8G8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+                });
+            }
+        }
+        return slot;
+    }
+
+    private void Stamp(Slot s, YuvInfo yuv, long arrival)
+    {
+        s.Yuv = yuv;
+        s.Arrival = arrival;
+        s.Seq = ++_ringSeq;
+    }
+
+    /// <summary>Stopwatch tick at which the oldest not-yet-shown frame becomes due, or
+    /// <see cref="long.MaxValue"/> when nothing is waiting.</summary>
+    public long NextDueTicks(long delayTicks)
+    {
+        lock (FrameLock)
+        {
+            long best = long.MaxValue;
+            foreach (Slot s in _ring)
+                if (s.Seq > _shownSeq && s.Arrival < best) best = s.Arrival;
+            return best == long.MaxValue ? best : best + delayTicks;
+        }
+    }
+
+    public bool HasDueFrame(long nowTicks, long delayTicks)
+    {
+        lock (FrameLock)
+        {
+            foreach (Slot s in _ring)
+                if (s.Seq > _shownSeq && s.Arrival <= nowTicks - delayTicks) return true;
+            return false;
+        }
+    }
+
+    /// <summary>Make the newest frame whose arrival is at least the delay ago the current one
+    /// (GPU-side copy into the frame textures that Convert reads). Older due frames that were
+    /// never shown - because the render thread was waiting for vsync - are simply skipped, never
+    /// lost before their turn: they stay in the ring until the newest due one replaces them.</summary>
+    public bool AdvanceDelayed(long nowTicks, long delayTicks, out long arrival)
+    {
+        arrival = 0;
+        lock (FrameLock)
+        {
+            Slot? best = null;
+            foreach (Slot s in _ring)
+                if (s.Seq > _shownSeq && s.Arrival <= nowTicks - delayTicks && (best == null || s.Seq > best.Seq))
+                    best = s;
+            if (best == null) return false;
+
+            EnsureFrameTextures(best.W, best.H, best.Gpu);
+            if (best.Gpu) Ctx.CopyResource(_nv12!, best.Nv12!);
+            else { Ctx.CopyResource(_texY!, best.Y!); Ctx.CopyResource(_texUV!, best.UV!); }
+            _gpuFrame = best.Gpu;
+            _yuv = best.Yuv;
+            _hasFrame = true;
+            _shownSeq = best.Seq;
+            arrival = best.Arrival;
+            return true;
         }
     }
 
@@ -305,6 +481,7 @@ internal sealed class D3DRenderer : IDisposable
         public int Rot, Mirror, P0, P1;
         public Vector4 Coef;
         public Vector4 Range;
+        public Vector4 Adj;
     }
 
     private void SetupTriangle(ID3D11RenderTargetView rtv, Rectangle viewport)
@@ -319,7 +496,7 @@ internal sealed class D3DRenderer : IDisposable
 
     /// <summary>Pass (a): NV12 to RGB with rotation and mirror into the oriented texture.
     /// Returns false if there is no frame yet.</summary>
-    public bool Convert(int rotation, bool mirror)
+    public bool Convert(int rotation, bool mirror, VideoAdjustments adj)
     {
         lock (FrameLock)
         {
@@ -356,6 +533,8 @@ internal sealed class D3DRenderer : IDisposable
             {
                 SrcW = src.Width, SrcH = src.Height, OutW = o.Width, OutH = o.Height,
                 Rot = rotation / 90, Mirror = mirror ? 1 : 0, Coef = coef, Range = range,
+                P0 = adj.IsNeutral ? 0 : 1,   // orient.z: adjustments on
+                Adj = new Vector4(adj.Brightness, adj.Contrast, 1f / adj.Gamma, adj.Saturation),
             });
 
             Ctx.PSSetShaderResource(0, null!);
@@ -598,7 +777,7 @@ internal sealed class D3DRenderer : IDisposable
         _swap?.Dispose(); _swap = null;
         if (!releaseDevice) return;
 
-        lock (FrameLock) DisposeFrameTextures();
+        lock (FrameLock) { FreeRing(); DisposeFrameTextures(); }
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
         _linear?.Dispose(); _point?.Dispose(); _raster?.Dispose();
         _cbConvert?.Dispose(); _cbScale?.Dispose(); _cbEasu?.Dispose(); _cbRcas?.Dispose();

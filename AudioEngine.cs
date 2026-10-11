@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
@@ -75,6 +76,47 @@ public sealed class AudioEngine : IDisposable
     /// held (see OnDataAvailable), so this is roughly the delay you hear.</summary>
     public int BufferMilliseconds { get; set; } = 120;
 
+    /// <summary>Largest value <see cref="ExtraDelayMs"/> accepts.</summary>
+    public const int MaxExtraDelayMs = 300;
+
+    private int _extraDelayMs;
+
+    /// <summary>
+    /// Deliberate extra audio delay (A/V sync: "play the sound later"), 0..<see cref="MaxExtraDelayMs"/>.
+    /// It adds to the latency target that OnDataAvailable actively holds, and unlike the
+    /// base buffer it has to be CREATED: the backlog only ever shrinks on its own, so a
+    /// bigger delay is made by queueing silence and a smaller one by discarding the surplus.
+    /// Takes effect immediately, without restarting the device, and survives Start()/Stop().
+    /// </summary>
+    public int ExtraDelayMs
+    {
+        get => Volatile.Read(ref _extraDelayMs);
+        set
+        {
+            int v = Math.Clamp(value, 0, MaxExtraDelayMs);
+            int old = Interlocked.Exchange(ref _extraDelayMs, v);
+            if (v != old) ShiftBacklog(v - old);
+        }
+    }
+
+    /// <summary>Append (positive) or discard from the front (negative) <paramref name="deltaMs"/>
+    /// of the queued audio. BufferedWaveProvider serialises this with the render thread's reads.</summary>
+    private void ShiftBacklog(int deltaMs)
+    {
+        var buffer = _buffer;
+        if (buffer == null || deltaMs == 0) return;
+        WaveFormat wf = buffer.WaveFormat;
+        int bytes = (int)(Math.Abs(deltaMs) * (long)wf.AverageBytesPerSecond / 1000);
+        bytes -= bytes % wf.BlockAlign;
+        if (bytes <= 0) return;
+        try
+        {
+            if (deltaMs > 0) buffer.AddSamples(new byte[bytes], 0, bytes);
+            else buffer.Read(new byte[Math.Min(bytes, buffer.BufferedBytes)], 0, Math.Min(bytes, buffer.BufferedBytes));
+        }
+        catch { /* the stream is being torn down */ }
+    }
+
     public string? CurrentDeviceName { get; private set; }
     public string? CurrentDeviceId { get; private set; }
     public bool IsRunning => _output != null;
@@ -148,7 +190,8 @@ public sealed class AudioEngine : IDisposable
         var capture = new WasapiCapture(captureDevice);
         var buffer = new BufferedWaveProvider(capture.WaveFormat)
         {
-            BufferDuration = TimeSpan.FromMilliseconds(Math.Max(MinBufferMs, BufferMilliseconds) * 4),
+            // Room for the target plus the full A/V-sync delay, with the same generous margin as before.
+            BufferDuration = TimeSpan.FromMilliseconds((Math.Max(MinBufferMs, BufferMilliseconds) + MaxExtraDelayMs) * 4),
             DiscardOnBufferOverflow = true,
         };
 
@@ -212,7 +255,9 @@ public sealed class AudioEngine : IDisposable
         // (400ms at the default) before anything trimmed it, which is the lag
         // you can hear. Trim early, and only the excess (oldest samples) —
         // ClearBuffer() would leave a whole buffer of silence instead.
-        double target = Math.Max(MinBufferMs, BufferMilliseconds);
+        // The A/V-sync delay is part of that target, so it is held, not trimmed away.
+        double extra = ExtraDelayMs;
+        double target = Math.Max(MinBufferMs, BufferMilliseconds) + extra;
         double buffered = buffer.BufferedDuration.TotalMilliseconds;
         // Hysteresis so normal jitter doesn't cause constant micro-trims.
         double allowance = target + Math.Max(20.0, target * 0.25);
@@ -226,6 +271,21 @@ public sealed class AudioEngine : IDisposable
                 if (_dropScratch == null || _dropScratch.Length < excess)
                     _dropScratch = new byte[excess];
                 buffer.Read(_dropScratch, 0, excess);  // discards from the front
+            }
+        }
+
+        // The deliberate delay is queued audio, and an under-run (render clock a touch
+        // faster than capture, or the very first packet) eats into it. Top it back up with
+        // silence once it has really been lost; a small hysteresis avoids a click every packet.
+        if (extra > 0)
+        {
+            double lost = extra - buffered;
+            if (lost > Math.Min(30.0, extra * 0.5))
+            {
+                WaveFormat wf = buffer.WaveFormat;
+                int pad = (int)(lost * wf.AverageBytesPerSecond / 1000.0);
+                pad -= pad % wf.BlockAlign;
+                if (pad > 0) buffer.AddSamples(new byte[pad], 0, pad);
             }
         }
 

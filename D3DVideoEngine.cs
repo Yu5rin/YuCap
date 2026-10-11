@@ -41,6 +41,9 @@ public sealed class D3DVideoEngine : IVideoEngine
     private volatile ScalingQuality _quality = ScalingQuality.Fsr;
     private float _sharpness = 0.5f;
     private volatile bool _pixelPerfect;
+    private readonly object _adjLock = new();
+    private VideoAdjustments _adj = VideoAdjustments.Neutral;   // four floats: read/written under _adjLock
+    private volatile int _videoDelayMs;
 
     private readonly object _dstLock = new();
     private Rectangle _dst;
@@ -78,6 +81,27 @@ public sealed class D3DVideoEngine : IVideoEngine
         set { _pixelPerfect = value; _s?.Poke(); }
     }
     public RenderStats? Stats => _s?.Stats;
+
+    public bool SupportsAdjustments => true;
+    public VideoAdjustments Adjustments
+    {
+        get { lock (_adjLock) return _adj; }
+        set
+        {
+            // A re-convert, not just a re-compose: the adjustment lives in the oriented texture.
+            lock (_adjLock) _adj = value.Clamped();
+            _s?.PokeConvert();
+        }
+    }
+    private VideoAdjustments CurrentAdjustments() { lock (_adjLock) return _adj; }
+
+    public bool SupportsVideoDelay => true;
+    public int VideoDelayMs
+    {
+        get => _videoDelayMs;
+        set { _videoDelayMs = Math.Clamp(value, 0, 1000); _s?.Poke(); }
+    }
+    public double VideoDelayActualMs => _s?.DelayActualMs ?? 0;
 
     public List<CaptureMode> GetModes() => new(_modes);
     public bool IsRectUpdateStuck(int thresholdMs) => false;
@@ -258,6 +282,10 @@ public sealed class D3DVideoEngine : IVideoEngine
         private volatile RenderStats? _stats;
         public RenderStats? Stats => _stats;
 
+        // Video delay bookkeeping (render thread writes, anyone reads).
+        private double _delayActual;
+        public double DelayActualMs => Volatile.Read(ref _delayActual);
+
         public Session(D3DVideoEngine e, IntPtr hwnd, VideoDeviceInfo info, CaptureMode? mode)
         {
             _e = e; _hwnd = hwnd; _info = info; _wantedMode = mode;
@@ -434,9 +462,23 @@ public sealed class D3DVideoEngine : IVideoEngine
             long lastIn = 0, lastPresented = 0;
             bool firstPresentLogged = false;
 
+            int trackedDelay = 0, delaySamples = 0;
+            bool delayLogged = false;
+
             while (!_stopping)
             {
-                _wake.WaitOne(250);
+                // With a video delay the next frame is due at a known time: sleep until then
+                // instead of until the next capture wake-up, or every frame would be shown up
+                // to one frame late.
+                int waitMs = 250;
+                int delayBefore = _e._videoDelayMs;
+                if (delayBefore > 0)
+                {
+                    long due = r.NextDueTicks(delayBefore * Stopwatch.Frequency / 1000);
+                    if (due != long.MaxValue)
+                        waitMs = (int)Math.Clamp((due - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency, 1, 250);
+                }
+                _wake.WaitOne(waitMs);
                 if (_stopping) break;
 
                 // Stills first: they must see the state the user is looking at.
@@ -447,6 +489,36 @@ public sealed class D3DVideoEngine : IVideoEngine
                 bool newFrame = Interlocked.Exchange(ref _frameReady, 0) == 1;
                 bool reconvert = Interlocked.Exchange(ref _dirtyConvert, 0) == 1;
                 bool dirty = Interlocked.Exchange(ref _dirtyCompose, 0) == 1;
+
+                // Video delay: the capture thread files frames into the renderer's ring; show
+                // the newest one that arrived at least `delay` ago. Done after any wait for the
+                // swap chain below, so frames that became due meanwhile are not left behind.
+                int delayMs = _e._videoDelayMs;
+                if (r.ConfigureRing(delayMs, Fps))
+                {
+                    Log.Info(delayMs > 0
+                        ? $"D3D: video delay configured {delayMs}ms (ring {r.RingSlots} frames)"
+                        : "D3D: video delay off");
+                }
+                bool delayed = delayMs > 0;
+                bool waitedLatency = false;
+                long arrivalShown = 0;
+                if (delayed)
+                {
+                    newFrame = false;   // capture arrivals do not drive presentation here
+                    long delayTicks = delayMs * Stopwatch.Frequency / 1000;
+                    if (r.HasDueFrame(Stopwatch.GetTimestamp(), delayTicks))
+                    {
+                        if (r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
+                        waitedLatency = true;
+                        newFrame = r.AdvanceDelayed(Stopwatch.GetTimestamp(), delayTicks, out arrivalShown);
+                    }
+                }
+                else
+                {
+                    trackedDelay = 0;
+                    Volatile.Write(ref _delayActual, 0);
+                }
 
                 Size now = ClientSize();
                 bool resized = now.Width > 0 && now.Height > 0 && now != client;
@@ -463,9 +535,9 @@ public sealed class D3DVideoEngine : IVideoEngine
                     if (newFrame)
                     {
                         // Wait until the swap chain has room, so latency stays at one frame.
-                        if (r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
+                        if (!waitedLatency && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
                     }
-                    if (newFrame || reconvert || !drawnOnce) r.Convert(_e._rotation, _e._mirror);
+                    if (newFrame || reconvert || !drawnOnce) r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments());
 
                     // Before the first SetVideoRect the destination is empty. The Media
                     // Foundation preview fills the whole window in that state, so do the
@@ -482,6 +554,24 @@ public sealed class D3DVideoEngine : IVideoEngine
                     }
                     drawnOnce = true;
                     Interlocked.Increment(ref _presented);
+                    if (delayed && newFrame && arrivalShown != 0)
+                    {
+                        // Age of the frame we just handed to the swap chain (it reaches the
+                        // screen at the next vsync, so the real figure is up to one refresh more).
+                        double ageMs = (Stopwatch.GetTimestamp() - arrivalShown) * 1000.0 / Stopwatch.Frequency;
+                        if (trackedDelay != delayMs)
+                        {
+                            trackedDelay = delayMs; delaySamples = 0; delayLogged = false;
+                        }
+                        double prev = Volatile.Read(ref _delayActual);
+                        Volatile.Write(ref _delayActual, delaySamples == 0 ? ageMs : prev * 0.9 + ageMs * 0.1);
+                        delaySamples++;
+                        if (!delayLogged && delaySamples >= 30)
+                        {
+                            delayLogged = true;
+                            Log.Info($"D3D: video delay target={delayMs}ms actual\u2248{Volatile.Read(ref _delayActual):0}ms");
+                        }
+                    }
                     if (!firstPresentLogged)
                     {
                         firstPresentLogged = true;
@@ -525,7 +615,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     if (q.NeedFrame)
                     {
                         if (!r.HasFrame) { q.Error = L.T("映像がありません"); q.Done.Set(); continue; }
-                        r.Convert(_e._rotation, _e._mirror);   // make sure the oriented texture is current
+                        r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments());   // make sure the oriented texture is current
                     }
                     q.Result = q.Work(r);
                     if (q.Result == null && q.Error == null) q.Error = L.T("映像がありません");
@@ -574,6 +664,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 {
                     IMFSample? sample = reader.ReadSample(VideoStream, SourceReaderControlFlag.None,
                         out _, out SourceReaderFlag flags, out _);
+                    long arrival = Stopwatch.GetTimestamp();   // when the frame reached us: the video delay counts from here
                     using (sample)
                     {
                         if (_stopping) break;
@@ -598,7 +689,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if (sample == null) continue;
 
                         Interlocked.Increment(ref _inFrames);
-                        SubmitSample(r, sample, width, height, yuv, ref texIid);
+                        SubmitSample(r, sample, width, height, yuv, arrival, ref texIid);
                         if (Interlocked.Exchange(ref _frameReady, 1) == 1) Interlocked.Increment(ref _dropped);
                         TryWake();
                         if (firstFrame) { firstFrame = false; Log.Info("D3D: first frame received"); }
@@ -629,7 +720,7 @@ public sealed class D3DVideoEngine : IVideoEngine
             }
         }
 
-        private void SubmitSample(D3DRenderer r, IMFSample sample, int w, int h, YuvInfo yuv, ref Guid texIid)
+        private void SubmitSample(D3DRenderer r, IMFSample sample, int w, int h, YuvInfo yuv, long arrival, ref Guid texIid)
         {
             if (sample.BufferCount < 1) return;
             using IMFMediaBuffer buf = sample.GetBufferByIndex(0);
@@ -640,7 +731,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 using var tex = new ID3D11Texture2D(p);
                 if (tex.Description.Format == Format.NV12)
                 {
-                    r.SubmitGpuFrame(tex, (uint)dxgi.SubresourceIndex, w, h, yuv);
+                    r.SubmitGpuFrame(tex, (uint)dxgi.SubresourceIndex, w, h, yuv, arrival);
                     return;
                 }
             }
@@ -650,12 +741,12 @@ public sealed class D3DVideoEngine : IVideoEngine
             if (b2 != null)
             {
                 b2.Lock2D(out IntPtr scan0, out int pitch);
-                try { r.SubmitCpuFrame(scan0, pitch, w, h, yuv); }
+                try { r.SubmitCpuFrame(scan0, pitch, w, h, yuv, arrival); }
                 finally { b2.Unlock2D(); }
                 return;
             }
             buf.Lock(out IntPtr data, out _, out _);
-            try { r.SubmitCpuFrame(data, w, w, h, yuv); }
+            try { r.SubmitCpuFrame(data, w, w, h, yuv, arrival); }
             finally { buf.Unlock(); }
         }
 

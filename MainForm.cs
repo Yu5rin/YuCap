@@ -89,6 +89,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly List<ToolStripMenuItem> _qualityItems = new();
     private readonly List<ToolStripMenuItem> _sharpnessItems = new();
 
+    private ToolStripMenuItem _miAdjust = null!;       // 表示 → 映像の調整...
     private ToolStripMenuItem _miLockAspect = null!;
     private ToolStripMenuItem _miBorderless = null!;
     private ToolStripMenuItem _miTopmost = null!;
@@ -677,6 +678,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             (_, _) => MaximizeCaptureLevel()));
         _miRestoreLevel = new ToolStripMenuItem(L.T("入力レベルを元に戻す"), null, (_, _) => RestoreCaptureLevel());
         device.DropDownItems.Add(_miRestoreLevel);
+        device.DropDownItems.Add(new ToolStripSeparator());
+        device.DropDownItems.Add(new ToolStripMenuItem(L.T("音ズレ補正..."), null, (_, _) => ShowAvSyncDialog()));
 
         // ---- 表示 ----
         var view = new ToolStripMenuItem(L.T("表示(&V)"));
@@ -724,6 +727,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildAspectSubmenu());
         view.DropDownItems.Add(BuildQualitySubmenu());
+        _miAdjust = new ToolStripMenuItem(L.T("映像の調整..."), null, (_, _) => ShowAdjustmentsDialog());
+        view.DropDownItems.Add(_miAdjust);
         view.DropDownItems.Add(BuildRotationSubmenu());
         view.DropDownItems.Add(zoomReset);
         view.DropDownItems.Add(new ToolStripSeparator());
@@ -1166,6 +1171,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _isBorderless = _settings.Borderless;
         _alwaysOnTop = _settings.AlwaysOnTop;
         _audio.BufferMilliseconds = _settings.AudioBufferMs;
+        ApplyAvSync();   // the audio side now; the video side again after every engine start
         _video.SetRotation(_settings.Rotation); // stored; applied when preview starts
         _video.SetMirror(_settings.Mirror);
         // A build before the 10% hover-opacity floor existed could have saved
@@ -2245,11 +2251,159 @@ public sealed partial class MainForm : Form, IMessageFilter
             _video.Quality = _settings.ScalingQuality == "fsr" ? ScalingQuality.Fsr : ScalingQuality.Standard;
             _video.Sharpness = _settings.FsrSharpness / 100f;
             _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
+            _video.Adjustments = CurrentAdjustments();   // ignored by engines without the capability
         }
         catch (Exception ex)
         {
             Log.Info("ApplyRenderOptions failed: " + ex.Message);
         }
+        ApplyAvSync();
+    }
+
+    private VideoAdjustments CurrentAdjustments() => new(
+        _settings.AdjBrightness / 100f, _settings.AdjContrast / 100f,
+        _settings.AdjSaturation / 100f, _settings.AdjGamma / 100f);
+
+    /// <summary>One signed offset drives two engines: positive delays the audio; negative
+    /// cannot make audio earlier (it already plays at the smallest delay its buffer allows),
+    /// so it delays the VIDEO instead. The Media Foundation preview cannot delay video, so
+    /// there negative values count as 0.</summary>
+    private void ApplyAvSync()
+    {
+        try
+        {
+            int off = _settings.AvOffsetMs;
+            _audio.ExtraDelayMs = Math.Max(0, off);
+            _video.VideoDelayMs = _video.SupportsVideoDelay ? Math.Max(0, -off) : 0;
+        }
+        catch (Exception ex)
+        {
+            Log.Info("ApplyAvSync failed: " + ex.Message);
+        }
+    }
+
+    // ---- 映像の調整 -------------------------------------------------------
+
+    private void ShowAdjustmentsDialog()
+    {
+        if (!_video.SupportsAdjustments) return;
+        // Remembered so キャンセル can put back exactly what was there; the sliders apply live.
+        (int b0, int c0, int s0, int g0) = (_settings.AdjBrightness, _settings.AdjContrast,
+            _settings.AdjSaturation, _settings.AdjGamma);
+
+        using var dlg = Ui.NewDialog(L.T("映像の調整"), 440, 262);
+        const int trackX = 96, trackW = 252, valueX = 356;
+
+        TrackBar AddRow(string name, int y, int min, int max, int value, int tick,
+            Func<int, string> format, Action<int> apply)
+        {
+            var label = Ui.Label(name, Ui.Pad, y + 6);
+            var track = new TrackBar
+            {
+                Minimum = min, Maximum = max, Value = Math.Clamp(value, min, max),
+                TickFrequency = tick, SmallChange = Math.Max(1, tick / 10), LargeChange = tick,
+                TickStyle = TickStyle.None,
+                Location = new Point(trackX, y), Size = new Size(trackW, 32),
+            };
+            var valueLabel = Ui.Label(format(track.Value), valueX, y + 6);
+            track.ValueChanged += (_, _) =>
+            {
+                valueLabel.Text = format(track.Value);
+                apply(track.Value);
+                ApplyRenderOptions();   // live: the video behind the dialog updates as you drag
+            };
+            dlg.Controls.AddRange(new Control[] { label, track, valueLabel });
+            return track;
+        }
+
+        TrackBar tb = AddRow(L.T("明るさ"), 16, -100, 100, b0, 25,
+            v => v.ToString("+0;-0;0"), v => _settings.AdjBrightness = v);
+        TrackBar tc = AddRow(L.T("コントラスト"), 62, 0, 200, c0, 25,
+            v => v + "%", v => _settings.AdjContrast = v);
+        TrackBar ts = AddRow(L.T("彩度"), 108, 0, 200, s0, 25,
+            v => v + "%", v => _settings.AdjSaturation = v);
+        TrackBar tg = AddRow(L.T("ガンマ"), 154, 50, 200, g0, 25,
+            v => (v / 100.0).ToString("0.00"), v => _settings.AdjGamma = v);
+
+        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
+        reset.Click += (_, _) => { tb.Value = 0; tc.Value = 100; ts.Value = 100; tg.Value = 100; };
+        dlg.Controls.Add(reset);
+        Ui.AddOkCancel(dlg);
+
+        if (dlg.ShowDialog(this) != DialogResult.OK)
+        {
+            (_settings.AdjBrightness, _settings.AdjContrast, _settings.AdjSaturation, _settings.AdjGamma) = (b0, c0, s0, g0);
+            ApplyRenderOptions();
+            UpdateStatus();
+            return;
+        }
+        MarkSettingsDirty();
+        UpdateStatus();
+    }
+
+    // ---- 音ズレ補正 -------------------------------------------------------
+
+    private static string AvOffsetText(int ms) =>
+        ms > 0 ? L.F("音声を {0}ms 遅らせる", ms)
+        : ms < 0 ? L.F("音声を {0}ms 早める", -ms)
+        : L.T("補正なし");
+
+    private void ShowAvSyncDialog()
+    {
+        int before = _settings.AvOffsetMs;   // キャンセル puts this back
+
+        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440, 262);
+        int w = dlg.ClientSize.Width;
+        int inner = w - 2 * Ui.Pad;
+
+        var left = Ui.Label(L.T("音声を早める"), Ui.Pad, 16);
+        var right = Ui.Label(L.T("音声を遅らせる"), 0, 16);
+        right.Left = w - Ui.Pad - right.PreferredWidth;
+
+        var track = new TrackBar
+        {
+            Minimum = -300, Maximum = 300, Value = Math.Clamp(before, -300, 300),
+            TickFrequency = 50, SmallChange = 10, LargeChange = 50,
+            Location = new Point(Ui.Pad, 38), Size = new Size(inner, 45),
+        };
+        var value = new Label
+        {
+            AutoSize = false, TextAlign = ContentAlignment.MiddleCenter,
+            Location = new Point(Ui.Pad, 88), Size = new Size(inner, 24),
+            Font = new Font(dlg.Font, FontStyle.Bold), Text = AvOffsetText(track.Value),
+        };
+        var hint = Ui.Hint(L.T("映像の動きと音が合う位置にしてください。手をたたく動画などで合わせると分かりやすいです。"),
+            Ui.Pad, 122, inner);
+        var mfHint = Ui.Hint(L.T("音声を早める補正は Direct3D 描画のときに使えます。標準の描画では 0 として扱います。"),
+            Ui.Pad, 164, inner);
+        mfHint.Visible = !_video.SupportsVideoDelay && track.Value < 0;
+
+        bool snapping = false;
+        track.ValueChanged += (_, _) =>
+        {
+            if (snapping) return;
+            int v = (int)Math.Round(track.Value / 10.0) * 10;   // the track is free, the offset moves in 10 ms steps
+            if (v != track.Value) { snapping = true; track.Value = v; snapping = false; }
+            value.Text = AvOffsetText(v);
+            mfHint.Visible = !_video.SupportsVideoDelay && v < 0;
+            _settings.AvOffsetMs = v;
+            ApplyAvSync();   // live: the sound / picture shifts while you drag
+        };
+
+        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
+        reset.Click += (_, _) => track.Value = 0;
+
+        dlg.Controls.AddRange(new Control[] { left, right, track, value, hint, mfHint, reset });
+        Ui.AddOkCancel(dlg);
+
+        if (dlg.ShowDialog(this) != DialogResult.OK)
+        {
+            _settings.AvOffsetMs = before;
+            ApplyAvSync();
+            return;
+        }
+        MarkSettingsDirty();
+        ShowOsd(AvOffsetText(_settings.AvOffsetMs));
     }
 
     private void SetScalingQuality(string quality)
@@ -3074,6 +3228,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_burstTimer.Enabled) stateParts.Add(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
         if (_zoom > 1.001) stateParts.Add(L.F("ズーム {0}%", (int)Math.Round(_zoom * 100)));
         if (IsFsrUpscaling()) stateParts.Add(L.T("FSR"));
+        if (_video.SupportsAdjustments && !CurrentAdjustments().IsNeutral) stateParts.Add(L.T("色調整"));
         _lblState.Text = string.Join("  ", stateParts);
         _lblState.Visible = stateParts.Count > 0;
 
@@ -3093,6 +3248,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         foreach (var item in _rendererItems)
             item.Checked = (string)item.Tag! == _settings.Renderer;
         UpdateQualityMenu();
+        _miAdjust.Enabled = _video.SupportsAdjustments;
+        _miAdjust.ToolTipText = _video.SupportsAdjustments
+            ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
 
         _miLockAspect.Checked = _lockAspect;
         _miBorderless.Checked = _isBorderless;

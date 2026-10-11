@@ -41,6 +41,16 @@ public sealed class AppSettings
     public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" (d3d only)
     public int FsrSharpness { get; set; } = 50;              // 0..100 (d3d + fsr only)
 
+    // Picture adjustments (Direct3D renderer only), in slider units; the defaults are neutral.
+    public int AdjBrightness { get; set; }                   // -100..100 (0 = unchanged)
+    public int AdjContrast { get; set; } = 100;              // 0..200 (100 = unchanged)
+    public int AdjSaturation { get; set; } = 100;            // 0..200 (100 = unchanged)
+    public int AdjGamma { get; set; } = 100;                 // 50..200, % of gamma 1.0 (100 = unchanged)
+
+    // A/V sync offset in ms, one signed value: positive delays the audio, negative makes it
+    // earlier (done by delaying the video, which only the Direct3D renderer can do).
+    public int AvOffsetMs { get; set; }                      // -300..300 in steps of 10
+
     // Session state restored across launches.
     public bool Fullscreen { get; set; }
     public bool Pip { get; set; }
@@ -147,6 +157,18 @@ public sealed class AppSettings
         ScalingQuality = (ScalingQuality ?? "fsr").Trim().ToLowerInvariant();
         if (ScalingQuality is not ("standard" or "fsr")) ScalingQuality = "fsr";
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
+
+        // Out-of-range picture adjustments (hand edit, newer build) are clamped, never reset:
+        // a clamped value is still close to what was meant, and every range ends at a safe
+        // picture. Contrast 0 or saturation 0 are valid (flat grey / monochrome) on purpose.
+        AdjBrightness = Math.Clamp(AdjBrightness, -100, 100);
+        AdjContrast = Math.Clamp(AdjContrast, 0, 200);
+        AdjSaturation = Math.Clamp(AdjSaturation, 0, 200);
+        AdjGamma = Math.Clamp(AdjGamma, 50, 200);   // also keeps 1/gamma finite in the shader
+
+        // The slider moves in 10 ms steps; snap a hand-edited value to that grid so the dialog
+        // and the engines always agree on what "0" and "+30" mean.
+        AvOffsetMs = (int)Math.Round(Math.Clamp(AvOffsetMs, -300, 300) / 10.0) * 10;
     }
 }
 

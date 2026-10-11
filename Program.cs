@@ -467,6 +467,27 @@ internal static class Program
                             long drop1 = engine.Stats?.DroppedFrames ?? 0;
                             if (n > 0)
                                 log.Add($"D3D stats (quiet 3s): in={sumIn / n:0}fps shown={sumShown / n:0}fps dropped={drop1 - drop0}");
+
+                            // Picture adjustments live in the convert pass, so a still taken after
+                            // the change must already carry it.
+                            log.Add("--- adjustments / video delay ---");
+                            double lumaA = MeanLuma(engine.PhotoSnapshot());
+                            engine.Adjustments = new VideoAdjustments(0.3f, 1f, 1f, 1f);
+                            System.Threading.Thread.Sleep(300);
+                            double lumaB = MeanLuma(engine.PhotoSnapshot());
+                            log.Add($"adjust brightness +0.3: mean {lumaA:0} -> {lumaB:0} ({(lumaB > lumaA ? "ok" : "NO CHANGE")})");
+                            engine.Adjustments = VideoAdjustments.Neutral;
+                            System.Threading.Thread.Sleep(300);
+                            double lumaC = MeanLuma(engine.PhotoSnapshot());
+                            log.Add($"adjust reset: {(Math.Abs(lumaC - lumaA) <= 2 ? "ok" : "MISMATCH")} (mean {lumaC:0}, was {lumaA:0})");
+
+                            engine.VideoDelayMs = 200;
+                            System.Threading.Thread.Sleep(1500);
+                            double actual = engine.VideoDelayActualMs;
+                            log.Add($"video delay 200ms: actual\u2248{actual:0}ms ({(actual >= 180 && actual <= 230 ? "ok" : "CHECK")})");
+                            engine.VideoDelayMs = 0;
+                            System.Threading.Thread.Sleep(500);
+                            log.Add($"video delay off: actual={engine.VideoDelayActualMs:0}ms");
                         }
 
                         // Rotation goes through the preview sink's vtable, which
@@ -585,6 +606,25 @@ internal static class Program
         };
 
         Application.Run(form);
+    }
+
+    /// <summary>Mean luminance (0..255) of a still, sampled on a grid; disposes the bitmap. NaN if null.</summary>
+    private static double MeanLuma(Bitmap? bmp)
+    {
+        if (bmp == null) return double.NaN;
+        using (bmp)
+        {
+            double sum = 0; int n = 0;
+            int stepX = Math.Max(1, bmp.Width / 64), stepY = Math.Max(1, bmp.Height / 64);
+            for (int y = 0; y < bmp.Height; y += stepY)
+                for (int x = 0; x < bmp.Width; x += stepX)
+                {
+                    Color c = bmp.GetPixel(x, y);
+                    sum += 0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B;
+                    n++;
+                }
+            return n == 0 ? double.NaN : sum / n;
+        }
     }
 
     private static void PumpFor(int ms)

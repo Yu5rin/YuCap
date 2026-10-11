@@ -13,6 +13,22 @@ public enum ScalingQuality
     Fsr,
 }
 
+/// <summary>
+/// Picture adjustments applied to the decoded frame (Direct3D only). Brightness is added
+/// (-1..1), Contrast and Saturation multiply (0..2), Gamma is the display gamma (0.5..2.0,
+/// above 1 = brighter midtones). <see cref="Neutral"/> is an exact passthrough.
+/// </summary>
+public readonly record struct VideoAdjustments(float Brightness, float Contrast, float Saturation, float Gamma)
+{
+    public static readonly VideoAdjustments Neutral = new(0f, 1f, 1f, 1f);
+    public bool IsNeutral => this == Neutral;
+
+    /// <summary>Clamp every member into its documented range.</summary>
+    public VideoAdjustments Clamped() => new(
+        Math.Clamp(Brightness, -1f, 1f), Math.Clamp(Contrast, 0f, 2f),
+        Math.Clamp(Saturation, 0f, 2f), Math.Clamp(Gamma, 0.5f, 2f));
+}
+
 /// <summary>Frame-rate figures measured by a renderer that presents frames itself.</summary>
 public sealed record RenderStats(double InputFps, double PresentedFps, long DroppedFrames);
 
@@ -80,6 +96,17 @@ public interface IVideoEngine : IDisposable
     /// becomes an exact block, which is the point of that display mode.</summary>
     bool PixelPerfect { get => false; set { } }
     RenderStats? Stats => null;
+    /// <summary>Brightness / contrast / saturation / gamma, applied before scaling so stills
+    /// and pause images carry it too.</summary>
+    bool SupportsAdjustments => false;
+    VideoAdjustments Adjustments { get => VideoAdjustments.Neutral; set { } }
+    /// <summary>Hold each frame back by this many milliseconds before showing it, so the picture
+    /// lines up with audio that cannot be made any earlier (A/V sync, "audio earlier").</summary>
+    bool SupportsVideoDelay => false;
+    int VideoDelayMs { get => 0; set { } }
+    /// <summary>Measured delay of the frames actually shown while <see cref="VideoDelayMs"/> is
+    /// set (ms); 0 when no delay is active or nothing was shown yet.</summary>
+    double VideoDelayActualMs => 0;
     /// <summary>Render the current frame at <paramref name="output"/> size off-screen and
     /// read it back — lets the scaler be checked at 4K on a smaller monitor.</summary>
     Bitmap? RenderOffscreen(Size output, ScalingQuality quality) => null;
