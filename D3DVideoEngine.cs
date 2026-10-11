@@ -467,7 +467,14 @@ public sealed class D3DVideoEngine : IVideoEngine
                     }
                     if (newFrame || reconvert || !drawnOnce) r.Convert(_e._rotation, _e._mirror);
 
-                    Result hr = r.PresentFrame(_e.CurrentDst(), _e._quality, _e._pixelPerfect, _e._sharpness);
+                    // Before the first SetVideoRect the destination is empty. The Media
+                    // Foundation preview fills the whole window in that state, so do the
+                    // same here (stretch to the client area) or nothing would be drawn
+                    // until the first layout pass.
+                    Rectangle dst = _e.CurrentDst();
+                    if (dst.Width <= 0 || dst.Height <= 0)
+                        dst = new Rectangle(0, 0, client.Width, client.Height);
+                    Result hr = r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness);
                     if (hr.Failure)
                     {
                         HandlePresentFailure(r, hr);

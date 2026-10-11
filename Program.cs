@@ -100,7 +100,24 @@ internal static class Program
         // Self-test: build the capture graph and report status.
         if (args.Length > 0 && args[0] == "--selftest")
         {
-            RunSelfTest(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_selftest.txt"));
+            // --selftest [出力先] [--renderer mf|d3d]   (mf = the default Media Foundation path)
+            string? outArg = null, rendererArg = "mf";
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("--renderer", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                    rendererArg = args[++i].Trim().ToLowerInvariant() == "d3d" ? "d3d" : "mf";
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal))
+                    outArg = args[i];
+            }
+            RunSelfTest(outArg ?? Path.Combine(Path.GetTempPath(), "yucap_selftest.txt"), rendererArg);
+            return;
+        }
+
+        // Render test (Direct3D only): dump source frames and 4K FSR/standard renders
+        // so the upscaler can be judged on a monitor smaller than 4K.
+        if (args.Length > 0 && args[0] == "--render-test")
+        {
+            RunRenderTest(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_render_test"));
             return;
         }
 
@@ -344,9 +361,10 @@ internal static class Program
         catch { /* never throw from the crash logger */ }
     }
 
-    private static void RunSelfTest(string outPath)
+    private static void RunSelfTest(string outPath, string renderer)
     {
         var log = new List<string>();
+        log.Add($"renderer: {renderer}");
         var form = new Form
         {
             StartPosition = FormStartPosition.Manual,
@@ -367,7 +385,7 @@ internal static class Program
         form.Controls.Add(status);
         canvas.SendToBack();
 
-        var engine = new VideoEngine();
+        var engine = VideoEngines.Create(renderer);
 
         form.Load += (_, _) =>
         {
@@ -427,6 +445,29 @@ internal static class Program
                         pump.Stop();
                         log.Add($"worst UI stall during resize: {worstGap}ms (deadlock would be thousands)");
                         log.Add($"FULLSCREEN: {VerifyVideo(engine)}");
+                        if (renderer == "d3d" && engine.Stats is { } st)
+                            log.Add($"D3D stats: in={st.InputFps:0}fps shown={st.PresentedFps:0}fps dropped={st.DroppedFrames}");
+                        if (renderer == "d3d")
+                        {
+                            // The figures above overlap VerifyVideo's snapshot readbacks, which
+                            // stall the render thread. Sample a quiet window (no snapshots) by
+                            // differencing the 1s-updated stats' cumulative drop counter and
+                            // averaging the per-second rates.
+                            var quiet = System.Diagnostics.Stopwatch.StartNew();
+                            long drop0 = engine.Stats?.DroppedFrames ?? 0;
+                            double sumIn = 0, sumShown = 0; int n = 0;
+                            Application.DoEvents();
+                            System.Threading.Thread.Sleep(1100);   // let a stats tick pass the snapshot period
+                            long t0 = quiet.ElapsedMilliseconds;
+                            while (quiet.ElapsedMilliseconds - t0 < 3000)
+                            {
+                                System.Threading.Thread.Sleep(1000);
+                                if (engine.Stats is { } q) { sumIn += q.InputFps; sumShown += q.PresentedFps; n++; }
+                            }
+                            long drop1 = engine.Stats?.DroppedFrames ?? 0;
+                            if (n > 0)
+                                log.Add($"D3D stats (quiet 3s): in={sumIn / n:0}fps shown={sumShown / n:0}fps dropped={drop1 - drop0}");
+                        }
 
                         // Rotation goes through the preview sink's vtable, which
                         // is easy to break silently when the interop shifts.
@@ -546,6 +587,99 @@ internal static class Program
         Application.Run(form);
     }
 
+    private static void PumpFor(int ms)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < ms)
+        {
+            Application.DoEvents();
+            System.Threading.Thread.Sleep(15);
+        }
+    }
+
+    /// <summary>
+    /// <c>--render-test &lt;dir&gt;</c>: start the Direct3D engine in a real (but unobtrusive)
+    /// window, then for each of 1080p / 1440p write the source frame and the standard
+    /// and FSR renders at 3840x2160, plus render-test.txt with timings and stats.
+    /// </summary>
+    private static void RunRenderTest(string dir)
+    {
+        var log = new List<string>();
+        var form = new Form
+        {
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(80, 80),
+            Size = new Size(960, 540),
+            ShowInTaskbar = false,
+            Text = "YuCap render-test",
+        };
+        var canvas = new VideoBox { Dock = DockStyle.Fill, BackColor = Color.Black };
+        form.Controls.Add(canvas);
+        IVideoEngine engine = VideoEngines.Create("d3d");
+
+        form.Load += (_, _) =>
+        {
+            try
+            {
+                Directory.CreateDirectory(dir);
+                engine.Attach(canvas.Handle);
+                var dev = VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), "JVA14");
+                if (dev == null) { log.Add("no capture device"); return; }
+                engine.Start(dev, null);
+                log.Add($"device: {dev.Name}");
+                PumpFor(2000);
+
+                var target = new Size(3840, 2160);
+                foreach (var (w, h) in new[] { (1920, 1080), (2560, 1440) })
+                {
+                    log.Add($"=== source {w}x{h} ===");
+                    if (!engine.GetModes().Any(m => m.Width == w && m.Height == h))
+                    {
+                        log.Add("  skipped: the device offers no such mode");
+                        continue;
+                    }
+                    try
+                    {
+                        engine.Start(dev, new CaptureMode("", w, h, 0));
+                        PumpFor(2000);
+                        log.Add($"  running: {engine.CurrentResolution.Width}x{engine.CurrentResolution.Height} {engine.NegotiatedFps}fps");
+
+                        using (Bitmap? src = engine.PhotoSnapshot())
+                        {
+                            if (src == null) log.Add("  source: PhotoSnapshot failed");
+                            else
+                            {
+                                src.Save(Path.Combine(dir, $"source_{w}x{h}.png"), System.Drawing.Imaging.ImageFormat.Png);
+                                log.Add($"  source_{w}x{h}.png  {src.Width}x{src.Height}");
+                            }
+                        }
+                        foreach (var (name, q) in new[] { ("standard", ScalingQuality.Standard), ("fsr", ScalingQuality.Fsr) })
+                        {
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            using Bitmap? img = engine.RenderOffscreen(target, q);
+                            long ms = sw.ElapsedMilliseconds;
+                            if (img == null) { log.Add($"  {name}: RenderOffscreen returned null ({ms}ms)"); continue; }
+                            string file = $"{name}_{w}x{h}_to_3840x2160.png";
+                            img.Save(Path.Combine(dir, file), System.Drawing.Imaging.ImageFormat.Png);
+                            log.Add($"  {file}  {img.Width}x{img.Height}  render {ms}ms");
+                        }
+                        if (engine.Stats is { } st)
+                            log.Add($"  D3D stats: in={st.InputFps:0}fps shown={st.PresentedFps:0}fps dropped={st.DroppedFrames}");
+                    }
+                    catch (Exception mex) { log.Add("  FAILED: " + mex.Message); }
+                }
+            }
+            catch (Exception ex) { log.Add("EXCEPTION: " + ex); }
+            finally
+            {
+                try { engine.Dispose(); } catch { }
+                try { File.WriteAllLines(Path.Combine(dir, "render-test.txt"), log); } catch { }
+                form.BeginInvoke(new Action(form.Close));
+            }
+        };
+        Application.Run(form);
+    }
+
     /// <summary>
     /// Decide whether real video is on screen. A single centre pixel cannot tell
     /// live video from a blank (all-white or all-black) surface, which is exactly
@@ -553,7 +687,7 @@ internal static class Program
     /// moment apart and reports both the spatial spread and whether the picture
     /// changed — a still, uniform surface means nothing is being rendered.
     /// </summary>
-    private static string VerifyVideo(VideoEngine engine)
+    private static string VerifyVideo(IVideoEngine engine)
     {
         try
         {

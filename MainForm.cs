@@ -56,7 +56,9 @@ public sealed partial class MainForm : Form, IMessageFilter
     private struct Rect { public int Left, Top, Right, Bottom; }
 
     // ---- Engines & UI ----------------------------------------------------
-    private readonly VideoEngine _video = new();
+    // Which engine this is follows AppSettings.Renderer; it is replaced (not
+    // reused) when the user switches renderer - see SwitchRenderer.
+    private IVideoEngine _video = null!;
     private readonly AudioEngine _audio = new();
 
     private readonly VideoBox _canvas = new();
@@ -80,6 +82,12 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private readonly List<ToolStripMenuItem> _aspectItems = new();
     private readonly List<ToolStripMenuItem> _rotationItems = new();
+    private readonly List<ToolStripMenuItem> _rendererItems = new();
+    // The quality menu exists twice (View menu + context menu), so everything
+    // that must follow its state is kept in lists.
+    private readonly List<ToolStripMenuItem> _qualityRoots = new();
+    private readonly List<ToolStripMenuItem> _qualityItems = new();
+    private readonly List<ToolStripMenuItem> _sharpnessItems = new();
 
     private ToolStripMenuItem _miLockAspect = null!;
     private ToolStripMenuItem _miBorderless = null!;
@@ -255,6 +263,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // call and then report "first run" on this second one, silently
         // swallowing the corrupt-settings notice.
         _settings = Program.Settings;
+        _video = CreateVideoEngine();
         L.English = _settings.Language == "en";
 
         Text = L.T("YuCap - キャプチャビューア");
@@ -714,6 +723,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         view.DropDownItems.Add(_miFreeze);
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildAspectSubmenu());
+        view.DropDownItems.Add(BuildQualitySubmenu());
         view.DropDownItems.Add(BuildRotationSubmenu());
         view.DropDownItems.Add(zoomReset);
         view.DropDownItems.Add(new ToolStripSeparator());
@@ -758,6 +768,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         options.DropDownItems.Add(deviceKeywordCfg);
         options.DropDownItems.Add(hotkeyCfg);
         options.DropDownItems.Add(BuildPipSettingsSubmenu());
+        options.DropDownItems.Add(BuildRendererSubmenu());
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(_miHotkeys);
         options.DropDownItems.Add(_miCursorHide);
@@ -870,6 +881,44 @@ public sealed partial class MainForm : Form, IMessageFilter
         return m;
     }
 
+    /// <summary>拡大の画質 > 標準 / 高画質（FSR）, シャープさ. Greyed out unless the active
+    /// engine can do it (Direct3D only) and the display mode actually scales smoothly.</summary>
+    private ToolStripMenuItem BuildQualitySubmenu()
+    {
+        var m = new ToolStripMenuItem(L.T("拡大の画質"));
+        var std = new ToolStripMenuItem(L.T("標準"), null, (_, _) => SetScalingQuality("standard")) { Tag = "standard" };
+        var fsr = new ToolStripMenuItem(L.T("高画質（FSR）"), null, (_, _) => SetScalingQuality("fsr")) { Tag = "fsr" };
+        _qualityItems.Add(std);
+        _qualityItems.Add(fsr);
+        m.DropDownItems.Add(std);
+        m.DropDownItems.Add(fsr);
+        m.DropDownItems.Add(new ToolStripSeparator());
+        var sharp = new ToolStripMenuItem(L.T("シャープさ"));
+        foreach (int pct in new[] { 0, 25, 50, 75, 100 })
+        {
+            int p = pct;
+            var item = new ToolStripMenuItem($"{p}%", null, (_, _) => SetSharpness(p)) { Tag = p };
+            _sharpnessItems.Add(item);
+            sharp.DropDownItems.Add(item);
+        }
+        m.DropDownItems.Add(sharp);
+        _qualityRoots.Add(m);
+        return m;
+    }
+
+    /// <summary>オプション > 描画方式.</summary>
+    private ToolStripMenuItem BuildRendererSubmenu()
+    {
+        var m = new ToolStripMenuItem(L.T("描画方式"));
+        var mf = new ToolStripMenuItem(L.T("標準（Media Foundation）"), null, (_, _) => SwitchRenderer("mf")) { Tag = "mf" };
+        var d3d = new ToolStripMenuItem(L.T("Direct3D（高画質拡大・試験版）"), null, (_, _) => SwitchRenderer("d3d")) { Tag = "d3d" };
+        _rendererItems.Add(mf);
+        _rendererItems.Add(d3d);
+        m.DropDownItems.Add(mf);
+        m.DropDownItems.Add(d3d);
+        return m;
+    }
+
     private ToolStripMenuItem MakeAspectItem(string text, VideoDisplayMode mode)
     {
         var item = new ToolStripMenuItem(text, null, (_, _) => SetDisplayMode(mode)) { Tag = mode };
@@ -925,6 +974,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _ctx.Items.Add(new ToolStripSeparator());
 
         _ctx.Items.Add(BuildAspectSubmenu());
+        _ctx.Items.Add(BuildQualitySubmenu());
         _ctx.Items.Add(BuildSizeSubmenu());
         _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
         _cmiVideoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_cmiVideoModeRoot);
@@ -1214,6 +1264,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         try
         {
             start();
+            ApplyRenderOptions(); // every start path goes through here
         }
         finally
         {
@@ -1688,6 +1739,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _canvas.ResetHandle();
             _video.Attach(_canvas.Handle);
             _video.Start(_currentVideoInfo, _cliMode ?? _savedMode);
+            ApplyRenderOptions();
             LayoutCanvas();
             Log.Info("resize guard: preview restarted on a fresh window");
         }
@@ -2175,8 +2227,135 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void SetDisplayMode(VideoDisplayMode mode)
     {
         _displayMode = mode;
+        ApplyRenderOptions(); // integer scaling switches the engine to nearest-neighbour
         UpdateChecks();
         LayoutCanvas();
+    }
+
+    // ---- Renderer / scaling quality -------------------------------------
+
+    private IVideoEngine CreateVideoEngine() => VideoEngines.Create(_settings.Renderer);
+
+    /// <summary>Push the user's scaling choices into the engine. Cheap and idempotent;
+    /// engines without the capability ignore the values.</summary>
+    private void ApplyRenderOptions()
+    {
+        try
+        {
+            _video.Quality = _settings.ScalingQuality == "fsr" ? ScalingQuality.Fsr : ScalingQuality.Standard;
+            _video.Sharpness = _settings.FsrSharpness / 100f;
+            _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
+        }
+        catch (Exception ex)
+        {
+            Log.Info("ApplyRenderOptions failed: " + ex.Message);
+        }
+    }
+
+    private void SetScalingQuality(string quality)
+    {
+        _settings.ScalingQuality = quality;
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        UpdateStatus();
+        ShowOsd(L.F("拡大の画質: {0}", quality == "fsr" ? L.T("高画質（FSR）") : L.T("標準")));
+    }
+
+    private void SetSharpness(int pct)
+    {
+        _settings.FsrSharpness = pct;
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        ShowOsd(L.F("シャープさ: {0}%", pct));
+    }
+
+    private static string RendererName(string renderer) =>
+        renderer == "d3d" ? L.T("Direct3D（高画質拡大・試験版）") : L.T("標準（Media Foundation）");
+
+    /// <summary>
+    /// Replace the engine with the one for <paramref name="renderer"/> and restart the
+    /// current device on it. Returns null on success, else the failure (the engine is
+    /// then left stopped and <c>_settings.Renderer</c> unchanged).
+    /// The canvas window MUST be recreated first: both engines bind a DirectComposition
+    /// target to the HWND and a window that already has one cannot be given another
+    /// (same reason as RestartPreview).
+    /// </summary>
+    private Exception? ReplaceEngine(string renderer)
+    {
+        try
+        {
+            try { _video.Stop(); } catch { /* going away anyway */ }
+            try { _video.Dispose(); } catch { /* going away anyway */ }
+            _canvas.ResetHandle();
+            _video = VideoEngines.Create(renderer);
+            _video.Attach(_canvas.Handle);
+            _video.SetRotation(_settings.Rotation);
+            _video.SetMirror(_settings.Mirror);
+            if (_currentVideoInfo != null)
+                RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, _cliMode ?? _savedMode));
+            ApplyRenderOptions();
+            _settings.Renderer = renderer;
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Log.Info($"ReplaceEngine({renderer}) failed: {ex}");
+            try { _video.Stop(); } catch { /* ignore */ }
+            return ex;
+        }
+    }
+
+    private void SwitchRenderer(string renderer)
+    {
+        if (renderer == _settings.Renderer) { UpdateChecks(); return; }
+        string previous = _settings.Renderer;
+        if (_frozen) ToggleFreeze();
+
+        Exception? failure = ReplaceEngine(renderer);
+        if (failure != null)
+        {
+            // Fall back to the engine that was working, the same way.
+            string reason = Errors.Describe(failure);
+            Exception? back = ReplaceEngine(previous);
+            _videoError = back != null ? Errors.Describe(back) : null;
+            LayoutCanvas();
+            UpdateStatus();
+            UpdateChecks();
+            MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            ShowOsd(L.T("Direct3D 描画を開始できなかったため、標準の描画に戻しました"), OsdLongMilliseconds);
+            return;
+        }
+
+        _videoError = null;
+        LayoutCanvas();
+        UpdateStatus();
+        UpdateChecks();
+        SaveSettings();
+        ShowOsd(L.F("描画方式: {0}", RendererName(renderer)));
+    }
+
+    /// <summary>Grey out the quality menu when it cannot apply, and say why.</summary>
+    private void UpdateQualityMenu()
+    {
+        string quality = _settings.ScalingQuality;
+        bool supported = _video.SupportsScalingQuality;
+        bool pixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
+        string tip = !supported ? L.T("Direct3D 描画のときに使えます（オプション → 描画方式）")
+            : pixelPerfect ? L.T("整数倍表示では使いません")
+            : string.Empty;
+        foreach (var root in _qualityRoots)
+        {
+            root.Enabled = supported && !pixelPerfect;
+            root.ToolTipText = tip;
+        }
+        foreach (var item in _qualityItems) item.Checked = (string)item.Tag! == quality;
+        foreach (var item in _sharpnessItems)
+        {
+            item.Checked = (int)item.Tag! == _settings.FsrSharpness;
+            item.Enabled = quality == "fsr";
+        }
     }
 
     private void ToggleLockAspect()
@@ -2799,6 +2978,18 @@ public sealed partial class MainForm : Form, IMessageFilter
     private static string Ellipsize(string s, int max) =>
         s.Length <= max ? s : s.Substring(0, max) + "…";
 
+    /// <summary>True while FSR is really resampling: the quality engine is running with FSR
+    /// selected, integer scaling is off, and the picture is drawn larger than the source.</summary>
+    private bool IsFsrUpscaling()
+    {
+        if (!_video.IsRunning || !_video.SupportsScalingQuality) return false;
+        if (_video.Quality != ScalingQuality.Fsr || _video.PixelPerfect) return false;
+        Size res = _video.DisplayResolution;
+        if (res.Width <= 0 || res.Height <= 0) return false;
+        Rectangle dest = ComputeDest(_canvas.ClientSize);
+        return dest.Width > res.Width || dest.Height > res.Height;
+    }
+
     private void UpdateStatus()
     {
         UpdatePowerState(); // display sleep inhibition follows the running state
@@ -2818,6 +3009,9 @@ public sealed partial class MainForm : Form, IMessageFilter
             _lblVideo.ToolTipText = r.Width > 0
                 ? $"{vLabel}: {_video.CurrentDeviceName}  {r.Width}x{r.Height} {comp}{fps}"
                 : $"{vLabel}: {_video.CurrentDeviceName}{fps}";
+            if (_video.Stats is { } st)
+                _lblVideo.ToolTipText += "\n" + L.F("入力 {0:0}fps / 表示 {1:0}fps / 欠落 {2}",
+                    st.InputFps, st.PresentedFps, st.DroppedFrames);
         }
         else
         {
@@ -2856,6 +3050,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_isPip) stateParts.Add(L.T("PiP"));
         if (_burstTimer.Enabled) stateParts.Add(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
         if (_zoom > 1.001) stateParts.Add(L.F("ズーム {0}%", (int)Math.Round(_zoom * 100)));
+        if (IsFsrUpscaling()) stateParts.Add(L.T("FSR"));
         _lblState.Text = string.Join("  ", stateParts);
         _lblState.Visible = stateParts.Count > 0;
 
@@ -2871,6 +3066,10 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         foreach (var item in _aspectItems)
             item.Checked = (VideoDisplayMode)item.Tag! == _displayMode;
+
+        foreach (var item in _rendererItems)
+            item.Checked = (string)item.Tag! == _settings.Renderer;
+        UpdateQualityMenu();
 
         _miLockAspect.Checked = _lockAspect;
         _miBorderless.Checked = _isBorderless;

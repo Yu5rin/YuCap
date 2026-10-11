@@ -34,6 +34,13 @@ public sealed class AppSettings
     public int Rotation { get; set; }             // 0 / 90 / 180 / 270
     public bool Mirror { get; set; }
 
+    // Renderer. "mf" is the proven Media Foundation preview and stays the default;
+    // "d3d" is our own Direct3D 11 swap chain, which is what makes FSR upscaling
+    // possible. It is opt-in (オプション → 描画方式) until verified on a 4K monitor.
+    public string Renderer { get; set; } = "mf";            // "mf" | "d3d"
+    public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" (d3d only)
+    public int FsrSharpness { get; set; } = 50;              // 0..100 (d3d + fsr only)
+
     // Session state restored across launches.
     public bool Fullscreen { get; set; }
     public bool Pip { get; set; }
@@ -132,6 +139,14 @@ public sealed class AppSettings
         UpdateApiUrl = string.IsNullOrWhiteSpace(UpdateApiUrl) ? DefaultUpdateApiUrl : UpdateApiUrl;
 
         CaptureLevelBefore = Math.Clamp(CaptureLevelBefore, -1, 100);
+
+        // Anything unrecognised (typo, hand edit, a value from a newer build) falls
+        // back to the safe choice: the Media Foundation path / the FSR default.
+        Renderer = (Renderer ?? "mf").Trim().ToLowerInvariant();
+        if (Renderer is not ("mf" or "d3d")) Renderer = "mf";
+        ScalingQuality = (ScalingQuality ?? "fsr").Trim().ToLowerInvariant();
+        if (ScalingQuality is not ("standard" or "fsr")) ScalingQuality = "fsr";
+        FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
     }
 }
 
