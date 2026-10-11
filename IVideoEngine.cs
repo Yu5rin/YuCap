@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Windows.Forms;
 
 namespace YuCap;
 
@@ -107,6 +108,20 @@ public interface IVideoEngine : IDisposable
     /// <summary>Measured delay of the frames actually shown while <see cref="VideoDelayMs"/> is
     /// set (ms); 0 when no delay is active or nothing was shown yet.</summary>
     double VideoDelayActualMs => 0;
+    /// <summary>Cut a black border off the picture (Direct3D only). Left/Top/Right/Bottom are in
+    /// SOURCE pixels, before rotation. <see cref="DisplayResolution"/> becomes the cropped (then
+    /// rotated) size, so layout, FSR and stills all follow the cropped picture; at least 64x64
+    /// always remains.</summary>
+    bool SupportsCrop => false;
+    Padding Crop { get => Padding.Empty; set { } }
+    /// <summary>Present each new frame at once instead of waiting for vsync (Direct3D only). The kind
+    /// of swap chain is chosen when the engine starts, so a change takes effect at the next Start
+    /// (MainForm restarts the engine on a fresh window when the user toggles it).</summary>
+    bool SupportsLowLatency => false;
+    bool LowLatency { get => false; set { } }
+    /// <summary>How frames reach the screen, e.g. "composition vsync", "hwnd tearing", "hwnd sync0".
+    /// Empty when not running or not applicable.</summary>
+    string PresentMode => string.Empty;
     /// <summary>Render the current frame at <paramref name="output"/> size off-screen and
     /// read it back — lets the scaler be checked at 4K on a smaller monitor.</summary>
     Bitmap? RenderOffscreen(Size output, ScalingQuality quality) => null;

@@ -488,6 +488,57 @@ internal static class Program
                             engine.VideoDelayMs = 0;
                             System.Threading.Thread.Sleep(500);
                             log.Add($"video delay off: actual={engine.VideoDelayActualMs:0}ms");
+
+                            // ---- crop, display-size save, low latency (Direct3D only) ----
+                            log.Add("--- crop / display-size save / low latency ---");
+                            try
+                            {
+                                Size srcRes = engine.CurrentResolution;
+                                engine.Crop = new System.Windows.Forms.Padding(100);
+                                System.Threading.Thread.Sleep(500);
+                                Size disp = engine.DisplayResolution;
+                                bool cropOk = disp == new Size(srcRes.Width - 200, srcRes.Height - 200);
+                                log.Add($"crop 100px: display={disp.Width}x{disp.Height} ({(cropOk ? "ok" : "CHECK")})"
+                                    + (srcRes == new Size(1920, 1080) ? string.Empty : $" source={srcRes.Width}x{srcRes.Height} (expected source-200)"));
+                                using (Bitmap? cph = engine.PhotoSnapshot())
+                                    log.Add(cph == null
+                                        ? "  crop photo: unavailable"
+                                        : $"  crop photo: {cph.Width}x{cph.Height} ({(cph.Size == disp ? "size matches display" : "MISMATCH")})");
+                                engine.Crop = System.Windows.Forms.Padding.Empty;
+                                System.Threading.Thread.Sleep(500);
+                                log.Add($"  crop cleared: display={engine.DisplayResolution.Width}x{engine.DisplayResolution.Height} (source {srcRes.Width}x{srcRes.Height})");
+
+                                // Snapshot(cropToVideo) is what 表示どおりに保存 saves: the composed frame
+                                // at the size of the destination rectangle (clipped to the window).
+                                Rectangle destNow = Rectangle.Intersect(new Rectangle(0, 0, scr.Width, scr.Height),
+                                    new Rectangle(Point.Empty, canvas.ClientSize));
+                                using (Bitmap? shown = engine.Snapshot(cropToVideo: true))
+                                    log.Add(shown == null
+                                        ? "display-size save: Snapshot unavailable"
+                                        : $"display-size save: Snapshot(cropToVideo)={shown.Width}x{shown.Height}, dest rect={destNow.Width}x{destNow.Height} ({(shown.Size == destNow.Size ? "ok" : "CHECK")})");
+
+                                // The swap chain kind is chosen at start, so low latency is a restart on a
+                                // fresh window (what MainForm does when the menu item is toggled).
+                                void RestartOnFreshWindow()
+                                {
+                                    canvas.ResetHandle();
+                                    engine.Attach(canvas.Handle);
+                                    engine.Start(dev, null);
+                                    engine.SetVideoRect(new Rectangle(0, 0, scr.Width, scr.Height));
+                                }
+                                engine.LowLatency = true;
+                                RestartOnFreshWindow();
+                                PumpFor(2500);
+                                double llShown = engine.Stats?.PresentedFps ?? 0;
+                                log.Add($"low latency: on, present mode={engine.PresentMode}, shown={llShown:0}fps");
+                                log.Add($"  low latency render: {VerifyVideo(engine)}");
+                                engine.LowLatency = false;
+                                RestartOnFreshWindow();
+                                PumpFor(2500);
+                                log.Add($"low latency: off, present mode={engine.PresentMode}, shown={engine.Stats?.PresentedFps ?? 0:0}fps");
+                                log.Add($"  after low latency off: {VerifyVideo(engine)}");
+                            }
+                            catch (Exception cex) { log.Add("crop / low latency test FAILED: " + cex.Message); }
                         }
 
                         // Rotation goes through the preview sink's vtable, which

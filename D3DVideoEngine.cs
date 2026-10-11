@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Windows.Forms;
 using SharpGen.Runtime;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -44,6 +45,9 @@ public sealed class D3DVideoEngine : IVideoEngine
     private readonly object _adjLock = new();
     private VideoAdjustments _adj = VideoAdjustments.Neutral;   // four floats: read/written under _adjLock
     private volatile int _videoDelayMs;
+    private readonly object _cropLock = new();
+    private Padding _crop = Padding.Empty;                     // five ints: read/written under _cropLock
+    private volatile bool _lowLatency;
 
     private readonly object _dstLock = new();
     private Rectangle _dst;
@@ -61,8 +65,38 @@ public sealed class D3DVideoEngine : IVideoEngine
 
     public int Rotation => _rotation;
     public bool Mirror => _mirror;
-    public Size DisplayResolution =>
-        _rotation is 90 or 270 ? new Size(CurrentResolution.Height, CurrentResolution.Width) : CurrentResolution;
+    /// <summary>The cropped, then rotated, size - what the convert pass really produces.</summary>
+    public Size DisplayResolution
+    {
+        get
+        {
+            Size src = CurrentResolution;
+            if (src.Width <= 0 || src.Height <= 0) return src;
+            Size kept = CropMath.Effective(src, Crop).Size;
+            return _rotation is 90 or 270 ? new Size(kept.Height, kept.Width) : kept;
+        }
+    }
+
+    public bool SupportsCrop => true;
+    public Padding Crop
+    {
+        get { lock (_cropLock) return _crop; }
+        set
+        {
+            lock (_cropLock) _crop = new Padding(Math.Max(0, value.Left), Math.Max(0, value.Top),
+                Math.Max(0, value.Right), Math.Max(0, value.Bottom));
+            _s?.PokeConvert();   // the crop lives in the convert pass, like the adjustments
+        }
+    }
+
+    public bool SupportsLowLatency => true;
+    /// <summary>Read when a session starts: the swap chain kind cannot change under a running one.</summary>
+    public bool LowLatency
+    {
+        get => _lowLatency;
+        set => _lowLatency = value;
+    }
+    public string PresentMode => _s?.PresentMode ?? string.Empty;
 
     public bool SupportsScalingQuality => true;
     public ScalingQuality Quality
@@ -286,9 +320,13 @@ public sealed class D3DVideoEngine : IVideoEngine
         private double _delayActual;
         public double DelayActualMs => Volatile.Read(ref _delayActual);
 
+        private readonly bool _lowLatency;   // fixed for the session: decides the swap chain kind
+        public string PresentMode => _r?.PresentMode ?? string.Empty;
+
         public Session(D3DVideoEngine e, IntPtr hwnd, VideoDeviceInfo info, CaptureMode? mode)
         {
             _e = e; _hwnd = hwnd; _info = info; _wantedMode = mode;
+            _lowLatency = e._lowLatency;
         }
 
         public void Begin()
@@ -385,7 +423,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
                 Size client = ClientSize();
                 if (client.Width <= 0 || client.Height <= 0) client = new Size(16, 16);
-                r.CreatePresentation(_hwnd, client);
+                r.CreatePresentation(_hwnd, client, _lowLatency);
                 r.Resize(client);   // creates the client-sized textures
                 _deviceReady.Set();
 
@@ -537,7 +575,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                         // Wait until the swap chain has room, so latency stays at one frame.
                         if (!waitedLatency && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
                     }
-                    if (newFrame || reconvert || !drawnOnce) r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments());
+                    if (newFrame || reconvert || !drawnOnce) r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments(), _e.Crop);
 
                     // Before the first SetVideoRect the destination is empty. The Media
                     // Foundation preview fills the whole window in that state, so do the
@@ -615,7 +653,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     if (q.NeedFrame)
                     {
                         if (!r.HasFrame) { q.Error = L.T("映像がありません"); q.Done.Set(); continue; }
-                        r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments());   // make sure the oriented texture is current
+                        r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments(), _e.Crop);   // make sure the oriented texture is current
                     }
                     q.Result = q.Work(r);
                     if (q.Result == null && q.Error == null) q.Error = L.T("映像がありません");

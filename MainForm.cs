@@ -684,6 +684,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         device.DropDownItems.Add(new ToolStripSeparator());
         device.DropDownItems.Add(new ToolStripMenuItem(L.T("音ズレ補正..."), null, (_, _) => ShowAvSyncDialog()));
 
+        // ---- プロファイル ----
+        var profiles = BuildProfilesMenu();
+
         // ---- 表示 ----
         var view = new ToolStripMenuItem(L.T("表示(&V)"));
         view.DropDownOpening += (_, _) => UpdateChecks();
@@ -732,6 +735,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         view.DropDownItems.Add(BuildQualitySubmenu());
         _miAdjust = new ToolStripMenuItem(L.T("映像の調整..."), null, (_, _) => ShowAdjustmentsDialog());
         view.DropDownItems.Add(_miAdjust);
+        _miCrop = new ToolStripMenuItem(L.T("黒い縁の切り取り..."), null, (_, _) => ShowCropDialog());
+        view.DropDownItems.Add(_miCrop);
         view.DropDownItems.Add(BuildRotationSubmenu());
         view.DropDownItems.Add(zoomReset);
         view.DropDownItems.Add(new ToolStripSeparator());
@@ -777,6 +782,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         options.DropDownItems.Add(hotkeyCfg);
         options.DropDownItems.Add(BuildPipSettingsSubmenu());
         options.DropDownItems.Add(BuildRendererSubmenu());
+        _miLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
+        options.DropDownItems.Add(_miLowLatency);
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(_miHotkeys);
         options.DropDownItems.Add(_miCursorHide);
@@ -804,7 +811,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         help.DropDownItems.Add(_miCheckUpdate);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
 
-        _menu.Items.AddRange(new ToolStripItem[] { file, device, view, options, help });
+        _menu.Items.AddRange(new ToolStripItem[] { file, device, profiles, view, options, help });
     }
 
     private ToolStripMenuItem BuildRotationSubmenu()
@@ -1046,6 +1053,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gHere, L.T("メニューバーの表示"), "F10");
         Row(gHere, L.T("情報表示の切替"), "Ctrl+Shift+I");
         Row(gHere, L.T("FSR と標準の拡大を見比べる"), L.T("Q（押している間）"));
+        Row(gHere, L.T("プロファイルを切り替える"), "Ctrl+1 – 9");
         Row(gHere, L.T("メニュー"), L.T("右クリック"));
         Row(gHere, L.T("操作一覧"), "F1");
 
@@ -1274,6 +1282,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         Cursor = Cursors.WaitCursor;
         try
         {
+            // Before the start too: the low-latency choice decides the swap chain kind when the
+            // engine starts, so the engine must already know it. Idempotent and cheap.
+            ApplyRenderOptions();
             start();
             ApplyRenderOptions(); // every start path goes through here
         }
@@ -2253,18 +2264,27 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// engines without the capability ignore the values.</summary>
     private void ApplyRenderOptions()
     {
+        Size displayBefore = _video.DisplayResolution;
         try
         {
             _video.Quality = _settings.ScalingQuality == "fsr" ? ScalingQuality.Fsr : ScalingQuality.Standard;
             _video.Sharpness = _settings.FsrSharpness / 100f;
             _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
             _video.Adjustments = CurrentAdjustments();   // ignored by engines without the capability
+            _video.Crop = new Padding(_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
+            _video.LowLatency = _settings.LowLatency;    // read by the engine at its next start
         }
         catch (Exception ex)
         {
             Log.Info("ApplyRenderOptions failed: " + ex.Message);
         }
         ApplyAvSync();
+
+        // A crop changes the picture's size, so the aspect-fit layout (and with it the FSR factor)
+        // has to follow. Only when a picture was already there: a start fills the size in itself.
+        Size displayAfter = _video.DisplayResolution;
+        if (displayBefore.Width > 0 && displayBefore.Height > 0 && displayAfter != displayBefore)
+            LayoutCanvas();
     }
 
     private VideoAdjustments CurrentAdjustments() => new(
@@ -3230,12 +3250,16 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Current-mode label: at most one relevant note at a time, so the bar
         // never crowds out the device labels next to it.
         var stateParts = new List<string>();
+        if (_settings.ActiveProfile is { } activeProfile)
+            stateParts.Add(ActiveProfileModified() ? L.F("{0}（変更あり）", activeProfile) : activeProfile);
         if (_frozen) stateParts.Add(L.T("一時停止中"));
         if (_isPip) stateParts.Add(L.T("PiP"));
         if (_burstTimer.Enabled) stateParts.Add(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
         if (_zoom > 1.001) stateParts.Add(L.F("ズーム {0}%", (int)Math.Round(_zoom * 100)));
         if (IsFsrUpscaling()) stateParts.Add(L.T("FSR"));
         if (_video.SupportsAdjustments && !CurrentAdjustments().IsNeutral) stateParts.Add(L.T("色調整"));
+        if (_video.SupportsCrop && HasCrop()) stateParts.Add(L.T("切り取り"));
+        if (_video.SupportsLowLatency && _settings.LowLatency) stateParts.Add(L.T("低遅延"));
         _lblState.Text = string.Join("  ", stateParts);
         _lblState.Visible = stateParts.Count > 0;
 
@@ -3259,6 +3283,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         _miAdjust.ToolTipText = _video.SupportsAdjustments
             ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
 
+        _miCrop.Enabled = _video.SupportsCrop;
+        _miCrop.ToolTipText = _video.SupportsCrop
+            ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+        _miLowLatency.Enabled = _video.SupportsLowLatency;
+        _miLowLatency.Checked = _video.SupportsLowLatency && _settings.LowLatency;
+        _miLowLatency.ToolTipText = _video.SupportsLowLatency
+            ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
         _miLockAspect.Checked = _lockAspect;
         _miBorderless.Checked = _isBorderless;
         _cmiBorderless.Checked = _isBorderless;
@@ -3345,6 +3376,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         // fresh press. Holding Ctrl+S must fire ONE snapshot, not one per
         // repeat interval.
         bool isRepeat = ((long)msg.LParam & 0x40000000) != 0;
+
+        // Ctrl+1 .. Ctrl+9: apply the profile in that menu position.
+        if (ProfileIndexForKey(keyData) is int profileIndex)
+        {
+            if (!isRepeat) ApplyProfileAt(profileIndex);
+            return true;
+        }
 
         switch (keyData)
         {
@@ -3525,6 +3563,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             L.T("拡大") + ": " + DescribeScaling(),
             L.T("遅延") + ": " + delay,
             L.T("色調整") + ": " + color,
+            L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
         }));
         PositionInfo();
     }

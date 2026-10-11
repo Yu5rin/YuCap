@@ -15,6 +15,32 @@ using D3DFeatureLevel = Vortice.Direct3D.FeatureLevel;
 
 namespace YuCap;
 
+/// <summary>Black-border crop arithmetic, shared by the renderer and the engine so that the size the UI
+/// lays out (<see cref="D3DVideoEngine.DisplayResolution"/>) is exactly the size the convert pass draws.</summary>
+internal static class CropMath
+{
+    public const int MinSide = 64;
+
+    /// <summary>The kept sub-rectangle of a <paramref name="src"/>-sized frame: each requested margin is
+    /// limited so that at least 64x64 pixels remain (left and top win over right and bottom). A source
+    /// already smaller than that is left whole.</summary>
+    public static Rectangle Effective(Size src, System.Windows.Forms.Padding crop)
+    {
+        (int x, int w) = Axis(src.Width, crop.Left, crop.Right);
+        (int y, int h) = Axis(src.Height, crop.Top, crop.Bottom);
+        return new Rectangle(x, y, w, h);
+    }
+
+    private static (int start, int len) Axis(int size, int near, int far)
+    {
+        int room = size - MinSide;
+        if (room <= 0) return (0, size);
+        near = Math.Clamp(near, 0, room);
+        far = Math.Clamp(far, 0, room - near);
+        return (near, size - near - far);
+    }
+}
+
 /// <summary>Colour interpretation of the incoming NV12 frames.</summary>
 internal readonly record struct YuvInfo(int Matrix, bool FullRange);
 
@@ -39,7 +65,14 @@ internal sealed class D3DRenderer : IDisposable
     private IDCompositionVisual? _dcompVisual;
     private Size _swapSize;
     public IntPtr LatencyWaitable { get; private set; }
-    public string PresentPath { get; private set; } = "?";
+    /// <summary>How frames reach the screen: "composition vsync" (DirectComposition, the normal path),
+    /// "hwnd tearing" (window swap chain, sync interval 0, tearing allowed - low latency on a system
+    /// that supports it), "hwnd sync0" (window swap chain, sync interval 0, no tearing) or
+    /// "hwnd vsync" (the fallback when DirectComposition cannot be used).</summary>
+    public string PresentMode { get; private set; } = "?";
+    private SwapChainFlags _swapFlags = SwapChainFlags.FrameLatencyWaitableObject;
+    private PresentFlags _presentFlags = PresentFlags.None;
+    private uint _syncInterval = 1;
 
     // ---- shaders / states / constant buffers ----
     private ID3D11VertexShader? _vs;
@@ -143,14 +176,29 @@ internal sealed class D3DRenderer : IDisposable
         _linear = Device.CreateSamplerState(new SamplerDescription(Filter.MinMagMipLinear, TextureAddressMode.Clamp));
         _point = Device.CreateSamplerState(new SamplerDescription(Filter.MinMagMipPoint, TextureAddressMode.Clamp));
         _raster = Device.CreateRasterizerState(new RasterizerDescription(CullMode.None, FillMode.Solid));
-        _cbConvert = Device.CreateBuffer(new BufferDescription(80, BindFlags.ConstantBuffer, ResourceUsage.Default));
+        _cbConvert = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbScale = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
     }
 
-    /// <summary>Create the swap chain for <paramref name="hwnd"/> and bind it to the window.</summary>
-    public void CreatePresentation(IntPtr hwnd, Size client)
+    /// <summary>Create the swap chain for <paramref name="hwnd"/> and bind it to the window.
+    ///
+    /// With <paramref name="lowLatency"/> the swap chain is a plain window (HWND) one and every frame
+    /// is presented at once with sync interval 0, using DXGI_PRESENT_ALLOW_TEARING when the system
+    /// supports it - that is what lets a borderless fullscreen window go independent-flip / VRR.
+    /// Tearing is not available on a DirectComposition swap chain, hence the different path; the kind
+    /// of swap chain is therefore fixed for the life of a session, and switching means a restart on a
+    /// fresh window (a window that ever had a composition target cannot be trusted to take a window
+    /// swap chain, nor the other way round - not verified, so not attempted in place).
+    ///
+    /// UNVERIFIED: whether the HWND path keeps YuCap's sibling child windows (the OSD, the info
+    /// overlay and the pause image, all siblings stacked above the canvas) visible on top of the
+    /// video. With DirectComposition the picture lives inside the canvas window's own visual tree;
+    /// a flip-model window swap chain on a child window is composed by DWM on its own. This is part
+    /// of the user's test plan; if they report those windows hidden under the video, low latency
+    /// will need another approach (e.g. a layered overlay window).</summary>
+    public void CreatePresentation(IntPtr hwnd, Size client, bool lowLatency = false)
     {
         _swapSize = client;
         using IDXGIDevice1 dxgiDevice = Device.QueryInterface<IDXGIDevice1>();
@@ -173,32 +221,66 @@ internal sealed class D3DRenderer : IDisposable
             Flags = SwapChainFlags.FrameLatencyWaitableObject,
         };
 
-        _swap = factory.CreateSwapChainForComposition(Device, desc);
-        try
+        if (lowLatency)
         {
-            _dcomp = DComp.DCompositionCreateDevice<IDCompositionDevice>(dxgiDevice);
-            _dcomp.CreateTargetForHwnd(hwnd, false, out _dcompTarget);
-            _dcomp.CreateVisual(out _dcompVisual);
-            _dcompVisual.SetContent(_swap);
-            _dcompTarget.SetRoot(_dcompVisual);
-            _dcomp.Commit();
-            PresentPath = "DirectComposition";
-        }
-        catch (Exception ex)
-        {
-            const int WindowAlreadyComposed = unchecked((int)0x88980800);
-            DisposeComposition();
-            _swap.Dispose();
-            _swap = null;
-            if (ex.HResult == WindowAlreadyComposed)
+            if (SupportsTearing(factory))
             {
-                Log.Info("D3D: the window already has a DirectComposition target (DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED) — the host window must be recreated before attaching this renderer");
-                throw new UserFacingException(L.T("このウィンドウは別の描画方式で使われています。映像ウィンドウを作り直す必要があります。"));
+                try
+                {
+                    desc.Flags = SwapChainFlags.FrameLatencyWaitableObject | SwapChainFlags.AllowTearing;
+                    _swap = factory.CreateSwapChainForHwnd(Device, hwnd, desc);
+                    _swapFlags = desc.Flags;
+                    _presentFlags = PresentFlags.AllowTearing;
+                    PresentMode = "hwnd tearing";
+                }
+                catch (Exception ex)
+                {
+                    Log.Info($"D3D: tearing swap chain failed ({ex.Message.Split('\n')[0]}, 0x{ex.HResult:X8}) - using sync interval 0 without tearing");
+                    _swap = null;
+                }
             }
-            Log.Info($"D3D: DirectComposition binding failed ({ex.Message.Split('\n')[0]}, 0x{ex.HResult:X8}) — falling back to a window swap chain");
-            desc.AlphaMode = AlphaMode.Ignore;
-            _swap = factory.CreateSwapChainForHwnd(Device, hwnd, desc);
-            PresentPath = "HWND";
+            if (_swap == null)
+            {
+                desc.Flags = SwapChainFlags.FrameLatencyWaitableObject;
+                _swap = factory.CreateSwapChainForHwnd(Device, hwnd, desc);
+                _swapFlags = desc.Flags;
+                _presentFlags = PresentFlags.None;
+                PresentMode = "hwnd sync0";
+            }
+            _syncInterval = 0;
+        }
+        else
+        {
+            _syncInterval = 1;
+            _presentFlags = PresentFlags.None;
+            _swapFlags = SwapChainFlags.FrameLatencyWaitableObject;
+            _swap = factory.CreateSwapChainForComposition(Device, desc);
+            try
+            {
+                _dcomp = DComp.DCompositionCreateDevice<IDCompositionDevice>(dxgiDevice);
+                _dcomp.CreateTargetForHwnd(hwnd, false, out _dcompTarget);
+                _dcomp.CreateVisual(out _dcompVisual);
+                _dcompVisual.SetContent(_swap);
+                _dcompTarget.SetRoot(_dcompVisual);
+                _dcomp.Commit();
+                PresentMode = "composition vsync";
+            }
+            catch (Exception ex)
+            {
+                const int WindowAlreadyComposed = unchecked((int)0x88980800);
+                DisposeComposition();
+                _swap.Dispose();
+                _swap = null;
+                if (ex.HResult == WindowAlreadyComposed)
+                {
+                    Log.Info("D3D: the window already has a DirectComposition target (DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED) — the host window must be recreated before attaching this renderer");
+                    throw new UserFacingException(L.T("このウィンドウは別の描画方式で使われています。映像ウィンドウを作り直す必要があります。"));
+                }
+                Log.Info($"D3D: DirectComposition binding failed ({ex.Message.Split('\n')[0]}, 0x{ex.HResult:X8}) — falling back to a window swap chain");
+                desc.AlphaMode = AlphaMode.Ignore;
+                _swap = factory.CreateSwapChainForHwnd(Device, hwnd, desc);
+                PresentMode = "hwnd vsync";
+            }
         }
 
         factory.MakeWindowAssociation(hwnd, WindowAssociationFlags.IgnoreAll);
@@ -208,7 +290,21 @@ internal sealed class D3DRenderer : IDisposable
             _swap2.MaximumFrameLatency = 1;
             LatencyWaitable = _swap2.FrameLatencyWaitableObject;
         }
-        Log.Info($"D3D: swap chain via {PresentPath}, {client.Width}x{client.Height}");
+        Log.Info($"D3D: present mode = {PresentMode}, {client.Width}x{client.Height}");
+    }
+
+    private static bool SupportsTearing(IDXGIFactory2 factory)
+    {
+        try
+        {
+            using IDXGIFactory5? f5 = factory.QueryInterfaceOrNull<IDXGIFactory5>();
+            return f5 != null && f5.PresentAllowTearing;
+        }
+        catch (Exception ex)
+        {
+            Log.Info("D3D: tearing support query failed: " + ex.Message.Split('\n')[0]);
+            return false;
+        }
     }
 
     private void DisposeComposition()
@@ -482,6 +578,7 @@ internal sealed class D3DRenderer : IDisposable
         public Vector4 Coef;
         public Vector4 Range;
         public Vector4 Adj;
+        public int CropL, CropT, CropR, CropB;
     }
 
     private void SetupTriangle(ID3D11RenderTargetView rtv, Rectangle viewport)
@@ -496,13 +593,14 @@ internal sealed class D3DRenderer : IDisposable
 
     /// <summary>Pass (a): NV12 to RGB with rotation and mirror into the oriented texture.
     /// Returns false if there is no frame yet.</summary>
-    public bool Convert(int rotation, bool mirror, VideoAdjustments adj)
+    public bool Convert(int rotation, bool mirror, VideoAdjustments adj, System.Windows.Forms.Padding crop)
     {
         lock (FrameLock)
         {
             if (!_hasFrame) return false;
             Size src = new(_fw, _fh);
-            Size o = Oriented(src, rotation);
+            Rectangle keep = CropMath.Effective(src, crop);      // the sub-rectangle that is shown
+            Size o = Oriented(keep.Size, rotation);
             if (_oriented == null || _orientedSize != o)
             {
                 _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
@@ -535,6 +633,7 @@ internal sealed class D3DRenderer : IDisposable
                 Rot = rotation / 90, Mirror = mirror ? 1 : 0, Coef = coef, Range = range,
                 P0 = adj.IsNeutral ? 0 : 1,   // orient.z: adjustments on
                 Adj = new Vector4(adj.Brightness, adj.Contrast, 1f / adj.Gamma, adj.Saturation),
+                CropL = keep.X, CropT = keep.Y,
             });
 
             Ctx.PSSetShaderResource(0, null!);
@@ -649,7 +748,7 @@ internal sealed class D3DRenderer : IDisposable
         Ctx.ClearState();
         Ctx.Flush();
         _swap.ResizeBuffers(0, (uint)client.Width, (uint)client.Height, Format.Unknown,
-            SwapChainFlags.FrameLatencyWaitableObject).CheckError();
+            _swapFlags).CheckError();
         _swapSize = client;
         EnsureClientTextures(client);
     }
@@ -670,7 +769,7 @@ internal sealed class D3DRenderer : IDisposable
             _composedValid = true;
         }
         Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
-        return _swap.Present(1, PresentFlags.None);
+        return _swap.Present(_syncInterval, _presentFlags);
     }
 
     // =====================================================================

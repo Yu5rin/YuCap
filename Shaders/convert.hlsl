@@ -4,6 +4,9 @@
 // Picture adjustments (brightness / contrast / saturation / gamma) are applied here, after
 // YUV->RGB and before any scaling, so the oriented texture - and therefore stills, the pause
 // image and the FSR input - carries exactly what is on screen.
+// Cropping: dims.zw is the size of the CROPPED, rotated picture; the mapping below runs inside the
+// cropped picture and crop.xy then shifts it to its place in the full source frame, so only the
+// sub-rectangle is ever sampled. dims.xy stays the full source size (texture coordinates).
 cbuffer Convert : register(b0)
 {
     int4   dims;    // srcW, srcH, outW, outH
@@ -11,6 +14,7 @@ cbuffer Convert : register(b0)
     float4 coef;    // Cr->R, Cb->G, Cr->G, Cb->B
     float4 range;   // yOffset, yScale, cOffset, cScale
     float4 adj;     // brightness (additive), contrast, 1/gamma, saturation
+    int4   crop;    // left, top of the cropped sub-rectangle in the SOURCE (before rotation), 0, 0
 };
 
 Texture2D<float>  texY  : register(t0);
@@ -31,6 +35,7 @@ float4 main(float4 pos : SV_Position) : SV_Target
     else if (orient.x == 2) s = int2(rw - 1 - x, rh - 1 - y);
     else                    s = int2(rh - 1 - y, x);
 
+    s += crop.xy;
     float Y = texY.Load(int3(s, 0));
     float2 uv = float2((s.x + 0.5) / dims.x, (s.y + 0.5) / dims.y);
     float2 c = texUV.SampleLevel(lin, uv, 0);

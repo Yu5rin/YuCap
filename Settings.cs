@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 
@@ -50,6 +51,26 @@ public sealed class AppSettings
     // A/V sync offset in ms, one signed value: positive delays the audio, negative makes it
     // earlier (done by delaying the video, which only the Direct3D renderer can do).
     public int AvOffsetMs { get; set; }                      // -300..300 in steps of 10
+
+    // Black-border crop (Direct3D renderer only), in SOURCE pixels before rotation; 0 = none.
+    public int CropLeft { get; set; }
+    public int CropTop { get; set; }
+    public int CropRight { get; set; }
+    public int CropBottom { get; set; }
+
+    // Low-latency presentation (Direct3D only, experimental): present at once, tear if allowed.
+    public bool LowLatency { get; set; }
+
+    // Snapshots at the size shown on screen (FSR included) instead of the source size
+    // (Direct3D only). Off by default: the saved file stays the exact source picture.
+    public bool SaveDisplaySize { get; set; }
+
+    // Per-source presets (プロファイル): up to MaxProfiles, applied from the menu or Ctrl+1..9.
+    // ActiveProfile is the name last applied / saved; whether it still matches the live values
+    // is worked out on demand, so editing a value never rewrites the profile behind its back.
+    public const int MaxProfiles = 9;
+    public List<VideoProfile> Profiles { get; set; } = new();
+    public string? ActiveProfile { get; set; }
 
     // Session state restored across launches.
     public bool Fullscreen { get; set; }
@@ -152,10 +173,8 @@ public sealed class AppSettings
 
         // Anything unrecognised (typo, hand edit, a value from a newer build) falls
         // back to the safe choice: the Media Foundation path / the FSR default.
-        Renderer = (Renderer ?? "mf").Trim().ToLowerInvariant();
-        if (Renderer is not ("mf" or "d3d")) Renderer = "mf";
-        ScalingQuality = (ScalingQuality ?? "fsr").Trim().ToLowerInvariant();
-        if (ScalingQuality is not ("standard" or "fsr")) ScalingQuality = "fsr";
+        Renderer = NormalizeRenderer(Renderer);
+        ScalingQuality = NormalizeQuality(ScalingQuality);
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
 
         // Out-of-range picture adjustments (hand edit, newer build) are clamped, never reset:
@@ -168,8 +187,46 @@ public sealed class AppSettings
 
         // The slider moves in 10 ms steps; snap a hand-edited value to that grid so the dialog
         // and the engines always agree on what "0" and "+30" mean.
-        AvOffsetMs = (int)Math.Round(Math.Clamp(AvOffsetMs, -300, 300) / 10.0) * 10;
+        AvOffsetMs = SnapAvOffset(AvOffsetMs);
+
+        CropLeft = Math.Clamp(CropLeft, 0, MaxCrop);
+        CropTop = Math.Clamp(CropTop, 0, MaxCrop);
+        CropRight = Math.Clamp(CropRight, 0, MaxCrop);
+        CropBottom = Math.Clamp(CropBottom, 0, MaxCrop);
+
+        // Profiles are normalised like the top-level values. A nameless one cannot be shown in
+        // the menu, a duplicate name cannot be told apart from the first, and more than nine
+        // have no Ctrl+digit: all are dropped rather than repaired.
+        var kept = new List<VideoProfile>();
+        foreach (VideoProfile? p in Profiles ?? new List<VideoProfile>())
+        {
+            if (p == null) continue;
+            p.Normalize();
+            if (p.Name.Length == 0) continue;
+            if (kept.Exists(k => string.Equals(k.Name, p.Name, StringComparison.OrdinalIgnoreCase))) continue;
+            if (kept.Count >= MaxProfiles) break;
+            kept.Add(p);
+        }
+        Profiles = kept;
+        ActiveProfile = Profiles.Find(p => string.Equals(p.Name, ActiveProfile, StringComparison.OrdinalIgnoreCase))?.Name;
     }
+
+    public const int MaxCrop = 2000;
+
+    // Shared by AppSettings.Normalize and VideoProfile.Normalize so the two can never disagree.
+    internal static string NormalizeRenderer(string? v)
+    {
+        v = (v ?? "mf").Trim().ToLowerInvariant();
+        return v is "mf" or "d3d" ? v : "mf";
+    }
+
+    internal static string NormalizeQuality(string? v)
+    {
+        v = (v ?? "fsr").Trim().ToLowerInvariant();
+        return v is "standard" or "fsr" ? v : "fsr";
+    }
+
+    internal static int SnapAvOffset(int ms) => (int)Math.Round(Math.Clamp(ms, -300, 300) / 10.0) * 10;
 }
 
 public static class SettingsStore
@@ -246,5 +303,92 @@ public static class SettingsStore
             Log.Info("settings: save failed — " + ex.Message);
             try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* best effort */ }
         }
+    }
+}
+
+
+/// <summary>
+/// One per-source preset (プロファイル). Holds exactly the values that differ between sources:
+/// capture mode, renderer and picture settings. Window placement, PiP, hotkeys, language and
+/// the other app-wide options are deliberately not part of it.
+/// </summary>
+public sealed class VideoProfile
+{
+    public const int MaxNameLength = 32;
+
+    public string Name { get; set; } = string.Empty;
+
+    // Capture mode (null members => auto).
+    public string? ModeCompression { get; set; }
+    public int? ModeWidth { get; set; }
+    public int? ModeHeight { get; set; }
+    public int? ModeFps { get; set; }
+
+    public string Renderer { get; set; } = "mf";
+    public string ScalingQuality { get; set; } = "fsr";
+    public int FsrSharpness { get; set; } = 50;
+    public int DisplayMode { get; set; }
+    public int AdjBrightness { get; set; }
+    public int AdjContrast { get; set; } = 100;
+    public int AdjSaturation { get; set; } = 100;
+    public int AdjGamma { get; set; } = 100;
+    public int AvOffsetMs { get; set; }
+    public int CropLeft { get; set; }
+    public int CropTop { get; set; }
+    public int CropRight { get; set; }
+    public int CropBottom { get; set; }
+    public bool LowLatency { get; set; }
+    public bool SaveDisplaySize { get; set; }
+
+    public CaptureMode? ToMode() =>
+        ModeCompression is { } c && ModeWidth is int w && ModeHeight is int h && ModeFps is int f
+            ? new CaptureMode(c, w, h, f) : null;
+
+    public void SetMode(CaptureMode? mode)
+    {
+        ModeCompression = mode?.Compression;
+        ModeWidth = mode?.Width;
+        ModeHeight = mode?.Height;
+        ModeFps = mode?.Fps;
+    }
+
+    /// <summary>Same ranges as the top-level settings (see <see cref="AppSettings.Normalize"/>).</summary>
+    public void Normalize()
+    {
+        string name = (Name ?? string.Empty).Trim();
+        Name = name.Length > MaxNameLength ? name[..MaxNameLength].TrimEnd() : name;
+        // A half-written mode (hand edit) is treated as auto rather than guessed at.
+        if (ToMode() == null) SetMode(null);
+
+        DisplayMode = Math.Clamp(DisplayMode, 0, 3);
+        Renderer = AppSettings.NormalizeRenderer(Renderer);
+        ScalingQuality = AppSettings.NormalizeQuality(ScalingQuality);
+        FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
+        AdjBrightness = Math.Clamp(AdjBrightness, -100, 100);
+        AdjContrast = Math.Clamp(AdjContrast, 0, 200);
+        AdjSaturation = Math.Clamp(AdjSaturation, 0, 200);
+        AdjGamma = Math.Clamp(AdjGamma, 50, 200);
+        AvOffsetMs = AppSettings.SnapAvOffset(AvOffsetMs);
+        CropLeft = Math.Clamp(CropLeft, 0, AppSettings.MaxCrop);
+        CropTop = Math.Clamp(CropTop, 0, AppSettings.MaxCrop);
+        CropRight = Math.Clamp(CropRight, 0, AppSettings.MaxCrop);
+        CropBottom = Math.Clamp(CropBottom, 0, AppSettings.MaxCrop);
+    }
+
+    /// <summary>True when every value (the name excluded) is the same.</summary>
+    public bool SameValues(VideoProfile o) =>
+        ToMode() == o.ToMode() && Renderer == o.Renderer && ScalingQuality == o.ScalingQuality
+        && FsrSharpness == o.FsrSharpness && DisplayMode == o.DisplayMode
+        && AdjBrightness == o.AdjBrightness && AdjContrast == o.AdjContrast
+        && AdjSaturation == o.AdjSaturation && AdjGamma == o.AdjGamma && AvOffsetMs == o.AvOffsetMs
+        && CropLeft == o.CropLeft && CropTop == o.CropTop && CropRight == o.CropRight && CropBottom == o.CropBottom
+        && LowLatency == o.LowLatency && SaveDisplaySize == o.SaveDisplaySize;
+
+    /// <summary>Copy of the values under a new name.</summary>
+    public VideoProfile Clone(string name)
+    {
+        var c = (VideoProfile)MemberwiseClone();
+        c.Name = name;
+        return c;
     }
 }

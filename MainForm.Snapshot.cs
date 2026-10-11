@@ -48,6 +48,14 @@ public sealed partial class MainForm
 
         if (!_frozen)
         {
+            // 表示どおりに保存: the composed frame at the size shown (FSR included) instead of the
+            // source picture. While paused the source-size still above stays in charge.
+            if (_settings.SaveDisplaySize && _video.SupportsScalingQuality)
+            {
+                Bitmap? shown = _video.Snapshot(cropToVideo: true);
+                if (shown != null) return shown;
+                Log.Info("snapshot: displayed-size frame unavailable, using the source picture");
+            }
             Bitmap? photo = _video.PhotoSnapshot();
             if (photo != null) return photo;
             Log.Info("snapshot: photo sink unavailable, using screen copy");
@@ -219,7 +227,8 @@ public sealed partial class MainForm
 
     private void ShowSnapshotSettings()
     {
-        using var dlg = Ui.NewDialog(L.T("スナップショット設定"), 460, 170);
+        const int dlgH = 250;
+        using var dlg = Ui.NewDialog(L.T("スナップショット設定"), 460, dlgH);
 
         var lblDir = Ui.Label(L.T("保存先:"), 16, 20);
         var txtDir = new TextBox
@@ -258,15 +267,31 @@ public sealed partial class MainForm
             L.T("ウィンドウの大きさに関係なく、入力された映像の解像度で保存します。"),
             16, 86, 460 - Ui.Pad * 2);
 
-        var reset = Ui.Button(L.T("既定に戻す"), 16, 170 - Ui.Pad - Ui.ButtonHeight, 100);
+        // 表示どおりに保存: only the Direct3D renderer has a composed frame to save.
+        bool canDisplaySize = _video.SupportsScalingQuality;
+        var chkDisplay = new CheckBox
+        {
+            Text = L.T("表示どおりの大きさで保存する（拡大の画質を反映。Direct3D 描画のとき）"),
+            Checked = _settings.SaveDisplaySize,
+            Enabled = canDisplaySize,
+            AutoSize = false,
+            Location = new Point(16, 124),
+            Size = new Size(460 - Ui.Pad * 2, 38),
+        };
+        var displayHint = Ui.Hint(L.T("Direct3D 描画のときに使えます（オプション → 描画方式）"),
+            34, 164, 460 - Ui.Pad * 2 - 18);
+        displayHint.Visible = !canDisplaySize;
+
+        var reset = Ui.Button(L.T("既定に戻す"), 16, dlgH - Ui.Pad - Ui.ButtonHeight, 100);
         reset.Click += (_, _) =>
         {
             txtDir.Text = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CaptureViewer");
             cmbFmt.SelectedIndex = 0;
+            chkDisplay.Checked = false;
         };
 
-        dlg.Controls.AddRange(new Control[] { lblDir, txtDir, browse, lblFmt, cmbFmt, hint, reset });
+        dlg.Controls.AddRange(new Control[] { lblDir, txtDir, browse, lblFmt, cmbFmt, hint, chkDisplay, displayHint, reset });
         Ui.AddOkCancel(dlg);
 
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
@@ -276,6 +301,7 @@ public sealed partial class MainForm
         _settings.SnapshotDir = string.Equals(txtDir.Text, defDir, StringComparison.OrdinalIgnoreCase)
             ? null : txtDir.Text;
         _settings.SnapshotFormat = cmbFmt.SelectedIndex == 1 ? "jpg" : "png";
+        if (canDisplaySize) _settings.SaveDisplaySize = chkDisplay.Checked;
         SaveSettings();
         ShowOsd(L.F("スナップショット: {0}", cmbFmt.SelectedIndex == 1 ? "JPEG" : "PNG"));
     }
