@@ -809,6 +809,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _checkUpdateBoldFont = new Font(_menu.Font, FontStyle.Bold);
         help.DropDownItems.Add(shortcuts);
         help.DropDownItems.Add(new ToolStripSeparator());
+        help.DropDownItems.Add(new ToolStripMenuItem(L.T("テストモード（自動試験）..."), null, (_, _) => ShowTestModeDialog()));
+        help.DropDownItems.Add(new ToolStripSeparator());
         help.DropDownItems.Add(_miCheckUpdate);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
 
@@ -1125,7 +1127,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (!_settings.GlobalHotkeys)
             Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です）"));
 
-        var close = Ui.Button(L.T("閉じる"), 520 - Ui.Pad - Ui.ButtonWidth, 470 - Ui.Pad - Ui.ButtonHeight);
+        var close = Ui.Button(L.T("閉じる"), 520 - Ui.Pad - Ui.ButtonWidth, 470 - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
         close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         close.DialogResult = DialogResult.OK;
 
@@ -1235,6 +1237,17 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (SettingsStore.LastLoadFailed)
             ShowOsd(L.T("設定ファイルを読み込めませんでした。既定値で起動しています。"), OsdLongMilliseconds);
 
+        if (TestModeGuard.Recovered)
+        {
+            TestModeGuard.Recovered = false;
+            ShowOsd(L.T("前回のテストモードが途中で終了したため、設定を元に戻しました"), 8000);
+        }
+
+        if (Program.Options.TestMode)
+        {
+            StartUnattendedTest();   // no update dialogs while the test runs
+            return;
+        }
         AnnounceNewVersion();
         MaybeCheckForUpdatesOnStartup();
     }
@@ -1286,6 +1299,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void SaveSettings()
     {
+        if (_testRunning) return;   // test mode changes settings on purpose; they are put back afterwards, never saved
         _settings.DisplayMode = (int)_displayMode;
         _settings.LockAspect = _lockAspect;
         // While in PiP the window state is temporary — persist the pre-PiP state
@@ -1411,7 +1425,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// system default audio output when it changes.</summary>
     private void OnDeviceChange()
     {
-        if (IsDisposed) return;
+        if (IsDisposed || _testRunning) return;
         Log.Info($"OnDeviceChange: videoRunning={_video.IsRunning} audioRunning={_audio.IsRunning}");
 
         try // ---- video ----
@@ -1481,6 +1495,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         // An update has already saved settings; re-saving here would capture the
         // torn-down state (no device, window mid-close) over the real settings.
+        if (_testRunning)
+        {
+            // Closing mid-test: stop the test first (it restores the settings), then the window can close.
+            e.Cancel = true;
+            _testCts?.Cancel();
+            return;
+        }
         if (!_skipSaveOnClose)
         {
             try { SaveSettings(); } catch { /* ignore */ }
@@ -1562,6 +1583,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         PositionOsd();
         PositionInfo();
+        PositionTestCaption();
     }
 
     private Rectangle ComputeDest(Size client)
@@ -1880,6 +1902,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     public bool PreFilterMessage(ref Message m)
     {
         if (m.Msg != WmMouseWheel) return false;
+        if (_testRunning) return true;   // no volume / zoom changes during a test
         if (!IsOwnWheelTarget(m.HWnd) || IsMenuDropdownOpen()) return false;
 
         Rectangle screenRect = _canvas.RectangleToScreen(_canvas.ClientRectangle);
@@ -2525,7 +2548,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// target to the HWND and a window that already has one cannot be given another
     /// (same reason as RestartPreview).
     /// </summary>
-    private Exception? ReplaceEngine(string renderer)
+    private Exception? ReplaceEngine(string renderer, CaptureMode? modeOverride = null)
     {
         try
         {
@@ -2537,7 +2560,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _video.SetRotation(_settings.Rotation);
             _video.SetMirror(_settings.Mirror);
             if (_currentVideoInfo != null)
-                RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, _cliMode ?? _savedMode));
+                RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, modeOverride ?? _cliMode ?? _savedMode));
             ApplyRenderOptions();
             _settings.Renderer = renderer;
             return null;
@@ -2673,6 +2696,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleFullscreen()
     {
+        if (_testRunning) return;
         // F11 / double-click: a deliberate user action, so a --fullscreen
         // launch override no longer applies once the user has touched it.
         if (_isFullscreen) ExitFullscreen(userAction: true);
@@ -3141,6 +3165,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Global hotkeys (work even when another app has focus).
         if (m.Msg == WmHotkey)
         {
+            if (_testRunning) return;
             switch ((int)m.WParam)
             {
                 case HkSnapshot: SaveSnapshot(); break;
@@ -3426,6 +3451,13 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        // Test mode: Esc aborts, every other key is swallowed so nothing changes under the test.
+        if (_testRunning)
+        {
+            if (keyData == Keys.Escape) _testCts?.Cancel();
+            return true;
+        }
+
         // Configured hotkeys also work app-locally: if global registration
         // failed (combo owned by another app) or is disabled, the key still
         // works while YuCap has focus. When globally registered, the key never

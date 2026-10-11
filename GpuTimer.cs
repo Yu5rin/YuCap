@@ -25,7 +25,8 @@ internal sealed class GpuTimer : IDisposable
     private int _next;
     private QuerySet? _open;                       // between Begin and End
     private readonly Queue<(long Tick, double Ms)> _window = new();
-    private readonly List<double> _fresh = new();  // completed since the last TakeSamples
+    private readonly List<double> _fresh = new();  // completed since the last TakeSamples (guarded by itself)
+    private bool _collect = true;                  // false: do not keep samples (the live path would grow it forever)
 
     public GpuTimer(ID3D11Device device, ID3D11DeviceContext ctx, int ringSize = 4)
     {
@@ -94,7 +95,7 @@ internal sealed class GpuTimer : IDisposable
             double ms = (t1 - t0) * 1000.0 / dj.Frequency;
             long now = Stopwatch.GetTimestamp();
             _window.Enqueue((now, ms));
-            _fresh.Add(ms);
+            lock (_fresh) { if (_collect) _fresh.Add(ms); }
         }
         long cutoff = Stopwatch.GetTimestamp() - Stopwatch.Frequency;
         while (_window.Count > 0 && _window.Peek().Tick < cutoff) _window.Dequeue();
@@ -113,9 +114,30 @@ internal sealed class GpuTimer : IDisposable
     /// <summary>Measurements completed since the last call (used by the benchmark).</summary>
     public List<double> TakeSamples()
     {
-        var r = new List<double>(_fresh);
-        _fresh.Clear();
-        return r;
+        lock (_fresh)
+        {
+            var r = new List<double>(_fresh);
+            _fresh.Clear();
+            return r;
+        }
+    }
+
+    /// <summary>Start keeping every completed measurement (any thread; the render thread keeps polling).</summary>
+    public void StartCollecting()
+    {
+        lock (_fresh) { _fresh.Clear(); _collect = true; }
+    }
+
+    /// <summary>Stop keeping measurements and return what was kept since <see cref="StartCollecting"/>.</summary>
+    public double[] StopCollecting()
+    {
+        lock (_fresh)
+        {
+            _collect = false;
+            double[] r = _fresh.ToArray();
+            _fresh.Clear();
+            return r;
+        }
     }
 
     /// <summary>True while any set still waits for its answer.</summary>

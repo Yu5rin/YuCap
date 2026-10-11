@@ -13,6 +13,9 @@ public sealed class InfoOverlay : Control
     private readonly Font _font = new("Consolas", 9f, FontStyle.Regular);
     private static readonly Color Fore = Color.FromArgb(220, 220, 220);
 
+    /// <summary>Test mode: opaque solid background of this colour (see <see cref="OsdOverlay.TestBack"/>).</summary>
+    internal Color? TestBack { get; set; }
+
     public InfoOverlay()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint
@@ -34,7 +37,7 @@ public sealed class InfoOverlay : Control
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        using var back = new SolidBrush(Color.FromArgb(200, 12, 12, 12));
+        using var back = new SolidBrush(TestBack ?? Color.FromArgb(200, 12, 12, 12));
         e.Graphics.FillRectangle(back, ClientRectangle);
         TextRenderer.DrawText(e.Graphics, Text, _font, new Point(10, 7), Fore, TextFormatFlags.NoPadding);
     }

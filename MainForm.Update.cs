@@ -356,9 +356,9 @@ public sealed partial class MainForm
         // Right-aligned as a group, in reading order 今すぐ更新 / 後で / この版をスキップ.
         // Widths are sized to fit each label rather than sharing Ui.ButtonWidth.
         int y = 200 - Ui.Pad - Ui.ButtonHeight;
-        var skip = Ui.Button(L.T("この版をスキップ"), 420 - Ui.Pad - 146, y, 146);
-        var later = Ui.Button(L.T("後で"), skip.Left - Ui.Gap - 100, y, 100);
-        var now = Ui.Button(L.T("今すぐ更新"), later.Left - Ui.Gap - 120, y, 120);
+        var skip = Ui.Button(L.T("この版をスキップ"), 420 - Ui.Pad - 146, y, 146, true);
+        var later = Ui.Button(L.T("後で"), skip.Left - Ui.Gap - 100, y, 100, true);
+        var now = Ui.Button(L.T("今すぐ更新"), later.Left - Ui.Gap - 120, y, 120, true);
 
         var result = UpdatePrompt.Later;
         now.Click += (_, _) => { result = UpdatePrompt.Now; dlg.Close(); };
@@ -382,7 +382,7 @@ public sealed partial class MainForm
 
         var lbl = Ui.Label(L.F("{0} をダウンロードしています...", info.AssetName), 16, 18);
         var bar = new ProgressBar { Location = new Point(16, 46), Size = new Size(348, 22), Maximum = 100 };
-        var cancelBtn = Ui.Button(L.T("キャンセル"), 380 - Ui.Pad - 90, 120 - Ui.Pad - Ui.ButtonHeight, 90);
+        var cancelBtn = Ui.Button(L.T("キャンセル"), 380 - Ui.Pad - 90, 120 - Ui.Pad - Ui.ButtonHeight, 90, true);
         var cts = new CancellationTokenSource();
         cancelBtn.Click += (_, _) => { cts.Cancel(); dlg.Close(); };
         dlg.Controls.AddRange(new Control[] { lbl, bar, cancelBtn });

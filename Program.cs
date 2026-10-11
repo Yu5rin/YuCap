@@ -17,6 +17,9 @@ internal sealed class StartupOptions
     public bool Muted;
     public int? Volume;
     public CaptureMode? Mode; // Compression "" = any
+    public bool TestMode;       // --test-mode: run the automatic test (MainForm.TestMode.cs), then exit
+    public bool TestQuick;      // --quick
+    public string? TestDisplay; // --display <N | device name | part of the monitor's name>
 }
 
 internal static partial class Program
@@ -47,6 +50,18 @@ internal static partial class Program
         // before MainForm ever runs, so the UI language must be loaded now —
         // otherwise an English-configured user sees Japanese in those dialogs.
         Settings = SettingsStore.Load();
+
+        // An earlier test mode that never finished (crash, power loss, killed process) left the user's
+        // real settings in test-in-progress.json: put them back before anything reads the settings.
+        AppSettings? recovered = TestModeGuard.TryRecover();
+        if (recovered != null)
+        {
+            recovered.Normalize();
+            Settings = recovered;
+            SettingsStore.Save(recovered);
+            TestModeGuard.Recovered = true;
+            Log.Info("test mode: restored the settings of an interrupted test");
+        }
         L.English = Settings.Language == "en";
 
         // A staged update that is already applied (version <= running), or that
@@ -159,6 +174,7 @@ internal static partial class Program
                 "  --selftest [出力先]       自己診断を実行して終了\n" +
                 "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
                 "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
+                "  --test-mode [--display <番号>] [--quick]   自動試験を実行してレポートを作り、終了\n" +
                 "  --check-update      更新の有無を確認して終了"),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
@@ -173,6 +189,11 @@ internal static partial class Program
         if (!first)
         {
             Log.Info("second instance — activating the existing window");
+            if (Options.TestMode)
+            {
+                Log.Info("test mode: YuCap is already running - the test was not started");
+                return;
+            }
             if (!SingleInstance.ActivateExisting(args))
             {
                 MessageBox.Show(L.T("YuCap は既に起動しています。"), "YuCap",
@@ -186,7 +207,7 @@ internal static partial class Program
         // --post-update handshake. Skipped for a --post-update launch so a
         // failing update cannot loop. The hash is re-verified inside
         // TryGetVerifiedStaged because the file sat on disk since the download.
-        if (postUpdate < 0 && Settings.UpdateCheckOnStartup
+        if (postUpdate < 0 && !Options.TestMode && Settings.UpdateCheckOnStartup
             && TryGetVerifiedStaged(out string stagedPath) && Updater.CanWriteToInstallDir())
         {
             try
@@ -225,7 +246,7 @@ internal static partial class Program
         // are not cleared here — the next launch sees version <= current and
         // cleans up. Never applied when the setting is off or the version was
         // skipped (TryGetVerifiedStaged checks the latter).
-        if (!Updater.AppliedThisSession && Settings.UpdateCheckOnStartup
+        if (!Updater.AppliedThisSession && !Options.TestMode && Settings.UpdateCheckOnStartup
             && TryGetVerifiedStaged(out string exitStaged) && Updater.CanWriteToInstallDir())
         {
             try { Updater.Apply(exitStaged, relaunch: false); }
@@ -271,6 +292,11 @@ internal static partial class Program
                 case "--borderless": Options.Borderless = true; break;
                 case "--topmost": Options.Topmost = true; break;
                 case "--muted": Options.Muted = true; break;
+                case "--test-mode": Options.TestMode = true; break;
+                case "--quick": Options.TestQuick = true; break;
+                case "--display":
+                    if (i + 1 < args.Length) Options.TestDisplay = args[++i];
+                    break;
                 case "--volume":
                     if (i + 1 < args.Length && int.TryParse(args[++i], out int v))
                         Options.Volume = Math.Clamp(v, 0, AudioEngine.MaxVolumePercent);
@@ -688,7 +714,7 @@ internal static partial class Program
     }
 
     /// <summary>Mean luminance (0..255) of a still, sampled on a grid; disposes the bitmap. NaN if null.</summary>
-    private static double MeanLuma(Bitmap? bmp)
+    internal static double MeanLuma(Bitmap? bmp)
     {
         if (bmp == null) return double.NaN;
         using (bmp)
@@ -706,7 +732,7 @@ internal static partial class Program
         }
     }
 
-    private static void PumpFor(int ms)
+    internal static void PumpFor(int ms)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < ms)
@@ -806,7 +832,7 @@ internal static partial class Program
     /// moment apart and reports both the spatial spread and whether the picture
     /// changed — a still, uniform surface means nothing is being rendered.
     /// </summary>
-    private static string VerifyVideo(IVideoEngine engine)
+    internal static string VerifyVideo(IVideoEngine engine)
     {
         try
         {
@@ -843,7 +869,7 @@ internal static partial class Program
 
     /// <summary>8x8 grayscale luminance thumbnail, used to compare two images
     /// cheaply for the rotation/mirror direction check in RunSelfTest.</summary>
-    private static double[,] Thumbnail8x8(Bitmap src)
+    internal static double[,] Thumbnail8x8(Bitmap src)
     {
         using var thumb = new Bitmap(8, 8);
         using (var g = Graphics.FromImage(thumb))
@@ -861,7 +887,7 @@ internal static partial class Program
         return lum;
     }
 
-    private static double MeanAbsDiff(double[,] a, double[,] b)
+    internal static double MeanAbsDiff(double[,] a, double[,] b)
     {
         double sum = 0;
         for (int y = 0; y < 8; y++)
@@ -870,14 +896,14 @@ internal static partial class Program
         return sum / 64.0;
     }
 
-    private static Bitmap Rotated180Copy(Bitmap src)
+    internal static Bitmap Rotated180Copy(Bitmap src)
     {
         var copy = (Bitmap)src.Clone();
         copy.RotateFlip(RotateFlipType.Rotate180FlipNone);
         return copy;
     }
 
-    private static Bitmap FlippedCopy(Bitmap src)
+    internal static Bitmap FlippedCopy(Bitmap src)
     {
         var copy = (Bitmap)src.Clone();
         copy.RotateFlip(RotateFlipType.RotateNoneFlipX);

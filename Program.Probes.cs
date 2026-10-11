@@ -195,7 +195,7 @@ internal static partial class Program
     /// <summary>Min / mean / max luma (0..255, Rec.709 weights on the displayed RGB), the 1st and 99th
     /// percentile, and the fraction of pixels above 235 and at or below 16. A PQ-encoded picture
     /// shown as SDR looks washed out: few near-black pixels, low contrast, a high mean.</summary>
-    private static List<string> DescribeLuminance(Bitmap bmp)
+    internal static List<string> DescribeLuminance(Bitmap bmp)
     {
         var hist = new long[256];
         long n = 0;
@@ -246,35 +246,65 @@ internal static partial class Program
         return lines;
     }
 
+    /// <summary>One monitor as DXGI sees it (Windows HDR state and luminance); shared by <c>--hdr-probe</c>
+    /// and the test mode's environment report.</summary>
+    internal sealed record OutputHdr(string Adapter, string DeviceName, int Width, int Height, string ColorSpace,
+        bool HdrOn, uint BitsPerColor, float MaxLuminance, float MaxFullFrame, float MinLuminance, bool HasInfo);
+
+    internal static List<OutputHdr> QueryOutputsHdr()
+    {
+        var list = new List<OutputHdr>();
+        using IDXGIFactory1 factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
+        for (uint a = 0; factory.EnumAdapters1(a, out IDXGIAdapter1? adapter).Success && adapter != null; a++)
+        {
+            using (adapter)
+            {
+                string adapterName = adapter.Description1.Description;
+                for (uint o = 0; adapter.EnumOutputs(o, out IDXGIOutput? output).Success && output != null; o++)
+                {
+                    using (output)
+                    {
+                        using IDXGIOutput6? o6 = output.QueryInterfaceOrNull<IDXGIOutput6>();
+                        if (o6 == null)
+                        {
+                            var dd = output.Description.DesktopCoordinates;
+                            list.Add(new OutputHdr(adapterName, output.Description.DeviceName, dd.Right - dd.Left, dd.Bottom - dd.Top,
+                                "?", false, 0, 0, 0, 0, HasInfo: false));
+                            continue;
+                        }
+                        OutputDescription1 d = o6.Description1;
+                        bool hdr = d.ColorSpace.ToString().Contains("G2084", StringComparison.OrdinalIgnoreCase);
+                        list.Add(new OutputHdr(adapterName, d.DeviceName,
+                            d.DesktopCoordinates.Right - d.DesktopCoordinates.Left, d.DesktopCoordinates.Bottom - d.DesktopCoordinates.Top,
+                            d.ColorSpace.ToString(), hdr, d.BitsPerColor, d.MaxLuminance, d.MaxFullFrameLuminance, d.MinLuminance, HasInfo: true));
+                    }
+                }
+            }
+        }
+        return list;
+    }
+
     private static List<string> DescribeDisplaysHdr()
     {
         var lines = new List<string>();
         try
         {
-            using IDXGIFactory1 factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
-            for (uint a = 0; factory.EnumAdapters1(a, out IDXGIAdapter1? adapter).Success && adapter != null; a++)
+            string? lastAdapter = null;
+            int outIdx = 0;
+            foreach (OutputHdr h in QueryOutputsHdr())
             {
-                using (adapter)
+                if (h.Adapter != lastAdapter) { lines.Add($"adapter: {h.Adapter}"); lastAdapter = h.Adapter; outIdx = 0; }
+                if (!h.HasInfo)
                 {
-                    lines.Add($"adapter {a}: {adapter.Description1.Description}");
-                    for (uint o = 0; adapter.EnumOutputs(o, out IDXGIOutput? output).Success && output != null; o++)
-                    {
-                        using (output)
-                        {
-                            using IDXGIOutput6? o6 = output.QueryInterfaceOrNull<IDXGIOutput6>();
-                            if (o6 == null)
-                            {
-                                lines.Add($"  output {o}: {output.Description.DeviceName}  (IDXGIOutput6 not available - no HDR information)");
-                                continue;
-                            }
-                            OutputDescription1 d = o6.Description1;
-                            bool hdr = d.ColorSpace.ToString().Contains("G2084", StringComparison.OrdinalIgnoreCase);
-                            lines.Add($"  output {o}: {d.DeviceName}  {d.DesktopCoordinates.Right - d.DesktopCoordinates.Left}x{d.DesktopCoordinates.Bottom - d.DesktopCoordinates.Top}" +
-                                      $"  colorSpace={d.ColorSpace}  windowsHDR={(hdr ? "ON" : "off")}  bitsPerColor={d.BitsPerColor}");
-                            lines.Add($"      maxLuminance={d.MaxLuminance:0} nits  maxFullFrame={d.MaxFullFrameLuminance:0} nits  minLuminance={d.MinLuminance:0.0000} nits");
-                        }
-                    }
+                    lines.Add($"  output {outIdx}: {h.DeviceName}  (IDXGIOutput6 not available - no HDR information)");
                 }
+                else
+                {
+                    lines.Add($"  output {outIdx}: {h.DeviceName}  {h.Width}x{h.Height}" +
+                              $"  colorSpace={h.ColorSpace}  windowsHDR={(h.HdrOn ? "ON" : "off")}  bitsPerColor={h.BitsPerColor}");
+                    lines.Add($"      maxLuminance={h.MaxLuminance:0} nits  maxFullFrame={h.MaxFullFrame:0} nits  minLuminance={h.MinLuminance:0.0000} nits");
+                }
+                outIdx++;
             }
         }
         catch (Exception ex) { lines.Add("display query failed: " + ex.Message); }

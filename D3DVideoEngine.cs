@@ -115,6 +115,9 @@ public sealed class D3DVideoEngine : IVideoEngine
         set { _pixelPerfect = value; _s?.Poke(); }
     }
     public RenderStats? Stats => _s?.Stats;
+    public long FramesReceived => _s?.FramesReceived ?? 0;
+    public long FramesPresented => _s?.FramesPresented ?? 0;
+    public long FramesDropped => _s?.FramesDropped ?? 0;
 
     public bool SupportsAdjustments => true;
     public VideoAdjustments Adjustments
@@ -280,6 +283,9 @@ public sealed class D3DVideoEngine : IVideoEngine
 
     public string? SourceColorInfo => _s?.ColorInfo;
 
+    public void BeginMeasure() => _s?.Renderer?.BeginMeasure();
+    public RenderMeasurement? EndMeasure() => _s?.Renderer?.EndMeasure();
+
     // =====================================================================
     //  One running session: render thread + capture thread
     // =====================================================================
@@ -331,6 +337,9 @@ public sealed class D3DVideoEngine : IVideoEngine
         private int _dirtyCompose, _dirtyConvert;
         private volatile RenderStats? _stats;
         public RenderStats? Stats => _stats;
+        public long FramesReceived => Interlocked.Read(ref _inFrames);
+        public long FramesPresented => Interlocked.Read(ref _presented);
+        public long FramesDropped => Interlocked.Read(ref _dropped);
         public string? ColorInfo;     // set once by OpenReader, for --hdr-probe
 
         // Video delay bookkeeping (render thread writes, anyone reads).
@@ -339,6 +348,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
         private readonly bool _lowLatency;   // fixed for the session: decides the swap chain kind
         public string PresentMode => _r?.PresentMode ?? string.Empty;
+        public D3DRenderer? Renderer => _r;
 
         public Session(D3DVideoEngine e, IntPtr hwnd, VideoDeviceInfo info, CaptureMode? mode)
         {

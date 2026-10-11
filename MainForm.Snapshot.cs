@@ -240,7 +240,7 @@ public sealed partial class MainForm
             Location = new Point(90, 16),
             Width = 460 - Ui.Pad - 88 - Ui.Gap - 90,
         };
-        var browse = Ui.Button(L.T("参照..."), 460 - Ui.Pad - 88, 14, 88);
+        var browse = Ui.Button(L.T("参照..."), 460 - Ui.Pad - 88, 14, 88, true);
         browse.Click += (_, _) =>
         {
             using var fb = new FolderBrowserDialog
@@ -346,7 +346,7 @@ public sealed partial class MainForm
             AutoSize = true,
             Location = new Point(20, 96),
         };
-        var ok = Ui.Button("OK", 380 - Ui.Pad - Ui.ButtonWidth, 240 - Ui.Pad - Ui.ButtonHeight);
+        var ok = Ui.Button("OK", 380 - Ui.Pad - Ui.ButtonWidth, 240 - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
         ok.DialogResult = DialogResult.OK;
 
         dlg.Controls.AddRange(new Control[] { pic, title, version, libs, ok });

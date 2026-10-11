@@ -403,7 +403,7 @@ public sealed partial class MainForm
                 Width = tbWidth,
                 TabStop = true,
             };
-            var clearBtn = Ui.Button(L.T("解除"), clearX, y - 1, 64);
+            var clearBtn = Ui.Button(L.T("解除"), clearX, y - 1, 64, true);
             void Clear()
             {
                 set(Keys.None);

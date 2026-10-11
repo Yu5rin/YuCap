@@ -22,6 +22,10 @@ public sealed class OsdOverlay : Control
     private Font _font;
     private bool _clickable;
 
+    /// <summary>Test mode: draw an opaque solid background of this colour, so a screen sample can tell
+    /// whether the overlay really is on top of the video.</summary>
+    internal Color? TestBack { get; set; }
+
     public OsdOverlay()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint
@@ -62,7 +66,7 @@ public sealed class OsdOverlay : Control
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        using var back = new SolidBrush(Color.FromArgb(215, 20, 20, 20));
+        using var back = new SolidBrush(TestBack ?? Color.FromArgb(215, 20, 20, 20));
         g.FillRectangle(back, ClientRectangle);
 
         var textRect = new Rectangle(14, 8, Math.Max(1, Width - 28), Math.Max(1, Height - 16));

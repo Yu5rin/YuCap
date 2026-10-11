@@ -101,6 +101,14 @@ public interface IVideoEngine : IDisposable
     /// becomes an exact block, which is the point of that display mode.</summary>
     bool PixelPerfect { get => false; set { } }
     RenderStats? Stats => null;
+    /// <summary>Exact cumulative count of frames received from the capture device since Start
+    /// (0 when not applicable). Unlike <see cref="Stats"/> it is not a rolling average, so the
+    /// caller can take deltas over any precise window.</summary>
+    long FramesReceived => 0;
+    /// <summary>Exact cumulative count of successful Present calls since Start.</summary>
+    long FramesPresented => 0;
+    /// <summary>Exact cumulative count of frames replaced before being drawn since Start.</summary>
+    long FramesDropped => 0;
     /// <summary>Brightness / contrast / saturation / gamma, applied before scaling so stills
     /// and pause images carry it too.</summary>
     bool SupportsAdjustments => false;
@@ -135,4 +143,8 @@ public interface IVideoEngine : IDisposable
     /// <summary>Colour attributes the source reader negotiated (native and output media type), as
     /// text lines, for <c>--hdr-probe</c>. Null when not running or not applicable.</summary>
     string? SourceColorInfo => null;
+    /// <summary>Start / stop recording frame pacing and per-frame GPU time (test mode, Direct3D only).
+    /// <see cref="EndMeasure"/> returns null when nothing was recorded.</summary>
+    void BeginMeasure() { }
+    RenderMeasurement? EndMeasure() => null;
 }

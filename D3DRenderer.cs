@@ -183,7 +183,7 @@ internal sealed class D3DRenderer : IDisposable
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
 
-        try { _gpu = new GpuTimer(Device, Ctx); }
+        try { _gpu = new GpuTimer(Device, Ctx); _gpu.StopCollecting(); }   // live: keep only the 1 s window
         catch (Exception ex) { Log.Info("D3D: GPU timestamp queries unavailable: " + ex.Message.Split('\n')[0]); }
     }
 
@@ -805,8 +805,30 @@ internal sealed class D3DRenderer : IDisposable
         }
         Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
         Result pr = _swap.Present(_syncInterval, _presentFlags);
+        if (pr.Success) Volatile.Read(ref _pacing)?.Record();
         _gpu?.Poll();
         return pr;
+    }
+
+    // ---- measurement window (test mode) ----
+    private PacingCapture? _pacing;
+
+    /// <summary>Start recording frame pacing and per-frame GPU time. Any thread.</summary>
+    public void BeginMeasure()
+    {
+        _gpu?.StartCollecting();
+        var p = new PacingCapture();
+        if (_swap != null) p.StartPolling(_swap);
+        Volatile.Write(ref _pacing, p);
+    }
+
+    /// <summary>Stop recording and return what was collected (empty data when never started).</summary>
+    public RenderMeasurement EndMeasure()
+    {
+        PacingCapture p = Interlocked.Exchange(ref _pacing, null) ?? new PacingCapture();
+        p.StopPolling();
+        double[] gpu = _gpu?.StopCollecting() ?? Array.Empty<double>();
+        return new RenderMeasurement(p, gpu, PresentMode);
     }
 
     // =====================================================================

@@ -29,9 +29,9 @@ internal static class Ui
     /// AutoScaleMode.Font actually rescale those pixel positions correctly
     /// when the user runs at 125-200% DPI instead of leaving them too small.
     /// </summary>
-    public static Form NewDialog(string title, int clientWidth, int clientHeight)
+    public static UiDialog NewDialog(string title, int clientWidth, int clientHeight)
     {
-        return new Form
+        return new UiDialog
         {
             Text = title,
             FormBorderStyle = FormBorderStyle.FixedDialog,
@@ -45,6 +45,11 @@ internal static class Ui
             AutoScaleDimensions = new SizeF(7F, 15F),
         };
     }
+
+    /// <summary>Test mode (ダイアログの表示崩れ): when set, every <see cref="UiDialog"/> that would be
+    /// shown modally is handed to this instead and reported as cancelled, so each dialog's layout can be
+    /// inspected without a person having to open it.</summary>
+    public static Func<Form, DialogResult>? DialogAudit;
 
     public static Label Label(string text, int x, int y)
     {
@@ -70,9 +75,23 @@ internal static class Ui
         };
     }
 
-    public static Button Button(string text, int x, int y, int width = ButtonWidth)
+    /// <summary>Width a button needs to show <paramref name="text"/> without clipping (text + padding),
+    /// never less than <paramref name="minWidth"/>. Keeps English captions from being truncated in
+    /// widths drawn for the Japanese ones.</summary>
+    public static int FitButtonWidth(string text, int minWidth)
     {
-        return new Button { Text = text, Location = new Point(x, y), Size = new Size(width, ButtonHeight) };
+        int tw = TextRenderer.MeasureText(text, SystemFonts.MessageBoxFont ?? Control.DefaultFont).Width;
+        return Math.Max(minWidth, tw + 28);
+    }
+
+    /// <summary>A button at least <paramref name="width"/> wide, widened to fit its text. With
+    /// <paramref name="keepRight"/> the right edge stays where the requested box put it (for
+    /// right-aligned buttons); otherwise the left edge stays.</summary>
+    public static Button Button(string text, int x, int y, int width = ButtonWidth, bool keepRight = false)
+    {
+        int w = FitButtonWidth(text, width);
+        if (keepRight) x -= w - width;
+        return new Button { Text = text, Location = new Point(x, y), Size = new Size(w, ButtonHeight) };
     }
 
     /// <summary>
@@ -86,18 +105,20 @@ internal static class Ui
         int w = dlg.ClientSize.Width;
         int h = dlg.ClientSize.Height;
 
+        string cancelText = L.T("キャンセル"), okLabel = okText ?? "OK";
+        int cw = FitButtonWidth(cancelText, ButtonWidth), ow = FitButtonWidth(okLabel, ButtonWidth);
         var cancel = new Button
         {
-            Text = L.T("キャンセル"),
-            Location = new Point(w - Pad - ButtonWidth, h - Pad - ButtonHeight),
-            Size = new Size(ButtonWidth, ButtonHeight),
+            Text = cancelText,
+            Location = new Point(w - Pad - cw, h - Pad - ButtonHeight),
+            Size = new Size(cw, ButtonHeight),
             DialogResult = DialogResult.Cancel,
         };
         var ok = new Button
         {
-            Text = okText ?? "OK",
-            Location = new Point(cancel.Location.X - Gap - ButtonWidth, h - Pad - ButtonHeight),
-            Size = new Size(ButtonWidth, ButtonHeight),
+            Text = okLabel,
+            Location = new Point(cancel.Location.X - Gap - ow, h - Pad - ButtonHeight),
+            Size = new Size(ow, ButtonHeight),
             DialogResult = DialogResult.OK,
         };
 
@@ -264,4 +285,19 @@ internal static class Ui
                 e.Graphics.DrawLine(pen, 0, b.Bottom - 1, b.Right, b.Bottom - 1);
         }
     }
+}
+
+/// <summary>The dialog shell made by <see cref="Ui.NewDialog"/>. Its only addition is the audit hook:
+/// callers hold it as a <c>var</c>, so their <c>dlg.ShowDialog(this)</c> binds to the method below
+/// (<c>Form.ShowDialog</c> itself is not virtual).</summary>
+internal sealed class UiDialog : Form
+{
+    public new DialogResult ShowDialog(IWin32Window? owner)
+    {
+        Func<Form, DialogResult>? audit = Ui.DialogAudit;
+        return audit != null ? audit(this) : base.ShowDialog(owner);
+    }
+
+    // While being audited the dialog is shown invisibly (see MainForm.TestMode.cs); it must not take focus.
+    protected override bool ShowWithoutActivation => Ui.DialogAudit != null;
 }

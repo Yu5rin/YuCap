@@ -371,6 +371,7 @@ internal static class L
          "  --selftest [出力先]       自己診断を実行して終了\n" +
          "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
          "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
+         "  --test-mode [--display <番号>] [--quick]   自動試験を実行してレポートを作り、終了\n" +
          "  --check-update      更新の有無を確認して終了"] =
             "YuCap command line options:\n\n" +
             "  --fullscreen        start in fullscreen\n" +
@@ -384,6 +385,7 @@ internal static class L
             "  --selftest [path]       run the self-test and exit\n" +
             "  --gpu-bench [path]      measure the GPU cost of 4K upscaling and exit\n" +
             "  --hdr-probe [path]      write an HDR input report and exit\n" +
+            "  --test-mode [--display <n>] [--quick]   run the automatic test, write the report and exit\n" +
             "  --check-update      check for an update and exit",
         ["現在: {0}\n更新はありません。\n\nエンドポイント:\n{1}"] =
             "Current: {0}\nNo updates available.\n\nEndpoint:\n{1}",
@@ -468,5 +470,41 @@ internal static class L
         ["低遅延"] = "Low latency",
         ["表示どおりの大きさで保存する（拡大の画質を反映。Direct3D 描画のとき）"] = "Save at the displayed size (includes the scaling quality; Direct3D rendering only)",
         ["表示方法"] = "Present",
+
+        // ---- Test mode (automatic test) ----
+        ["テストモード（自動試験）..."] = "Test mode (automatic test)...",
+        ["テストモード（自動試験）"] = "Test mode (automatic test)",
+        ["試験するモニター:"] = "Monitor to test:",
+        ["所要時間の目安: 約 {0} 分"] = "Estimated time: about {0} min",
+        ["試験中は画面が何度も切り替わります。Esc でいつでも中止できます。終了すると設定は元に戻ります。"] =
+            "The screen switches many times during the test. Press Esc to stop at any time. Your settings are restored when it ends.",
+        ["レポートは「ピクチャ」フォルダの YuCap\\テストレポート に保存されます。"] =
+            "The report is saved in the Pictures folder under YuCap\\テストレポート.",
+        ["テストモード {0}/{1}：{2}"] = "Test mode {0}/{1}: {2}",
+        ["テストモード：準備中"] = "Test mode: preparing",
+        ["Esc で中止"] = "Esc to stop",
+        ["前回のテストモードが途中で終了したため、設定を元に戻しました"] =
+            "The previous test mode ended unexpectedly, so your settings were restored",
+        ["環境の確認"] = "Checking the environment",
+        ["取り込み: {0}"] = "Capture: {0}",
+        ["表示の計測: {0}"] = "Display measurement: {0}",
+        ["通知の表示: {0}"] = "Overlay visibility: {0}",
+        ["FSR の見え方: {0}"] = "FSR comparison: {0}",
+        ["HDR の確認"] = "Checking HDR",
+        ["機能の確認: {0}"] = "Feature check: {0}",
+        ["音声の確認"] = "Checking audio",
+        ["ダイアログの確認"] = "Checking dialogs",
+        ["まとめ"] = "Summary",
+        ["低遅延オン"] = "low latency on",
+        ["低遅延オフ"] = "low latency off",
+        ["通知"] = "notice",
+        ["一時停止の画像"] = "pause image",
+        ["情報表示"] = "info overlay",
+        ["切り取り"] = "crop",
+        ["色の調整"] = "color adjustment",
+        ["映像の遅延"] = "video delay",
+        ["表示どおりの保存"] = "save as displayed",
+        ["回転と反転"] = "rotation and mirror",
+        ["テスト表示"] = "Test overlay",
     };
 }

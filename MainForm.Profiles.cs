@@ -321,6 +321,11 @@ public sealed partial class MainForm
         using var dlg = Ui.NewDialog(L.T("黒い縁の切り取り"), 400, 236);
         int inner = dlg.ClientSize.Width - 2 * Ui.Pad;
 
+        // label column wide enough for the longest of the four side names in the current language
+        int lw = 24;
+        foreach (string s in new[] { L.T("左"), L.T("上"), L.T("右"), L.T("下") })
+            lw = Math.Max(lw, TextRenderer.MeasureText(s, dlg.Font).Width + 8);
+
         NumericUpDown Spin(string name, int x, int y, int value, int sourceLen)
         {
             int max = sourceLen > CropMath.MinSide ? Math.Min(AppSettings.MaxCrop, sourceLen - CropMath.MinSide) : AppSettings.MaxCrop;
@@ -328,9 +333,9 @@ public sealed partial class MainForm
             var nud = new NumericUpDown
             {
                 Minimum = 0, Maximum = max, Value = Math.Clamp(value, 0, max),
-                Location = new Point(x + 36, y), Width = 84,
+                Location = new Point(x + lw, y), Width = 84,
             };
-            var px = Ui.Label("px", x + 126, y + 4);
+            var px = Ui.Label("px", x + lw + 90, y + 4);
             dlg.Controls.AddRange(new Control[] { lbl, nud, px });
             return nud;
         }
@@ -342,7 +347,7 @@ public sealed partial class MainForm
 
         var result = Ui.Hint(string.Empty, Ui.Pad, 86, inner);
         var detect = Ui.Button(L.T("自動で検出"), Ui.Pad, 112, 110);
-        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad + 118, 112, 110);
+        var reset = Ui.Button(L.T("既定に戻す"), detect.Right + Ui.Gap, 112, 110);
         var note = Ui.Hint(string.Empty, Ui.Pad, 148, inner);
         dlg.Controls.AddRange(new Control[] { result, detect, reset, note });
         Ui.AddOkCancel(dlg);
