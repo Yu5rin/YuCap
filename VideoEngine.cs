@@ -26,7 +26,7 @@ public enum VideoDisplayMode { AspectFit, Stretch, OneToOne, IntegerScale }
 /// 4K30) are available. Aspect/position/snapshot reuse the EVR display control the
 /// preview sink exposes via GetService.
 /// </summary>
-public sealed class VideoEngine : IDisposable
+public sealed class VideoEngine : IVideoEngine
 {
     private static readonly object StartupLock = new();
     private static bool _mfStarted;
