@@ -20,6 +20,16 @@
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
+    <PackageReference Include="Vortice.DirectComposition" Version="3.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\*.hlsl" LogicalName="Shaders.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="third_party/FidelityFX-FSR1/ffx_a.h" LogicalName="Shaders.ffx_a.h" />
+    <EmbeddedResource Include="third_party/FidelityFX-FSR1/ffx_fsr1.h" LogicalName="Shaders.ffx_fsr1.h" />
   </ItemGroup>
 
 </Project>
