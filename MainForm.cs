@@ -2690,13 +2690,36 @@ public sealed partial class MainForm : Form, IMessageFilter
         foreach (var m in modes)
         {
             var mode = m;
-            var item = new ToolStripMenuItem($"{mode.Width}x{mode.Height}  {mode.Compression}  {mode.Fps}fps")
+            var item = new ToolStripMenuItem(ModeLabel(mode))
             {
                 Checked = _savedMode != null && mode.Equals(cur),
             };
             item.Click += (_, _) => ApplyVideoMode(mode);
             root.DropDownItems.Add(item);
         }
+    }
+
+    /// <summary>
+    /// Human-readable mode label: common name first (1440p60), exact details after.
+    /// Contains no translatable words, so it deliberately bypasses L.T.
+    /// </summary>
+    private static string ModeLabel(CaptureMode m)
+    {
+        string? name = (m.Width, m.Height) switch
+        {
+            (640, 360) => $"360p{m.Fps}",
+            (1280, 720) => $"720p{m.Fps}",
+            (1920, 1080) => $"1080p{m.Fps}",
+            (2560, 1440) => $"1440p{m.Fps}",
+            (3840, 2160) => $"4K{m.Fps}",
+            (720, 480) => $"480p{m.Fps}",
+            (640, 480) => $"480p{m.Fps}",
+            _ => null,
+        };
+        bool hasComp = !string.IsNullOrEmpty(m.Compression);
+        if (name != null)
+            return hasComp ? $"{name}（{m.Width}x{m.Height} {m.Compression}）" : $"{name}（{m.Width}x{m.Height}）";
+        return hasComp ? $"{m.Width}x{m.Height} {m.Fps}fps（{m.Compression}）" : $"{m.Width}x{m.Height} {m.Fps}fps";
     }
 
     private void ApplyVideoMode(CaptureMode mode)
@@ -2715,7 +2738,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _savedMode = _video.CurrentMode;
             SaveSettings();
             LayoutCanvas();
-            ShowOsd($"{mode.Width}x{mode.Height} {mode.Fps}fps");
+            ShowOsd(ModeLabel(mode));
         }
         catch (Exception ex)
         {
