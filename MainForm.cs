@@ -63,6 +63,8 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private readonly VideoBox _canvas = new();
     private readonly OsdOverlay _osd = new();
+    private readonly InfoOverlay _info = new();   // Ctrl+Shift+I testing aid, never persisted
+    private bool _compareHeld;                      // Q held: FSR temporarily swapped for Standard
     private readonly MenuStrip _menu = new();
     private readonly StatusStrip _status = new();
     private readonly ToolStripStatusLabel _lblVideo = new();
@@ -307,6 +309,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Controls.Add(_freezeView);
         Controls.Add(_menu);
         Controls.Add(_status);
+        Controls.Add(_info);
         Controls.Add(_osd);
         MainMenuStrip = _menu;
         _canvas.SendToBack();
@@ -320,7 +323,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _osd.Click += (_, _) => OsdClick();
 
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); if (_info.Visible) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
         _devTimer.Interval = 900;
@@ -1041,6 +1044,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gHere, L.T("常に前面に表示"), "Ctrl+T");
         Row(gHere, L.T("ウィンドウ枠を非表示"), "Ctrl+B");
         Row(gHere, L.T("メニューバーの表示"), "F10");
+        Row(gHere, L.T("情報表示の切替"), "Ctrl+Shift+I");
+        Row(gHere, L.T("FSR と標準の拡大を見比べる"), L.T("Q（押している間）"));
         Row(gHere, L.T("メニュー"), L.T("右クリック"));
         Row(gHere, L.T("操作一覧"), "F1");
 
@@ -1483,6 +1488,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _freezeView.ImageRect = FreezeImageRect();
         }
         PositionOsd();
+        PositionInfo();
     }
 
     private Rectangle ComputeDest(Size client)
@@ -1958,6 +1964,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _freezeView.ImageRect = FreezeImageRect();
             _freezeView.Visible = true;
             _freezeView.BringToFront();
+            if (_info.Visible) _info.BringToFront();
             _osd.BringToFront();
             _frozen = true;
             _mutedBeforeFreeze = _audio.Muted;
@@ -3367,6 +3374,12 @@ public sealed partial class MainForm : Form, IMessageFilter
             case Keys.Control | Keys.NumPad0:
                 ResetZoom();
                 return true;
+            case Keys.Control | Keys.Shift | Keys.I:
+                if (!isRepeat) ToggleInfo();
+                return true;
+            case Keys.Q:
+                if (!isRepeat) BeginCompare();
+                return true;
             case Keys.M:
                 ToggleMute();
                 return true;
@@ -3387,6 +3400,133 @@ public sealed partial class MainForm : Form, IMessageFilter
                 break;
         }
         return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Q) EndCompare();
+        base.OnKeyUp(e);
+    }
+
+    protected override void OnDeactivate(EventArgs e)
+    {
+        EndCompare(silent: true);   // key-up never arrives once focus is gone
+        base.OnDeactivate(e);
+    }
+
+    // ---- Compare FSR / Standard (hold Q) ----------------------------------
+
+    private void BeginCompare()
+    {
+        if (_compareHeld) return;
+        if (!_video.SupportsScalingQuality || _video.Quality != ScalingQuality.Fsr || _video.PixelPerfect)
+        {
+            ShowOsd(L.T("見比べは Direct3D 描画で高画質（FSR）のときに使えます"), OsdLongMilliseconds);
+            return;
+        }
+        _compareHeld = true;
+        _video.Quality = ScalingQuality.Standard;   // temporary: _settings is untouched
+        ShowOsd(L.T("標準の拡大で表示中（Q を離すと FSR）"), OsdLongMilliseconds);
+    }
+
+    private void EndCompare(bool silent = false)
+    {
+        if (!_compareHeld) return;
+        _compareHeld = false;
+        try { if (_video.SupportsScalingQuality) _video.Quality = ScalingQuality.Fsr; } catch { }
+        if (!silent) ShowOsd(L.T("FSR"));
+    }
+
+    // ---- Info overlay (Ctrl+Shift+I) ----------------------------------------
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DevMode
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX, dmPositionY;
+        public uint dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool EnumDisplaySettingsW(string? deviceName, int modeNum, ref DevMode dm);
+    private const int EnumCurrentSettings = -1;
+
+    private void ToggleInfo()
+    {
+        if (_info.Visible) { _info.Visible = false; return; }
+        UpdateInfo();
+        _info.Visible = true;
+        _info.BringToFront();
+        _osd.BringToFront();
+        PositionInfo();
+    }
+
+    private void PositionInfo()
+    {
+        if (_info.Visible)
+            _info.Location = new Point(_canvas.Right - _info.Width - 12, _canvas.Top + 12);
+    }
+
+    private string DescribeScaling()
+    {
+        Size res = _video.DisplayResolution;
+        if (!_video.IsRunning || res.Width <= 0 || res.Height <= 0) return "—";
+        Rectangle d = ComputeDest(_canvas.ClientSize);
+        double fx = (double)d.Width / res.Width, fy = (double)d.Height / res.Height;
+        string f = Math.Abs(fx - fy) < 0.01 ? $"{fx:0.00}" : $"{fx:0.00}×{fy:0.00}";
+        if (d.Width == res.Width && d.Height == res.Height) return L.T("等倍");
+        // D3DRenderer uses FSR only when upscaling in BOTH dimensions.
+        if (d.Width > res.Width && d.Height > res.Height)
+        {
+            if (_video.SupportsScalingQuality && _video.PixelPerfect) return L.T("整数倍") + $" ×{fx:0.##}";
+            if (_video.SupportsScalingQuality && _video.Quality == ScalingQuality.Fsr) return "FSR ×" + f;
+            return L.T("標準") + " ×" + f;
+        }
+        if (d.Width < res.Width && d.Height < res.Height) return L.T("縮小") + " ×" + f;
+        return L.T("標準") + " ×" + f;
+    }
+
+    private void UpdateInfo()
+    {
+        string renderer = _video.SupportsScalingQuality ? "Direct3D" : L.T("標準（Media Foundation）");
+        string input = _video.CurrentMode is { } m ? ModeLabel(m) : "—";
+        string fps = _video.Stats is { } st
+            ? L.F("入力 {0:0} / 表示 {1:0} / 欠落 {2}", st.InputFps, st.PresentedFps, st.DroppedFrames)
+            : "—";
+
+        string screen = "—";
+        try
+        {
+            var dm = new DevMode { dmSize = (ushort)Marshal.SizeOf<DevMode>() };
+            if (EnumDisplaySettingsW(Screen.FromControl(this).DeviceName, EnumCurrentSettings, ref dm))
+            {
+                int scale = (int)Math.Round(GetDpiForWindow(Handle) * 100.0 / 96.0);
+                screen = $"{dm.dmPelsWidth}x{dm.dmPelsHeight} @ {dm.dmDisplayFrequency}Hz  {scale}%";
+            }
+        }
+        catch { }
+
+        string delay = L.F("映像 {0:0}ms / 音声 {1:0}ms", _video.VideoDelayActualMs, _audio.BufferedMs);
+        if (_audio.ExtraDelayMs > 0) delay += $" (+{_audio.ExtraDelayMs}ms)";
+        string color = _video.SupportsAdjustments && !CurrentAdjustments().IsNeutral ? L.T("オン") : L.T("オフ");
+
+        _info.SetText(string.Join("\n", new[]
+        {
+            L.T("描画方式") + ": " + renderer,
+            L.T("入力") + ": " + input,
+            "fps: " + fps,
+            L.T("画面") + ": " + screen,
+            L.T("拡大") + ": " + DescribeScaling(),
+            L.T("遅延") + ": " + delay,
+            L.T("色調整") + ": " + color,
+        }));
+        PositionInfo();
     }
 
     protected override void Dispose(bool disposing)
