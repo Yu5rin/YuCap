@@ -18,6 +18,16 @@ internal sealed record GpuInfo(string Name, string DriverVersion, string DriverD
 
 internal static class TestProbes
 {
+    /// <summary>Median and 95th percentile of latency samples (ms); null with fewer than 5 samples.</summary>
+    public static (double Median, double P95)? LatencyStats(double[]? samples)
+    {
+        if (samples == null || samples.Length < 5) return null;
+        double[] s = samples.OrderBy(x => x).ToArray();
+        double med = s.Length % 2 == 1 ? s[s.Length / 2] : (s[s.Length / 2 - 1] + s[s.Length / 2]) / 2;
+        double p95 = s[Math.Clamp((int)Math.Ceiling(0.95 * s.Length) - 1, 0, s.Length - 1)];
+        return (med, p95);
+    }
+
     // ================================================================ system
 
     public static string OsDescription()

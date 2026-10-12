@@ -85,6 +85,39 @@ internal static class Displays
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool EnumDisplaySettingsW(string? deviceName, int modeNum, ref DevMode dm);
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MRect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MonitorInfoEx
+    {
+        public int cbSize;
+        public MRect rcMonitor, rcWork;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfoEx info);
+
+    /// <summary>Current refresh rate (Hz, as Windows reports it - 59.94 Hz shows as 59 or 60) of the
+    /// monitor <paramref name="hwnd"/> is mostly on; 0 when it cannot be told. Cheap enough to call
+    /// about once a second from any thread.</summary>
+    public static int RefreshHzOfWindow(IntPtr hwnd)
+    {
+        try
+        {
+            IntPtr mon = MonitorFromWindow(hwnd, 2 /* MONITOR_DEFAULTTONEAREST */);
+            if (mon == IntPtr.Zero) return 0;
+            var mi = new MonitorInfoEx { cbSize = Marshal.SizeOf<MonitorInfoEx>() };
+            return GetMonitorInfoW(mon, ref mi) ? RefreshRate(mi.szDevice) : 0;
+        }
+        catch { return 0; }
+    }
+
     private static int RefreshRate(string deviceName)
     {
         try

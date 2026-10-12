@@ -61,6 +61,10 @@ public sealed class AppSettings
     // Low-latency presentation (Direct3D only, experimental): present at once, tear if allowed.
     public bool LowLatency { get; set; }
 
+    // Frame interpolation (Direct3D only): make in-between frames when the display refreshes clearly
+    // faster than the video arrives (30 -> 60, 60 -> 144 ...). Off by default; costs one frame of latency.
+    public bool Interpolation { get; set; }
+
     // Which display fullscreen uses: "" = the one the window is on; otherwise "\.\DISPLAYn|name|WxH"
     // (see Displays.cs). Not part of the video profiles: it describes the room, not the source.
     public string FullscreenDisplay { get; set; } = "";
@@ -122,6 +126,10 @@ public sealed class AppSettings
     public int HotkeySnapshot { get; set; } = 0x20000 | 0x40000 | 0x53; // Ctrl+Alt+S
     public int HotkeyMute { get; set; } = 0x20000 | 0x40000 | 0x4D;     // Ctrl+Alt+M
     public int HotkeyPip { get; set; } = 0x20000 | 0x40000 | 0x50;      // Ctrl+Alt+P
+    public int HotkeyVolumeUp { get; set; } = 0x20000 | 0x40000 | 0x26;   // Ctrl+Alt+Up
+    public int HotkeyVolumeDown { get; set; } = 0x20000 | 0x40000 | 0x28; // Ctrl+Alt+Down
+    /// <summary>Endpoint id of the audio output (speakers) to play the capture audio on; null = follow the Windows default.</summary>
+    public string? AudioOutputDeviceId { get; set; }
     public string DeviceKeyword { get; set; } = "JVA14";
     public string Language { get; set; } = "ja";  // "ja" | "en"
 
@@ -174,6 +182,11 @@ public sealed class AppSettings
         UpdateApiUrl = string.IsNullOrWhiteSpace(UpdateApiUrl) ? DefaultUpdateApiUrl : UpdateApiUrl;
 
         CaptureLevelBefore = Math.Clamp(CaptureLevelBefore, -1, 100);
+        if (string.IsNullOrWhiteSpace(AudioOutputDeviceId)) AudioOutputDeviceId = null;
+        // Settings files from before the volume hotkeys have no such entries: the property initialisers
+        // already gave them their defaults. Only a combo without a key (modifiers alone) is meaningless.
+        if ((HotkeyVolumeUp & 0xFFFF) == 0) HotkeyVolumeUp = 0;
+        if ((HotkeyVolumeDown & 0xFFFF) == 0) HotkeyVolumeDown = 0;
 
         // Anything unrecognised (typo, hand edit, a value from a newer build) falls
         // back to the safe choice: the Media Foundation path / the FSR default.
@@ -343,6 +356,7 @@ public sealed class VideoProfile
     public int CropRight { get; set; }
     public int CropBottom { get; set; }
     public bool LowLatency { get; set; }
+    public bool Interpolation { get; set; }
     public bool SaveDisplaySize { get; set; }
 
     public CaptureMode? ToMode() =>
@@ -387,7 +401,7 @@ public sealed class VideoProfile
         && AdjBrightness == o.AdjBrightness && AdjContrast == o.AdjContrast
         && AdjSaturation == o.AdjSaturation && AdjGamma == o.AdjGamma && AvOffsetMs == o.AvOffsetMs
         && CropLeft == o.CropLeft && CropTop == o.CropTop && CropRight == o.CropRight && CropBottom == o.CropBottom
-        && LowLatency == o.LowLatency && SaveDisplaySize == o.SaveDisplaySize;
+        && LowLatency == o.LowLatency && Interpolation == o.Interpolation && SaveDisplaySize == o.SaveDisplaySize;
 
     /// <summary>Copy of the values under a new name.</summary>
     public VideoProfile Clone(string name)

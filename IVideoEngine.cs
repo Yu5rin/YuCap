@@ -30,6 +30,27 @@ public readonly record struct VideoAdjustments(float Brightness, float Contrast,
         Math.Clamp(Saturation, 0f, 2f), Math.Clamp(Gamma, 0.5f, 2f));
 }
 
+/// <summary>Why frame interpolation is not running (<see cref="InterpolationStatus.Idle"/>).</summary>
+public enum InterpolationIdle
+{
+    /// <summary>It is running.</summary>
+    None,
+    /// <summary>The setting is off.</summary>
+    Disabled,
+    /// <summary>Low-latency presentation is not display-driven, so there are no refreshes to fill.</summary>
+    LowLatency,
+    /// <summary>The display refresh is not clearly higher than the source frame rate.</summary>
+    RefreshTooLow,
+    /// <summary>No video yet, so the source frame rate is not known.</summary>
+    NoSignal,
+    /// <summary>The interpolation shaders could not be built on this system.</summary>
+    Unavailable,
+}
+
+/// <summary>What frame interpolation is doing right now: running (Active) from SourceFps up to RefreshHz,
+/// or idle with the reason.</summary>
+public sealed record InterpolationStatus(bool Active, double SourceFps, double RefreshHz, InterpolationIdle Idle);
+
 /// <summary>Frame-rate figures measured by a renderer that presents frames itself.</summary>
 public sealed record RenderStats(double InputFps, double PresentedFps, long DroppedFrames,
     double GpuMsAvg = 0, double GpuMsMax = 0);
@@ -137,6 +158,13 @@ public interface IVideoEngine : IDisposable
     /// <summary>How frames reach the screen, e.g. "composition vsync", "hwnd tearing", "hwnd sync0".
     /// Empty when not running or not applicable.</summary>
     string PresentMode => string.Empty;
+    /// <summary>Motion-compensated frame interpolation (Direct3D only): when the display refreshes clearly
+    /// faster than the video arrives, in-between pictures are made so that every refresh shows a new one.
+    /// It costs one source frame of extra latency. <see cref="InterpolationState"/> says whether it is
+    /// actually running and, if not, why.</summary>
+    bool SupportsInterpolation => false;
+    bool Interpolation { get => false; set { } }
+    InterpolationStatus? InterpolationState => null;
     /// <summary>Render the current frame at <paramref name="output"/> size off-screen and
     /// read it back — lets the scaler be checked at 4K on a smaller monitor.</summary>
     Bitmap? RenderOffscreen(Size output, ScalingQuality quality) => null;
@@ -146,6 +174,13 @@ public interface IVideoEngine : IDisposable
     /// <summary>Colour attributes the source reader negotiated (native and output media type), as
     /// text lines, for <c>--hdr-probe</c>. Null when not running or not applicable.</summary>
     string? SourceColorInfo => null;
+    /// <summary>Smoothed time from a frame reaching YuCap until the display shows it (ms), including any video delay,
+    /// pacing margin and interpolation hold; 0 when unknown (Media Foundation renderer, nothing shown yet).
+    /// Does not include the capture card's or the display's own delay.</summary>
+    double VideoLatencyMs => 0;
+    /// <summary>True when <see cref="VideoLatencyMs"/> is derived from when Present returned rather than from
+    /// the display's frame statistics.</summary>
+    bool VideoLatencyEstimated => false;
     /// <summary>Start / stop recording frame pacing and per-frame GPU time (test mode, Direct3D only).
     /// <see cref="EndMeasure"/> returns null when nothing was recorded.</summary>
     void BeginMeasure() { }

@@ -23,6 +23,14 @@ internal static class D3DShaders
         public byte[] Scale = Array.Empty<byte>();
         public byte[] Easu = Array.Empty<byte>();
         public byte[] Rcas = Array.Empty<byte>();
+        // Frame interpolation (Shaders/interp.hlsl). Compiled separately: a failure here only
+        // disables interpolation (InterpOk stays false) and never breaks the renderer.
+        public bool InterpOk;
+        public byte[] PyrLuma = Array.Empty<byte>();
+        public byte[] PyrDown = Array.Empty<byte>();
+        public byte[] Me = Array.Empty<byte>();
+        public byte[] Med = Array.Empty<byte>();
+        public byte[] Synth = Array.Empty<byte>();
     }
 
     private static readonly object Gate = new();
@@ -48,6 +56,20 @@ internal static class D3DShaders
                 Easu = Compile(fsr, "easu", "fsr.hlsl", "ps_5_0"),
                 Rcas = Compile(fsr, "rcas", "fsr.hlsl", "ps_5_0"),
             };
+            try
+            {
+                string interp = Resource("interp.hlsl");
+                b.PyrLuma = Compile(interp, "pyr1", "interp.hlsl", "ps_5_0");
+                b.PyrDown = Compile(interp, "pyrd", "interp.hlsl", "ps_5_0");
+                b.Me = Compile(interp, "me", "interp.hlsl", "ps_5_0");
+                b.Med = Compile(interp, "med", "interp.hlsl", "ps_5_0");
+                b.Synth = Compile(interp, "synth", "interp.hlsl", "ps_5_0");
+                b.InterpOk = true;
+            }
+            catch (Exception ex)
+            {
+                Log.Info("D3D: interpolation shaders unavailable - frame interpolation is disabled: " + ex.Message.Split((char)10)[0]);
+            }
             Log.Info($"D3D: shaders compiled in {sw.ElapsedMilliseconds}ms");
             _cached = b;
             return b;

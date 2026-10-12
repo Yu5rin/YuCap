@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Diagnostics;
+using System.Linq;
 using System.Drawing.Imaging;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -78,9 +80,10 @@ internal sealed class D3DRenderer : IDisposable
     // ---- shaders / states / constant buffers ----
     private ID3D11VertexShader? _vs;
     private ID3D11PixelShader? _psConvert, _psScale, _psEasu, _psRcas;
+    private ID3D11PixelShader? _psPyr1, _psPyrD, _psMe, _psMed, _psSynth;   // frame interpolation (null = unavailable)
     private ID3D11SamplerState? _linear, _point;
     private ID3D11RasterizerState? _raster;
-    private ID3D11Buffer? _cbConvert, _cbScale, _cbEasu, _cbRcas;
+    private ID3D11Buffer? _cbConvert, _cbScale, _cbEasu, _cbRcas, _cbInterp;
     private readonly IntPtr _scratch = Marshal.AllocHGlobal(256);
     private GpuTimer? _gpu;                       // GPU time per presented frame (render thread only)
 
@@ -119,6 +122,7 @@ internal sealed class D3DRenderer : IDisposable
         public bool Gpu;
         public YuvInfo Yuv;
         public long Arrival;
+        public long Smooth;                    // phase-locked arrival (Stopwatch ticks), see Session.TrackSmooth
         public long Seq;                       // 0 = empty
         public void Free()
         {
@@ -182,6 +186,26 @@ internal sealed class D3DRenderer : IDisposable
         _cbScale = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
+
+        if (b.InterpOk)
+        {
+            try
+            {
+                _psPyr1 = Device.CreatePixelShader(b.PyrLuma);
+                _psPyrD = Device.CreatePixelShader(b.PyrDown);
+                _psMe = Device.CreatePixelShader(b.Me);
+                _psMed = Device.CreatePixelShader(b.Med);
+                _psSynth = Device.CreatePixelShader(b.Synth);
+                _cbInterp = Device.CreateBuffer(new BufferDescription(64, BindFlags.ConstantBuffer, ResourceUsage.Default));
+            }
+            catch (Exception ex)
+            {
+                Log.Info("D3D: interpolation shaders could not be created - frame interpolation is disabled: " + ex.Message.Split('\n')[0]);
+                _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
+                _psPyr1 = _psPyrD = _psMe = _psMed = _psSynth = null;
+                _cbInterp?.Dispose(); _cbInterp = null;
+            }
+        }
 
         try { _gpu = new GpuTimer(Device, Ctx); _gpu.StopCollecting(); }   // live: keep only the 1 s window
         catch (Exception ex) { Log.Info("D3D: GPU timestamp queries unavailable: " + ex.Message.Split('\n')[0]); }
@@ -411,7 +435,7 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>GPU path: copy the decoder/processor's NV12 texture into ours.</summary>
-    public void SubmitGpuFrame(ID3D11Texture2D src, uint subresource, int w, int h, YuvInfo yuv, long arrival)
+    public void SubmitGpuFrame(ID3D11Texture2D src, uint subresource, int w, int h, YuvInfo yuv, long arrival, long smooth)
     {
         lock (FrameLock)
         {
@@ -419,11 +443,12 @@ internal sealed class D3DRenderer : IDisposable
             {
                 Slot s = AcquireSlot(w, h, gpu: true);
                 Ctx.CopySubresourceRegion(s.Nv12!, 0, 0, 0, 0, src, subresource, new Box(0, 0, 0, w, h, 1));
-                Stamp(s, yuv, arrival);
+                Stamp(s, yuv, arrival, smooth);
                 return;
             }
             EnsureFrameTextures(w, h, gpu: true);
             Ctx.CopySubresourceRegion(_nv12!, 0, 0, 0, 0, src, subresource, new Box(0, 0, 0, w, h, 1));
+            Volatile.Write(ref _latestArrival, arrival);
             _gpuFrame = true;
             _yuv = yuv;
             _hasFrame = true;
@@ -431,7 +456,7 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>CPU path: upload NV12 from memory (Y plane, then the interleaved UV plane).</summary>
-    public void SubmitCpuFrame(IntPtr scan0, int pitch, int w, int h, YuvInfo yuv, long arrival)
+    public void SubmitCpuFrame(IntPtr scan0, int pitch, int w, int h, YuvInfo yuv, long arrival, long smooth)
     {
         lock (FrameLock)
         {
@@ -440,12 +465,13 @@ internal sealed class D3DRenderer : IDisposable
                 Slot s = AcquireSlot(w, h, gpu: false);
                 Ctx.UpdateSubresource(s.Y!, 0, null, scan0, (uint)pitch, 0);
                 Ctx.UpdateSubresource(s.UV!, 0, null, scan0 + pitch * h, (uint)pitch, 0);
-                Stamp(s, yuv, arrival);
+                Stamp(s, yuv, arrival, smooth);
                 return;
             }
             EnsureFrameTextures(w, h, gpu: false);
             Ctx.UpdateSubresource(_texY!, 0, null, scan0, (uint)pitch, 0);
             Ctx.UpdateSubresource(_texUV!, 0, null, scan0 + pitch * h, (uint)pitch, 0);
+            Volatile.Write(ref _latestArrival, arrival);
             _gpuFrame = false;
             _yuv = yuv;
             _hasFrame = true;
@@ -497,7 +523,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             slot = _ring[0];
             foreach (Slot s in _ring) if (s.Seq < slot.Seq) slot = s;
-            if (slot.Seq > _shownSeq) _ringDropped++;   // overwritten before its turn
+            if (!_interpHold && slot.Seq > _shownSeq) _ringDropped++;   // overwritten before its turn (interpolation counts what it skipped itself)
         }
         if (slot.W != w || slot.H != h || slot.Gpu != gpu || (gpu ? slot.Nv12 : slot.Y) == null)
         {
@@ -531,10 +557,11 @@ internal sealed class D3DRenderer : IDisposable
         return slot;
     }
 
-    private void Stamp(Slot s, YuvInfo yuv, long arrival)
+    private void Stamp(Slot s, YuvInfo yuv, long arrival, long smooth)
     {
         s.Yuv = yuv;
         s.Arrival = arrival;
+        s.Smooth = smooth;
         s.Seq = ++_ringSeq;
     }
 
@@ -648,62 +675,78 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>Pass (a): NV12 to RGB with rotation and mirror into the oriented texture.
-    /// Returns false if there is no frame yet.</summary>
+    /// Returns false if there is no frame yet. While frame interpolation is active the oriented
+    /// texture is produced by <see cref="InterpUpdate"/>; this then only makes sure it is current.</summary>
     public bool Convert(int rotation, bool mirror, VideoAdjustments adj, System.Windows.Forms.Padding crop)
     {
         lock (FrameLock)
         {
+            if (_interpHold)
+            {
+                InterpUpdate(Stopwatch.GetTimestamp() - _interpHoldTicks, rotation, mirror, adj, crop, false, out _);
+                return _hasFrame && _oriented != null;
+            }
             if (!_hasFrame) return false;
             Size src = new(_fw, _fh);
             Rectangle keep = CropMath.Effective(src, crop);      // the sub-rectangle that is shown
             Size o = Oriented(keep.Size, rotation);
-            if (_oriented == null || _orientedSize != o)
-            {
-                _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
-                _oriented = Device.CreateTexture2D(new Texture2DDescription
-                {
-                    Width = (uint)o.Width, Height = (uint)o.Height, MipLevels = 1, ArraySize = 1,
-                    Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
-                    Usage = ResourceUsage.Default,
-                    BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
-                });
-                _orientedSrv = Device.CreateShaderResourceView(_oriented);
-                _orientedRtv = Device.CreateRenderTargetView(_oriented);
-                _orientedSize = o;
-            }
-
-            // BT.601 / 709 / 2020 coefficients (Cr->R, Cb->G, Cr->G, Cb->B).
-            Vector4 coef = _yuv.Matrix switch
-            {
-                2 => new Vector4(1.402f, 0.344136f, 0.714136f, 1.772f),
-                4 or 5 => new Vector4(1.4746f, 0.164553f, 0.571353f, 1.8814f),
-                _ => new Vector4(1.5748f, 0.187324f, 0.468124f, 1.8556f),
-            };
-            Vector4 range = _yuv.FullRange
-                ? new Vector4(0f, 1f, 0.5f, 1f)
-                : new Vector4(16f / 255f, 255f / 219f, 128f / 255f, 255f / 224f);
-
-            WriteCb(_cbConvert!, new ConvertCb
-            {
-                SrcW = src.Width, SrcH = src.Height, OutW = o.Width, OutH = o.Height,
-                Rot = rotation / 90, Mirror = mirror ? 1 : 0, Coef = coef, Range = range,
-                P0 = adj.IsNeutral ? 0 : 1,   // orient.z: adjustments on
-                Adj = new Vector4(adj.Brightness, adj.Contrast, 1f / adj.Gamma, adj.Saturation),
-                CropL = keep.X, CropT = keep.Y,
-            });
-
-            Ctx.PSSetShaderResource(0, null!);
-            SetupTriangle(_orientedRtv!, new Rectangle(0, 0, o.Width, o.Height));
-            Ctx.PSSetShader(_psConvert);
-            Ctx.PSSetConstantBuffer(0, _cbConvert);
-            Ctx.PSSetSampler(0, _linear);
-            Ctx.PSSetShaderResource(0, (_gpuFrame ? _nv12Y : _srvY)!);
-            Ctx.PSSetShaderResource(1, (_gpuFrame ? _nv12UV : _srvUV)!);
-            Ctx.Draw(3, 0);
-            Ctx.PSSetShaderResource(0, null!);
-            Ctx.PSSetShaderResource(1, null!);
+            EnsureOriented(o);
+            ConvertInto(_orientedRtv!, src, keep, o, rotation, mirror, adj);
             return true;
         }
+    }
+
+    private void EnsureOriented(Size o)
+    {
+        if (_oriented != null && _orientedSize == o) return;
+        _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
+        _oriented = Device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)o.Width, Height = (uint)o.Height, MipLevels = 1, ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        });
+        _orientedSrv = Device.CreateShaderResourceView(_oriented);
+        _orientedRtv = Device.CreateRenderTargetView(_oriented);
+        _orientedSize = o;
+    }
+
+    /// <summary>The convert draw: the frame textures (<c>_nv12</c> / <c>_texY,_texUV</c>) into <paramref name="rtv"/>,
+    /// an <paramref name="o"/>-sized target. Caller holds <see cref="FrameLock"/>.</summary>
+    private void ConvertInto(ID3D11RenderTargetView rtv, Size src, Rectangle keep, Size o,
+        int rotation, bool mirror, VideoAdjustments adj)
+    {
+        // BT.601 / 709 / 2020 coefficients (Cr->R, Cb->G, Cr->G, Cb->B).
+        Vector4 coef = _yuv.Matrix switch
+        {
+            2 => new Vector4(1.402f, 0.344136f, 0.714136f, 1.772f),
+            4 or 5 => new Vector4(1.4746f, 0.164553f, 0.571353f, 1.8814f),
+            _ => new Vector4(1.5748f, 0.187324f, 0.468124f, 1.8556f),
+        };
+        Vector4 range = _yuv.FullRange
+            ? new Vector4(0f, 1f, 0.5f, 1f)
+            : new Vector4(16f / 255f, 255f / 219f, 128f / 255f, 255f / 224f);
+
+        WriteCb(_cbConvert!, new ConvertCb
+        {
+            SrcW = src.Width, SrcH = src.Height, OutW = o.Width, OutH = o.Height,
+            Rot = rotation / 90, Mirror = mirror ? 1 : 0, Coef = coef, Range = range,
+            P0 = adj.IsNeutral ? 0 : 1,   // orient.z: adjustments on
+            Adj = new Vector4(adj.Brightness, adj.Contrast, 1f / adj.Gamma, adj.Saturation),
+            CropL = keep.X, CropT = keep.Y,
+        });
+
+        Ctx.PSSetShaderResource(0, null!);
+        SetupTriangle(rtv, new Rectangle(0, 0, o.Width, o.Height));
+        Ctx.PSSetShader(_psConvert);
+        Ctx.PSSetConstantBuffer(0, _cbConvert);
+        Ctx.PSSetSampler(0, _linear);
+        Ctx.PSSetShaderResource(0, (_gpuFrame ? _nv12Y : _srvY)!);
+        Ctx.PSSetShaderResource(1, (_gpuFrame ? _nv12UV : _srvUV)!);
+        Ctx.Draw(3, 0);
+        Ctx.PSSetShaderResource(0, null!);
+        Ctx.PSSetShaderResource(1, null!);
     }
 
     public Size OrientedSize => _orientedSize;
@@ -833,6 +876,26 @@ internal sealed class D3DRenderer : IDisposable
         return pr;
     }
 
+    // ---- latency (YuCap-internal: frame received -> shown) ----
+    internal readonly VideoLatencyTracker Latency = new();
+
+    /// <summary>The swap chain's present counter right after a Present (render thread); 0 if unavailable.</summary>
+    public uint LastPresentCount
+    {
+        get { try { return _swap?.LastPresentCount ?? 0; } catch { return 0; } }
+    }
+
+    /// <summary>Arrival tick of the newest frame that went straight into the frame textures (no ring).</summary>
+    public long LatestArrival => Volatile.Read(ref _latestArrival);
+    private long _latestArrival;
+
+    /// <summary>Render thread: let the latency tracker read GetFrameStatistics once.</summary>
+    public void PollLatency()
+    {
+        IDXGISwapChain1? s = _swap;
+        if (s != null) Latency.Poll(s);
+    }
+
     // ---- measurement window (test mode) ----
     private PacingCapture? _pacing;
 
@@ -840,6 +903,7 @@ internal sealed class D3DRenderer : IDisposable
     public void BeginMeasure()
     {
         _gpu?.StartCollecting();
+        Latency.BeginCollect();
         var p = new PacingCapture();
         if (_swap != null) p.StartPolling(_swap);
         Volatile.Write(ref _pacing, p);
@@ -851,7 +915,467 @@ internal sealed class D3DRenderer : IDisposable
         PacingCapture p = Interlocked.Exchange(ref _pacing, null) ?? new PacingCapture();
         p.StopPolling();
         double[] gpu = _gpu?.StopCollecting() ?? Array.Empty<double>();
-        return new RenderMeasurement(p, gpu, PresentMode);
+        var (lat, est) = Latency.EndCollect();
+        return new RenderMeasurement(p, gpu, PresentMode, lat, est);
+    }
+
+    // =====================================================================
+    //  Frame interpolation (render thread; the ring is read under FrameLock)
+    // =====================================================================
+    //
+    // While interpolation is active (SetInterpolation) the ring always receives the frames and every
+    // refresh shows the picture of time T = now - hold: A is the newest ring frame whose smoothed
+    // timestamp is <= T, B the frame after it, alpha how far T lies between them. A and B are kept as
+    // oriented BGRA textures with a luma pyramid each; motion is estimated once per (A, B) pair and the
+    // in-between picture is synthesised into _oriented, so scaling / FSR / stills work as before.
+
+    /// <summary>One converted frame: the oriented picture and its luma pyramid (1/2 .. 1/16).</summary>
+    private sealed class OriFrame
+    {
+        public ID3D11Texture2D Tex = null!;
+        public ID3D11ShaderResourceView Srv = null!;
+        public ID3D11RenderTargetView Rtv = null!;
+        public Size Size;
+        public long Seq;                                  // 0 = holds nothing valid
+        public readonly ID3D11Texture2D[] Luma = new ID3D11Texture2D[4];
+        public readonly ID3D11ShaderResourceView[] LumaSrv = new ID3D11ShaderResourceView[4];
+        public readonly ID3D11RenderTargetView[] LumaRtv = new ID3D11RenderTargetView[4];
+        public readonly Size[] LumaSize = new Size[4];
+
+        public void Dispose()
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                LumaRtv[i]?.Dispose(); LumaSrv[i]?.Dispose(); Luma[i]?.Dispose();
+            }
+            Rtv?.Dispose(); Srv?.Dispose(); Tex?.Dispose();
+        }
+    }
+
+    /// <summary>The motion field of one pyramid level: raw result of the search and its median-filtered copy.</summary>
+    private sealed class FieldLevel
+    {
+        public Size Size;
+        public ID3D11Texture2D Raw = null!, Fin = null!;
+        public ID3D11ShaderResourceView RawSrv = null!, FinSrv = null!;
+        public ID3D11RenderTargetView RawRtv = null!, FinRtv = null!;
+        public void Dispose()
+        {
+            RawRtv?.Dispose(); RawSrv?.Dispose(); Raw?.Dispose();
+            FinRtv?.Dispose(); FinSrv?.Dispose(); Fin?.Dispose();
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct InterpCb { public Vector4 P0, P1, P2, P3; }
+
+    /// <summary>Everything that changes how a slot turns into an oriented picture; a change drops the cached pair.</summary>
+    private readonly record struct InterpKey(int Rotation, bool Mirror, VideoAdjustments Adj,
+        System.Windows.Forms.Padding Crop, int W, int H);
+
+    private const float MeLambda = 0.002f;              // smoothness penalty per level pixel
+
+    private bool _interpHold;                           // interpolation active (guarded by FrameLock)
+    private long _interpHoldTicks;
+    private OriFrame? _oriA, _oriB;
+    private FieldLevel[]? _fields;                      // index 0 = level 1 (1/2) ... 3 = level 4 (1/16)
+    private InterpKey _interpKey;
+    private bool _interpKeyValid;
+    private long _curA, _curB, _meA, _meB;              // the pair shown last / the pair the field belongs to
+    private double _lastAlpha = -1;
+    private long _interpMaxUsed;
+
+    /// <summary>True when the interpolation shaders compiled and could be created.</summary>
+    public bool InterpAvailable => _psSynth != null && _cbInterp != null;
+
+    /// <summary>Render thread: switch interpolation on (with the hold-back in Stopwatch ticks) or off.</summary>
+    public void SetInterpolation(bool on, long holdTicks)
+    {
+        bool wasOn;
+        lock (FrameLock)
+        {
+            wasOn = _interpHold;
+            _interpHold = on && InterpAvailable;
+            _interpHoldTicks = holdTicks;
+            if (_interpHold == wasOn) return;
+            _interpMaxUsed = 0;
+            _interpKeyValid = false;
+        }
+        if (!on) InterpFree();
+    }
+
+    private void InterpFree()
+    {
+        _oriA?.Dispose(); _oriA = null;
+        _oriB?.Dispose(); _oriB = null;
+        if (_fields != null) foreach (FieldLevel f in _fields) f.Dispose();
+        _fields = null;
+        _curA = _curB = _meA = _meB = 0;
+        _lastAlpha = -1;
+        _interpKeyValid = false;
+    }
+
+    private ID3D11Texture2D MakeTarget(int w, int h, Format fmt, out ID3D11ShaderResourceView srv, out ID3D11RenderTargetView rtv)
+    {
+        ID3D11Texture2D t = Device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
+            Format = fmt, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        });
+        srv = Device.CreateShaderResourceView(t);
+        rtv = Device.CreateRenderTargetView(t);
+        return t;
+    }
+
+    private void EnsureOriFrame(ref OriFrame? f, Size o)
+    {
+        if (f != null && f.Size == o) return;
+        f?.Dispose();
+        f = new OriFrame { Size = o };
+        f.Tex = MakeTarget(o.Width, o.Height, Format.B8G8R8A8_UNorm, out f.Srv, out f.Rtv);
+        Size s = o;
+        for (int i = 0; i < 4; i++)
+        {
+            s = new Size(Math.Max(1, (s.Width + 1) / 2), Math.Max(1, (s.Height + 1) / 2));
+            f.LumaSize[i] = s;
+            f.Luma[i] = MakeTarget(s.Width, s.Height, Format.R16_Float, out f.LumaSrv[i], out f.LumaRtv[i]);
+        }
+    }
+
+    private void EnsureFields(OriFrame like)
+    {
+        if (_fields != null)
+        {
+            bool same = true;
+            for (int i = 0; i < 4; i++) same &= _fields[i].Size == FieldSize(like.LumaSize[i]);
+            if (same) return;
+            foreach (FieldLevel f in _fields) f.Dispose();
+        }
+        _fields = new FieldLevel[4];
+        for (int i = 0; i < 4; i++)
+        {
+            Size fs = FieldSize(like.LumaSize[i]);
+            var f = new FieldLevel { Size = fs };
+            f.Raw = MakeTarget(fs.Width, fs.Height, Format.R16G16B16A16_Float, out f.RawSrv, out f.RawRtv);
+            f.Fin = MakeTarget(fs.Width, fs.Height, Format.R16G16B16A16_Float, out f.FinSrv, out f.FinRtv);
+            _fields[i] = f;
+        }
+    }
+
+    private static Size FieldSize(Size level) => new(Math.Max(1, (level.Width + 3) / 4), Math.Max(1, (level.Height + 3) / 4));
+
+    /// <summary>Copy a ring slot into the frame textures and convert it into <paramref name="f"/>, then build its
+    /// luma pyramid. Keeps _hasFrame / _fw / _fh / _yuv as if the slot had been the current frame.
+    /// Caller holds <see cref="FrameLock"/>.</summary>
+    private void ConvertSlot(Slot s, OriFrame f, int rotation, bool mirror, VideoAdjustments adj, System.Windows.Forms.Padding crop)
+    {
+        EnsureFrameTextures(s.W, s.H, s.Gpu);
+        if (s.Gpu) Ctx.CopyResource(_nv12!, s.Nv12!);
+        else { Ctx.CopyResource(_texY!, s.Y!); Ctx.CopyResource(_texUV!, s.UV!); }
+        _gpuFrame = s.Gpu;
+        _yuv = s.Yuv;
+        _hasFrame = true;
+        Size src = new(_fw, _fh);
+        ConvertInto(f.Rtv, src, CropMath.Effective(src, crop), f.Size, rotation, mirror, adj);
+        BuildPyramid(f);
+    }
+
+    private void BuildPyramid(OriFrame f)
+    {
+        for (int k = 0; k < 4; k++)
+        {
+            Size dst = f.LumaSize[k];
+            Size from = k == 0 ? f.Size : f.LumaSize[k - 1];
+            WriteCb(_cbInterp!, new InterpCb { P0 = new Vector4(from.Width, from.Height, 0, 0) });
+            SetupTriangle(f.LumaRtv[k], new Rectangle(0, 0, dst.Width, dst.Height));
+            Ctx.PSSetShader(k == 0 ? _psPyr1 : _psPyrD);
+            Ctx.PSSetConstantBuffer(0, _cbInterp);
+            Ctx.PSSetShaderResource(0, k == 0 ? f.Srv : f.LumaSrv[k - 1]);
+            Ctx.Draw(3, 0);
+            Ctx.PSSetShaderResource(0, null!);
+        }
+    }
+
+    /// <summary>Hierarchical symmetric block matching of A against B, coarse (1/16) to fine (1/2).</summary>
+    private void EstimateMotion(OriFrame a, OriFrame b)
+    {
+        EnsureFields(a);
+        FieldLevel[] fields = _fields!;
+        for (int k = 3; k >= 0; k--)
+        {
+            FieldLevel fl = fields[k];
+            Size ls = a.LumaSize[k];
+            Size parent = k == 3 ? new Size(1, 1) : fields[k + 1].Size;
+
+            WriteCb(_cbInterp!, new InterpCb
+            {
+                P0 = new Vector4(ls.Width, ls.Height, 1f / ls.Width, 1f / ls.Height),
+                P1 = new Vector4(fl.Size.Width, fl.Size.Height, parent.Width, parent.Height),
+                P2 = new Vector4(MeLambda, k == 3 ? 1f : 0f, k == 0 ? 1f : 0f, 0),
+            });
+            SetupTriangle(fl.RawRtv, new Rectangle(0, 0, fl.Size.Width, fl.Size.Height));
+            Ctx.PSSetShader(_psMe);
+            Ctx.PSSetConstantBuffer(0, _cbInterp);
+            Ctx.PSSetSampler(0, _linear);
+            Ctx.PSSetShaderResource(0, a.LumaSrv[k]);
+            Ctx.PSSetShaderResource(1, b.LumaSrv[k]);
+            Ctx.PSSetShaderResource(2, k == 3 ? null! : fields[k + 1].FinSrv);
+            Ctx.Draw(3, 0);
+            Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!); Ctx.PSSetShaderResource(2, null!);
+
+            // 3x3 median; the finest level also converts the vectors to oriented-source pixels (x2)
+            WriteCb(_cbInterp!, new InterpCb
+            {
+                P1 = new Vector4(fl.Size.Width, fl.Size.Height, 0, 0),
+                P2 = new Vector4(0, k == 0 ? 2f : 1f, 0, 0),
+            });
+            SetupTriangle(fl.FinRtv, new Rectangle(0, 0, fl.Size.Width, fl.Size.Height));
+            Ctx.PSSetShader(_psMed);
+            Ctx.PSSetConstantBuffer(0, _cbInterp);
+            Ctx.PSSetShaderResource(0, fl.RawSrv);
+            Ctx.Draw(3, 0);
+            Ctx.PSSetShaderResource(0, null!);
+        }
+    }
+
+    private void Synthesize(OriFrame a, OriFrame b, float alpha)
+    {
+        FieldLevel f1 = _fields![0];
+        Size o = _orientedSize;
+        WriteCb(_cbInterp!, new InterpCb
+        {
+            P0 = new Vector4(o.Width, o.Height, 0, 0),
+            P1 = new Vector4(f1.Size.Width, f1.Size.Height, 0, 0),
+            P2 = new Vector4(0, 0, alpha, 0),
+        });
+        SetupTriangle(_orientedRtv!, new Rectangle(0, 0, o.Width, o.Height));
+        Ctx.PSSetShader(_psSynth);
+        Ctx.PSSetConstantBuffer(0, _cbInterp);
+        Ctx.PSSetSampler(0, _linear);
+        Ctx.PSSetShaderResource(0, a.Srv);
+        Ctx.PSSetShaderResource(1, b.Srv);
+        Ctx.PSSetShaderResource(2, f1.FinSrv);
+        Ctx.Draw(3, 0);
+        Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!); Ctx.PSSetShaderResource(2, null!);
+    }
+
+    /// <summary>Debug hook for <c>--interp-probe</c>: with a motion-estimated pair cached, read back A, the picture
+    /// synthesised at <paramref name="alpha"/>, and B. False when no complete pair is cached.</summary>
+    internal bool InterpDebugStills(double alpha, out Bitmap? a, out Bitmap? mid, out Bitmap? b)
+    {
+        a = mid = b = null;
+        lock (FrameLock)
+        {
+            if (!_interpHold || _oriA == null || _oriB == null || _oriA.Seq == 0 || _oriB.Seq == 0
+                || _meA != _oriA.Seq || _meB != _oriB.Seq || _oriented == null || _orientedSize != _oriA.Size) return false;
+            var full = new Rectangle(Point.Empty, _oriA.Size);
+            a = ReadBack(_oriA.Tex, full);
+            Synthesize(_oriA, _oriB, (float)alpha);
+            mid = ReadBack(_oriented, full);
+            b = ReadBack(_oriB.Tex, full);
+            _lastAlpha = -1;       // _oriented no longer matches the cached alpha: redo it at the next refresh
+            return true;
+        }
+    }
+
+    /// <summary>Debug hook for <c>--interp-synth</c>: run the whole interpolation pipeline on two given pictures
+    /// (no ring, no capture) and return the picture synthesised at <paramref name="alpha"/>, the final motion
+    /// field (vectors in source pixels, one per 8x8 block) and the GPU time per stage.</summary>
+    internal bool InterpDebugSynthetic(Bitmap a, Bitmap b, double alpha, int benchFrames,
+        out Bitmap? mid, out float[] fieldXy, out Size fieldSize, out string timing)
+    {
+        mid = null; fieldXy = Array.Empty<float>(); fieldSize = Size.Empty; timing = string.Empty;
+        if (!InterpAvailable || a.Size != b.Size) return false;
+        lock (FrameLock)
+        {
+            Size o = a.Size;
+            OriFrame? fa = null, fb = null;
+            EnsureOriFrame(ref fa, o); EnsureOriFrame(ref fb, o);
+            Upload(fa!, a); Upload(fb!, b);
+            EnsureOriented(o);
+            _lastAlpha = -1; _curA = _curB = _meA = _meB = 0;
+
+            BuildPyramid(fa!); BuildPyramid(fb!);
+            EstimateMotion(fa!, fb!);
+            Synthesize(fa!, fb!, (float)alpha);
+            mid = ReadBack(_oriented!, new Rectangle(Point.Empty, o));
+
+            FieldLevel f1 = _fields![0];
+            fieldSize = f1.Size;
+            fieldXy = ReadField(f1);
+
+            if (benchFrames > 0)
+            {
+                double[] pyr = TimeGpu(() => BuildPyramid(fb!), benchFrames);
+                double[] me = TimeGpu(() => EstimateMotion(fa!, fb!), benchFrames);
+                double[] syn = TimeGpu(() => Synthesize(fa!, fb!, (float)alpha), benchFrames);
+                string Fmt(double[] v) => v.Length == 0 ? "n/a" : $"avg {v.Average():0.00} ms (max {v.Max():0.00})";
+                timing = $"convert-less pyramid {Fmt(pyr)}; motion search {Fmt(me)}; synthesis {Fmt(syn)}";
+            }
+            Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+            fa!.Dispose(); fb!.Dispose();
+            _lastAlpha = -1;
+            return true;
+        }
+    }
+
+    private void Upload(OriFrame f, Bitmap bmp)
+    {
+        BitmapData bd = bmp.LockBits(new Rectangle(Point.Empty, bmp.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try { Ctx.UpdateSubresource(f.Tex, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+        finally { bmp.UnlockBits(bd); }
+    }
+
+    private float[] ReadField(FieldLevel f)
+    {
+        using ID3D11Texture2D staging = Device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)f.Size.Width, Height = (uint)f.Size.Height, MipLevels = 1, ArraySize = 1,
+            Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging, BindFlags = BindFlags.None, CPUAccessFlags = CpuAccessFlags.Read,
+        });
+        Ctx.CopyResource(staging, f.Fin);
+        MappedSubresource map = Ctx.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        var xy = new float[f.Size.Width * f.Size.Height * 2];
+        try
+        {
+            for (int y = 0; y < f.Size.Height; y++)
+            {
+                var row = new short[f.Size.Width * 4];
+                Marshal.Copy(map.DataPointer + y * (int)map.RowPitch, row, 0, row.Length);
+                for (int x = 0; x < f.Size.Width; x++)
+                {
+                    xy[(y * f.Size.Width + x) * 2] = (float)BitConverter.Int16BitsToHalf(row[x * 4]);
+                    xy[(y * f.Size.Width + x) * 2 + 1] = (float)BitConverter.Int16BitsToHalf(row[x * 4 + 1]);
+                }
+            }
+        }
+        finally { Ctx.Unmap(staging, 0); }
+        return xy;
+    }
+
+    private double[] TimeGpu(Action work, int n)
+    {
+        using var timer = new GpuTimer(Device, Ctx, 8);
+        for (int i = 0; i < 5; i++) work();
+        Ctx.Flush();
+        timer.Poll(); timer.TakeSamples();
+        var sw = Stopwatch.StartNew();
+        int submitted = 0;
+        while (submitted < n && sw.ElapsedMilliseconds < 20000)
+        {
+            if (!timer.Begin()) { Ctx.Flush(); Thread.Sleep(0); timer.Poll(); continue; }
+            work();
+            timer.End();
+            Ctx.Flush();
+            submitted++;
+            timer.Poll();
+        }
+        while (timer.AnyPending && sw.ElapsedMilliseconds < 25000) { Ctx.Flush(); Thread.Sleep(1); timer.Poll(); }
+        return timer.TakeSamples().ToArray();
+    }
+
+    /// <summary>Make _oriented the picture of time <paramref name="t"/> (Stopwatch ticks on the smoothed timeline).
+    /// <paramref name="changed"/> is true when the picture differs from what the last call left there.
+    /// Returns false while the ring holds nothing to show.</summary>
+    public bool InterpUpdate(long t, int rotation, bool mirror, VideoAdjustments adj,
+        System.Windows.Forms.Padding crop, bool force, out bool changed)
+    {
+        changed = false;
+        if (!_interpHold) return false;
+        lock (FrameLock)
+        {
+            // ---- pick the pair ----
+            Slot? a = null, oldest = null;
+            foreach (Slot s in _ring)
+            {
+                if (s.Seq == 0) continue;
+                if (oldest == null || s.Seq < oldest.Seq) oldest = s;
+                if (s.Smooth <= t && (a == null || s.Seq > a.Seq)) a = s;
+            }
+            a ??= oldest;                     // start-up: nothing is old enough yet - show the oldest
+            if (a == null) return _hasFrame && _oriented != null;
+
+            Slot? b = null;
+            double alpha = 0;
+            foreach (Slot s in _ring)
+                if (s.Seq == a.Seq + 1) { b = s; break; }
+            if (b != null && (b.W != a.W || b.H != a.H)) b = null;     // a mode change in between
+            if (b != null)
+            {
+                long span = b.Smooth - a.Smooth;
+                alpha = span > 0 ? Math.Clamp((double)(t - a.Smooth) / span, 0.0, 1.0) : (t >= b.Smooth ? 1.0 : 0.0);
+            }
+
+            // ---- cache validity ----
+            var key = new InterpKey(rotation, mirror, adj, crop, a.W, a.H);
+            if (force || !_interpKeyValid || key != _interpKey)
+            {
+                if (_oriA != null) _oriA.Seq = 0;
+                if (_oriB != null) _oriB.Seq = 0;
+                _curA = _curB = _meA = _meB = 0;
+                _lastAlpha = -1;
+                _interpKey = key;
+                _interpKeyValid = true;
+            }
+            Size src = new(a.W, a.H);
+            Size o = Oriented(CropMath.Effective(src, crop).Size, rotation);
+
+            // frames nobody ever looked at
+            if (_interpMaxUsed != 0 && a.Seq > _interpMaxUsed + 1) _ringDropped += a.Seq - _interpMaxUsed - 1;
+            _interpMaxUsed = Math.Max(_interpMaxUsed, Math.Max(a.Seq, b?.Seq ?? 0));
+            _shownSeq = a.Seq;
+
+            // ---- convert what the pair needs ----
+            if (_oriA == null || _oriA.Seq != a.Seq || _oriA.Size != o)
+            {
+                if (_oriB != null && _oriB.Seq == a.Seq && _oriB.Size == o)
+                {
+                    (_oriA, _oriB) = (_oriB, _oriA);       // the old B is the new A: its pyramid is reused
+                    if (_oriB != null) _oriB.Seq = 0;
+                }
+                else
+                {
+                    _gpu?.Begin();
+                    EnsureOriFrame(ref _oriA, o);
+                    ConvertSlot(a, _oriA!, rotation, mirror, adj, crop);
+                    _oriA!.Seq = a.Seq;
+                }
+            }
+            if (b != null && (_oriB == null || _oriB.Seq != b.Seq || _oriB.Size != o))
+            {
+                _gpu?.Begin();
+                EnsureOriFrame(ref _oriB, o);
+                ConvertSlot(b, _oriB!, rotation, mirror, adj, crop);
+                _oriB!.Seq = b.Seq;
+            }
+
+            // ---- motion, once per pair ----
+            long bSeq = b?.Seq ?? 0;
+            if (b != null && (_meA != a.Seq || _meB != bSeq))
+            {
+                _gpu?.Begin();
+                EstimateMotion(_oriA!, _oriB!);
+                _meA = a.Seq; _meB = bSeq;
+            }
+
+            // ---- the picture ----
+            bool pairChanged = a.Seq != _curA || bSeq != _curB;
+            double eff = b != null ? alpha : 0.0;
+            if (pairChanged || _lastAlpha < 0 || Math.Abs(eff - _lastAlpha) > 0.002 || _oriented == null || _orientedSize != o)
+            {
+                _gpu?.Begin();
+                EnsureOriented(o);
+                if (b == null || eff <= 0.002) Ctx.CopyResource(_oriented!, _oriA!.Tex);
+                else if (eff >= 0.998) Ctx.CopyResource(_oriented!, _oriB!.Tex);
+                else Synthesize(_oriA!, _oriB!, (float)eff);
+                _curA = a.Seq; _curB = bSeq;
+                _lastAlpha = eff;
+                changed = true;
+            }
+            return true;
+        }
     }
 
     // =====================================================================
@@ -1026,6 +1550,7 @@ internal sealed class D3DRenderer : IDisposable
     public void DisposeAll(bool releaseDevice)
     {
         try { Ctx?.ClearState(); Ctx?.Flush(); } catch { }
+        InterpFree();
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
         _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
@@ -1039,8 +1564,9 @@ internal sealed class D3DRenderer : IDisposable
         lock (FrameLock) { FreeRing(); DisposeFrameTextures(); }
         _gpu?.Dispose(); _gpu = null;
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
+        _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
         _linear?.Dispose(); _point?.Dispose(); _raster?.Dispose();
-        _cbConvert?.Dispose(); _cbScale?.Dispose(); _cbEasu?.Dispose(); _cbRcas?.Dispose();
+        _cbConvert?.Dispose(); _cbScale?.Dispose(); _cbEasu?.Dispose(); _cbRcas?.Dispose(); _cbInterp?.Dispose();
         Ctx?.Dispose();
         Device?.Dispose();
         Marshal.FreeHGlobal(_scratch);

@@ -48,6 +48,7 @@ public sealed class D3DVideoEngine : IVideoEngine
     private readonly object _cropLock = new();
     private Padding _crop = Padding.Empty;                     // five ints: read/written under _cropLock
     private volatile bool _lowLatency;
+    private volatile bool _interpolation;
 
     private readonly object _dstLock = new();
     private Rectangle _dst;
@@ -132,6 +133,14 @@ public sealed class D3DVideoEngine : IVideoEngine
     }
     private VideoAdjustments CurrentAdjustments() { lock (_adjLock) return _adj; }
 
+    public bool SupportsInterpolation => true;
+    public bool Interpolation
+    {
+        get => _interpolation;
+        set { _interpolation = value; _s?.PokeInterpolation(); }
+    }
+    public InterpolationStatus? InterpolationState => _s?.InterpStatus();
+
     public bool SupportsVideoDelay => true;
     public int VideoDelayMs
     {
@@ -140,6 +149,8 @@ public sealed class D3DVideoEngine : IVideoEngine
     }
     public double VideoDelayActualMs => _s?.DelayActualMs ?? 0;
     public double VideoPacingMarginMs => _s?.PacingMarginMs ?? 0;
+    public double VideoLatencyMs => _s?.Renderer?.Latency.Ms ?? 0;
+    public bool VideoLatencyEstimated => _s?.Renderer?.Latency.Estimated ?? false;
 
     public List<CaptureMode> GetModes() => new(_modes);
     public bool IsRectUpdateStuck(int thresholdMs) => false;
@@ -282,6 +293,30 @@ public sealed class D3DVideoEngine : IVideoEngine
         return result;
     }
 
+    /// <summary>Debug hook for <c>--interp-probe</c>: the cached pair's A and B and the picture synthesised between them.</summary>
+    internal bool DebugInterpStills(double alpha, out Bitmap? a, out Bitmap? mid, out Bitmap? b)
+    {
+        Bitmap? ra = null, rm = null, rb = null;
+        bool ok = false;
+        Session? s = _s;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.InterpDebugStills(alpha, out ra, out rm, out rb); return null; }, 3000, needFrame: false, out _);
+        a = ra; mid = rm; b = rb;
+        return ok;
+    }
+
+    internal bool DebugInterpSynthetic(Bitmap a, Bitmap b, double alpha, int benchFrames,
+        out Bitmap? mid, out float[] fieldXy, out Size fieldSize, out string timing)
+    {
+        Bitmap? rm = null; float[] rf = Array.Empty<float>(); Size rs = Size.Empty; string rt = string.Empty;
+        bool ok = false;
+        Session? s = _s;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.InterpDebugSynthetic(a, b, alpha, benchFrames, out rm, out rf, out rs, out rt); return null; }, 60000, needFrame: false, out _);
+        mid = rm; fieldXy = rf; fieldSize = rs; timing = rt;
+        return ok;
+    }
+
     public string? SourceColorInfo => _s?.ColorInfo;
 
     public void BeginMeasure() => _s?.Renderer?.BeginMeasure();
@@ -363,6 +398,71 @@ public sealed class D3DVideoEngine : IVideoEngine
         private double _loggedMargin;
 
         [DllImport("dwmapi.dll")] private static extern int DwmFlush();
+
+        // Smoothed arrival timeline (capture thread): a phase-locked loop on the frame interval, so that
+        // the few ms of USB / scheduling jitter in the raw arrival times do not wobble the interpolation phase.
+        private double _smoothTicks;
+        private bool _smoothValid;
+
+        private long TrackSmooth(long arrival)
+        {
+            double nom = Volatile.Read(ref _nominalMs) * Stopwatch.Frequency / 1000.0;
+            double sm;
+            if (!_smoothValid || nom <= 0) sm = arrival;
+            else
+            {
+                double pred = _smoothTicks + nom;
+                double err = arrival - pred;
+                if (Math.Abs(err) > 6 * nom) sm = arrival;          // a long stall: start over
+                else
+                {
+                    double k = Math.Round(err / nom);                // dropped (k>0) or duplicated (k<0) frames
+                    pred += k * nom;
+                    err -= k * nom;
+                    sm = pred + 0.05 * err;
+                }
+                if (sm < _smoothTicks + 0.2 * nom) sm = _smoothTicks + 0.2 * nom;   // always moves forward
+            }
+            _smoothValid = true;
+            _smoothTicks = sm;
+            return (long)sm;
+        }
+
+        // ---- frame interpolation ----
+        private volatile bool _interpActive;
+        private volatile bool _displayDriven;
+        private int _interpReeval;
+        private int _refreshHz;
+        private long _refreshTick;
+        public void PokeInterpolation() { Volatile.Write(ref _interpReeval, 1); TryWake(); }
+
+        private int RefreshHz()
+        {
+            long now = Environment.TickCount64;
+            if (_refreshHz == 0 || now - _refreshTick > 500)
+            {
+                _refreshHz = Displays.RefreshHzOfWindow(_hwnd);
+                _refreshTick = now;
+            }
+            return _refreshHz;
+        }
+
+        /// <summary>Whether interpolation should run now. It starts when the refresh is at least 1.1x the
+        /// measured source frame rate and stops again below 1.05x (so a borderline pair does not flap).</summary>
+        private InterpolationStatus EvaluateInterpolation(bool wasActive)
+        {
+            double nominal = Volatile.Read(ref _nominalMs);
+            double src = nominal > 0 ? 1000.0 / nominal : 0;
+            double hz = RefreshHz();
+            if (!_e._interpolation) return new InterpolationStatus(false, src, hz, InterpolationIdle.Disabled);
+            if (_r is { InterpAvailable: false }) return new InterpolationStatus(false, src, hz, InterpolationIdle.Unavailable);
+            if (_lowLatency || !_displayDriven) return new InterpolationStatus(false, src, hz, InterpolationIdle.LowLatency);
+            if (src <= 0 || hz <= 0) return new InterpolationStatus(false, src, hz, InterpolationIdle.NoSignal);
+            if (hz < src * (wasActive ? 1.05 : 1.10)) return new InterpolationStatus(false, src, hz, InterpolationIdle.RefreshTooLow);
+            return new InterpolationStatus(true, src, hz, InterpolationIdle.None);
+        }
+
+        public InterpolationStatus InterpStatus() => EvaluateInterpolation(_interpActive);
 
         /// <summary>Capture thread: fold one arrival into the jitter estimate (p90 of how far the
         /// arrival interval strays from nominal) and update the margin.</summary>
@@ -591,7 +691,11 @@ public sealed class D3DVideoEngine : IVideoEngine
             // Vsync path: the display, not the capture card, clocks presentation (see below).
             // Low-latency mode (sync 0 / tearing) keeps presenting on arrival.
             bool displayDriven = r.VsyncPaced;
+            _displayDriven = displayDriven;
             bool presentedLast = false;
+            long interpEvalTick = 0;
+            InterpolationIdle interpIdleLogged = (InterpolationIdle)(-1);
+            double interpHoldMs = 0;
             bool marginLogged = false;
             int iter = 0;
             bool dueLogged = false;
@@ -613,6 +717,26 @@ public sealed class D3DVideoEngine : IVideoEngine
                 }
                 int delayMs = userDelayMs + (int)Math.Round(marginMs);   // what the ring holds frames back by
                 bool waitedLatency = false;
+
+                if (displayDriven)
+                {
+                    long tk = Environment.TickCount64;
+                    bool reeval = Interlocked.Exchange(ref _interpReeval, 0) == 1;
+                    if (reeval || tk - interpEvalTick >= (interpIdleLogged == InterpolationIdle.NoSignal ? 100 : 1000))
+                    {
+                        interpEvalTick = tk;
+                        InterpolationStatus st = EvaluateInterpolation(_interpActive);
+                        if (st.Active != _interpActive || st.Idle != interpIdleLogged)
+                        {
+                            interpIdleLogged = st.Idle;
+                            if (st.Active)
+                                Log.Info($"D3D: frame interpolation ON {st.SourceFps:0.0} fps -> {st.RefreshHz:0} Hz");
+                            else if (_interpActive || st.Idle != InterpolationIdle.Disabled)
+                                Log.Info($"D3D: frame interpolation {(_interpActive ? "OFF" : "idle")} ({st.Idle}; source {st.SourceFps:0.0} fps, refresh {st.RefreshHz:0} Hz)");
+                            _interpActive = st.Active;
+                        }
+                    }
+                }
                 long arrivalShown = 0;
 
                 if (displayDriven)
@@ -658,18 +782,42 @@ public sealed class D3DVideoEngine : IVideoEngine
                 }
                 reconvert = Interlocked.Exchange(ref _dirtyConvert, 0) == 1;
                 dirty = Interlocked.Exchange(ref _dirtyCompose, 0) == 1;
+                r.PollLatency();   // how long the frames presented so far took to reach the screen
+                long contentTicks = 0;   // the instant on the source timeline of the picture shown this iteration
 
                 // The capture thread files frames into the renderer's ring; show the oldest
                 // due one that arrived at least `delayMs` ago (user delay + pacing margin).
-                if (r.ConfigureRing(delayMs, Fps))
+                // With interpolation the hold-back also includes one source frame interval: the picture
+                // shown is that of time now - hold, made from the two frames around it.
+                bool interp = displayDriven && _interpActive;
+                double nominalNow = Volatile.Read(ref _nominalMs);
+                interpHoldMs = interp ? delayMs + nominalNow : 0;
+                int ringMs = interp ? (int)Math.Ceiling(interpHoldMs) : delayMs;
+                if (r.ConfigureRing(ringMs, Fps))
                 {
-                    Log.Info(delayMs > 0
+                    Log.Info(interp ? $"D3D: interpolation hold {interpHoldMs:0.0}ms (ring {r.RingSlots} frames)"
+                        : delayMs > 0
                         ? $"D3D: video delay configured {delayMs}ms (ring {r.RingSlots} frames)"
                         : "D3D: video delay off");
                 }
+                r.SetInterpolation(interp, (long)(interpHoldMs * Stopwatch.Frequency / 1000.0));
                 bool ringed = delayMs > 0;
-                _ringActive = ringed;
-                if (ringed)
+                _ringActive = ringed || interp;
+                if (interp)
+                {
+                    newFrame = false;
+                    long holdTicks = (long)(interpHoldMs * Stopwatch.Frequency / 1000.0);
+                    long interpT = Stopwatch.GetTimestamp() - holdTicks;
+                    if (r.InterpUpdate(interpT, _e._rotation, _e._mirror,
+                            _e.CurrentAdjustments(), _e.Crop, reconvert, out bool changed))
+                    {
+                        newFrame = changed;
+                        if (changed) contentTicks = interpT;
+                    }
+                    long rd2 = r.TakeRingDropped();
+                    if (rd2 > 0) Interlocked.Add(ref _dropped, rd2);
+                }
+                else if (ringed)
                 {
                     newFrame = false;   // capture arrivals do not drive presentation here
                     long delayTicks = drawnOnce ? delayMs * Stopwatch.Frequency / 1000 : 0;   // the first frame needs no pacing margin
@@ -684,11 +832,13 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if (!waitedLatency && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
                         waitedLatency = true;
                         newFrame = r.AdvanceDelayed(Stopwatch.GetTimestamp(), delayTicks, out arrivalShown);
+                        if (newFrame) contentTicks = arrivalShown;
                     }
                     long rd = r.TakeRingDropped();
                     if (rd > 0) Interlocked.Add(ref _dropped, rd);
                 }
-                bool delayed = userDelayMs > 0;
+                bool delayed = userDelayMs > 0 || interp;
+                int delayKey = interp ? (int)Math.Ceiling(interpHoldMs) : delayMs;
                 if (!delayed)
                 {
                     trackedDelay = 0;
@@ -723,7 +873,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                         // Wait until the swap chain has room, so latency stays at one frame.
                         if (!waitedLatency && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
                     }
-                    if (newFrame || reconvert || !drawnOnce)
+                    if (!interp && (newFrame || reconvert || !drawnOnce))
                     {
                         r.GpuBegin();   // the GPU-time span starts with the convert pass and ends in PresentFrame
                         r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments(), _e.Crop);
@@ -745,14 +895,25 @@ public sealed class D3DVideoEngine : IVideoEngine
                     drawnOnce = true;
                     presentedLast = true;
                     Interlocked.Increment(ref _presented);
-                    if (delayed && newFrame && arrivalShown != 0)
+                    if (newFrame)
+                    {
+                        // Direct path (no ring): the frame shown is the newest one that arrived.
+                        long content = contentTicks != 0 ? contentTicks : (interp || ringed ? 0 : r.LatestArrival);
+                        if (content != 0)
+                        {
+                            r.Latency.SetRefreshMs(1000.0 / Math.Max(1, RefreshHz()));
+                            r.Latency.Shown(r.LastPresentCount, content, Stopwatch.GetTimestamp());
+                        }
+                    }
+                    if (delayed && newFrame && (arrivalShown != 0 || interp))
                     {
                         // Age of the frame we just handed to the swap chain (it reaches the
                         // screen at the next vsync, so the real figure is up to one refresh more).
-                        double ageMs = (Stopwatch.GetTimestamp() - arrivalShown) * 1000.0 / Stopwatch.Frequency;
-                        if (trackedDelay != delayMs)
+                        // An interpolated picture shows the instant now - hold, so its age is the hold.
+                        double ageMs = interp ? interpHoldMs : (Stopwatch.GetTimestamp() - arrivalShown) * 1000.0 / Stopwatch.Frequency;
+                        if (trackedDelay != delayKey)
                         {
-                            trackedDelay = delayMs; delaySamples = 0; delayLogged = false;
+                            trackedDelay = delayKey; delaySamples = 0; delayLogged = false;
                         }
                         double prev = Volatile.Read(ref _delayActual);
                         Volatile.Write(ref _delayActual, delaySamples == 0 ? ageMs : prev * 0.9 + ageMs * 0.1);
@@ -760,7 +921,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if (!delayLogged && delaySamples >= 30)
                         {
                             delayLogged = true;
-                            Log.Info($"D3D: video delay target={delayMs}ms actual\u2248{Volatile.Read(ref _delayActual):0}ms");
+                            Log.Info($"D3D: video delay target={delayKey}ms actual\u2248{Volatile.Read(ref _delayActual):0}ms");
                         }
                     }
                     if (!firstPresentLogged)
@@ -883,7 +1044,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
                         Interlocked.Increment(ref _inFrames);
                         TrackArrival(arrival);
-                        SubmitSample(r, sample, width, height, yuv, arrival, ref texIid);
+                        SubmitSample(r, sample, width, height, yuv, arrival, TrackSmooth(arrival), ref texIid);
                         // With the ring active the render thread counts what the ring loses.
                         if (Interlocked.Exchange(ref _frameReady, 1) == 1 && !_ringActive) Interlocked.Increment(ref _dropped);
                         TryWake();
@@ -915,7 +1076,7 @@ public sealed class D3DVideoEngine : IVideoEngine
             }
         }
 
-        private void SubmitSample(D3DRenderer r, IMFSample sample, int w, int h, YuvInfo yuv, long arrival, ref Guid texIid)
+        private void SubmitSample(D3DRenderer r, IMFSample sample, int w, int h, YuvInfo yuv, long arrival, long smooth, ref Guid texIid)
         {
             if (sample.BufferCount < 1) return;
             using IMFMediaBuffer buf = sample.GetBufferByIndex(0);
@@ -926,7 +1087,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 using var tex = new ID3D11Texture2D(p);
                 if (tex.Description.Format == Format.NV12)
                 {
-                    r.SubmitGpuFrame(tex, (uint)dxgi.SubresourceIndex, w, h, yuv, arrival);
+                    r.SubmitGpuFrame(tex, (uint)dxgi.SubresourceIndex, w, h, yuv, arrival, smooth);
                     return;
                 }
             }
@@ -936,12 +1097,12 @@ public sealed class D3DVideoEngine : IVideoEngine
             if (b2 != null)
             {
                 b2.Lock2D(out IntPtr scan0, out int pitch);
-                try { r.SubmitCpuFrame(scan0, pitch, w, h, yuv, arrival); }
+                try { r.SubmitCpuFrame(scan0, pitch, w, h, yuv, arrival, smooth); }
                 finally { b2.Unlock2D(); }
                 return;
             }
             buf.Lock(out IntPtr data, out _, out _);
-            try { r.SubmitCpuFrame(data, w, w, h, yuv, arrival); }
+            try { r.SubmitCpuFrame(data, w, w, h, yuv, arrival, smooth); }
             finally { buf.Unlock(); }
         }
 

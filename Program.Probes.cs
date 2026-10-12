@@ -13,6 +13,8 @@ namespace YuCap;
 //   --gpu-bench <out.txt>   can this GPU upscale to 4K at the source frame rate?
 //   --hdr-probe <out.txt>   does the capture card deliver HDR, and is Windows HDR on?
 //   --restart-stress <out.txt> [N]   restart the Direct3D preview N times; does video always come back?
+//   --interp-probe <out.txt> [--mode 4k30] [--stills <dir>]   frame interpolation on the live device
+//   --interp-synth <out.txt> --in <picture.png> [--scale 2] [--stills <dir>]   interpolation on a known motion
 // Both run the Direct3D engine in a real (small) window on the live capture device.
 internal static partial class Program
 {
@@ -162,6 +164,255 @@ internal static partial class Program
                 log.Add("  first frame received: " + Pct(firstRx));
                 log.Add("  first present:        " + Pct(firstPresent));
                 log.Add("  first picture:        " + Pct(firstPicture));
+            }
+            catch (Exception ex) { log.Add("EXCEPTION: " + ex); }
+            finally
+            {
+                try { engine.Dispose(); } catch { }
+                try { File.WriteAllLines(outPath, log); } catch { }
+                form.BeginInvoke(new Action(form.Close));
+            }
+        };
+        Application.Run(form);
+    }
+
+    // =====================================================================
+    //  --interp-probe
+    // =====================================================================
+
+    /// <summary>Frame interpolation on the live device in a small window: a baseline without it, then with it
+    /// (presented fps, GPU time, pacing, activation), and stills of A, the synthesised middle and B.</summary>
+    private static void RunInterpProbe(string outPath, CaptureMode? wanted, string? stillsDir)
+    {
+        var log = new List<string>();
+        Form form = NewProbeWindow("YuCap interp-probe", out VideoBox canvas);
+        var engine = new D3DVideoEngine();
+
+        form.Shown += (_, _) =>
+        {
+            try
+            {
+                log.Add($"YuCap {Application.ProductVersion} - frame interpolation probe");
+                var dev = VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), Settings.DeviceKeyword);
+                if (dev == null) { log.Add("no capture device"); return; }
+                engine.Attach(canvas.Handle);
+                engine.Start(dev, null);
+                PumpFor(800);
+                List<CaptureMode> modes = engine.GetModes();
+                CaptureMode? mode = wanted == null ? null : modes
+                    .Where(m => m.Width == wanted.Width && m.Height == wanted.Height && m.Fps == wanted.Fps)
+                    .OrderBy(m => m.Compression == "NV12" ? 0 : 1).FirstOrDefault();
+                if (wanted != null && mode == null) { log.Add("mode not offered: " + wanted); return; }
+                engine.Start(dev, mode);
+                engine.SetVideoRect(new Rectangle(0, 0, canvas.ClientSize.Width, canvas.ClientSize.Height));
+                log.Add($"device: {dev.Name}  mode: {engine.CurrentMode?.Compression} {engine.CurrentResolution.Width}x{engine.CurrentResolution.Height}@{engine.NegotiatedFps}");
+                log.Add($"window: {canvas.ClientSize.Width}x{canvas.ClientSize.Height} on {Screen.FromControl(form).DeviceName}, refresh {Displays.RefreshHzOfWindow(form.Handle)} Hz, present mode {engine.PresentMode}");
+                log.Add(string.Empty);
+
+                foreach (bool on in new[] { false, true })
+                {
+                    engine.Interpolation = on;
+                    PumpFor(2500);
+                    InterpolationStatus? st = engine.InterpolationState;
+                    log.Add($"=== interpolation {(on ? "ON" : "OFF")}: state = {(st == null ? "?" : $"active={st.Active} idle={st.Idle} source={st.SourceFps:0.00}fps refresh={st.RefreshHz:0}Hz")}");
+                    engine.BeginMeasure();
+                    long rx0 = engine.FramesReceived, pr0 = engine.FramesPresented, dr0 = engine.FramesDropped;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    PumpFor(6000);
+                    double el = sw.Elapsed.TotalSeconds;
+                    RenderMeasurement? meas = engine.EndMeasure();
+                    log.Add($"  received {(engine.FramesReceived - rx0) / el:0.00} fps, presented {(engine.FramesPresented - pr0) / el:0.00} fps, dropped {engine.FramesDropped - dr0}");
+                    if (engine.Stats is { } rs) log.Add($"  stats: in={rs.InputFps:0.0} presented={rs.PresentedFps:0.0} gpu avg={rs.GpuMsAvg:0.00}ms max={rs.GpuMsMax:0.00}ms");
+                    log.Add($"  video delay actual {engine.VideoDelayActualMs:0.0}ms (pacing margin {engine.VideoPacingMarginMs:0.0}ms)");
+                    if (meas != null)
+                    {
+                        double[] g = meas.GpuMs.OrderBy(x => x).ToArray();
+                        if (g.Length > 0)
+                            log.Add($"  GPU per present: n={g.Length} avg={g.Average():0.00}ms p50={g[g.Length / 2]:0.00} p95={g[Math.Clamp((int)Math.Ceiling(0.95 * g.Length) - 1, 0, g.Length - 1)]:0.00} max={g[^1]:0.00}ms");
+                        double srcFps = engine.NegotiatedFps;
+                        double hz = Displays.RefreshHzOfWindow(form.Handle);
+                        TestProbes.PacingAnalysis p = TestProbes.AnalyzePacing(meas.Pacing, on && st is { Active: true } ? hz : srcFps, hz);
+                        log.Add($"  pacing ({p.Source}): frames={p.Frames} mean={p.MeanMs:0.00}ms std={p.StdMs:0.00}ms p5..p95={p.P5Ms:0.0}..{p.P95Ms:0.0}ms judder={p.JudderShare:P0} observedHz={p.ObservedHz:0.00} sameRefresh={p.SameRefreshShare:P1}");
+                        foreach (var h in p.Histogram) log.Add($"    {h.Label}: {h.Text}");
+                    }
+                    log.Add(string.Empty);
+
+                    if (on && stillsDir != null)
+                    {
+                        Directory.CreateDirectory(stillsDir);
+                        for (int attempt = 0; attempt < 20; attempt++)
+                        {
+                            if (engine.DebugInterpStills(0.5, out Bitmap? a, out Bitmap? mid, out Bitmap? b))
+                            {
+                                using (a) using (mid) using (b)
+                                {
+                                    a!.Save(Path.Combine(stillsDir, "A.png"), ImageFormat.Png);
+                                    mid!.Save(Path.Combine(stillsDir, "mid.png"), ImageFormat.Png);
+                                    b!.Save(Path.Combine(stillsDir, "B.png"), ImageFormat.Png);
+                                    log.Add($"stills saved to {stillsDir} ({a.Width}x{a.Height})");
+                                }
+                                break;
+                            }
+                            PumpFor(100);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { log.Add("EXCEPTION: " + ex); }
+            finally
+            {
+                try { engine.Dispose(); } catch { }
+                try { File.WriteAllLines(outPath, log); } catch { }
+                form.BeginInvoke(new Action(form.Close));
+            }
+        };
+        Application.Run(form);
+    }
+
+    // =====================================================================
+    //  --interp-synth
+    // =====================================================================
+
+    private static int[] ReadPixels(Bitmap bmp)
+    {
+        var px = new int[bmp.Width * bmp.Height];
+        BitmapData bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try { System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, px, 0, px.Length); }
+        finally { bmp.UnlockBits(bd); }
+        return px;
+    }
+
+    private static Bitmap MakeBitmap(int[] px, int w, int h)
+    {
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        BitmapData bd = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try { System.Runtime.InteropServices.Marshal.Copy(px, 0, bd.Scan0, px.Length); }
+        finally { bmp.UnlockBits(bd); }
+        return bmp;
+    }
+
+    /// <summary>out(x, y) = src(x - dx, y - dy), edge pixels repeated.</summary>
+    private static int[] ShiftPixels(int[] src, int w, int h, double dx, double dy)
+    {
+        var o = new int[src.Length];
+        int ix = (int)Math.Round(dx), iy = (int)Math.Round(dy);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                o[y * w + x] = src[Math.Clamp(y - iy, 0, h - 1) * w + Math.Clamp(x - ix, 0, w - 1)];
+        return o;
+    }
+
+    private static double Psnr(int[] p, int[] q, int w, Rectangle r)
+    {
+        double se = 0; long n = 0;
+        for (int y = r.Top; y < r.Bottom; y++)
+            for (int x = r.Left; x < r.Right; x++)
+            {
+                int a = p[y * w + x], b = q[y * w + x];
+                for (int sh = 0; sh < 24; sh += 8) { int d = ((a >> sh) & 255) - ((b >> sh) & 255); se += d * d; n++; }
+            }
+        double mse = se / Math.Max(1, n);
+        return mse <= 1e-9 ? 99 : 10 * Math.Log10(255.0 * 255.0 / mse);
+    }
+
+    /// <summary>The interpolation pipeline on a known motion: a picture and a copy of it moved by a global vector
+    /// with one block moved differently. Reports how close the motion field and the synthesised picture are to the
+    /// truth, plus GPU time per stage at the picture's size (<c>--scale</c> enlarges it, e.g. to 4K).</summary>
+    private static void RunInterpSynth(string outPath, string inPng, string? stillsDir, double scale)
+    {
+        var log = new List<string>();
+        Form form = NewProbeWindow("YuCap interp-synth", out VideoBox canvas);
+        var engine = new D3DVideoEngine();
+        form.Shown += (_, _) =>
+        {
+            try
+            {
+                var dev = VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), Settings.DeviceKeyword);
+                if (dev == null) { log.Add("no capture device"); return; }
+                engine.Attach(canvas.Handle);
+                engine.Start(dev, null);
+                engine.Interpolation = true;
+                PumpFor(1000);
+
+                using Bitmap src = new Bitmap(inPng);
+                int w = (int)Math.Round(src.Width * scale) & ~1, h = (int)Math.Round(src.Height * scale) & ~1;
+                using var a0 = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(a0))
+                {
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(src, 0, 0, w, h);
+                }
+                int[] A = ReadPixels(a0);
+                log.Add($"picture {w}x{h} (from {Path.GetFileName(inPng)}, scale {scale})");
+
+                double gdx = 14 * scale, gdy = -8 * scale;             // background motion A -> B
+                var blk = new Rectangle(w * 36 / 100, h * 38 / 100, w * 20 / 100, h * 28 / 100);
+                double bdx = -40 * scale, bdy = 12 * scale;            // the block's own motion
+                int[] B = ShiftPixels(A, w, h, gdx, gdy);
+                int[] blockShift = ShiftPixels(A, w, h, bdx, bdy);
+                for (int y = blk.Top; y < blk.Bottom; y++)
+                    for (int x = blk.Left; x < blk.Right; x++) B[y * w + x] = blockShift[y * w + x];
+
+                double alpha = 0.5;
+                int[] gt = ShiftPixels(A, w, h, gdx * alpha, gdy * alpha);                 // truth at alpha, background
+                int[] gtBlock = ShiftPixels(A, w, h, bdx * alpha, bdy * alpha);
+                var blkMid = new Rectangle(blk.Left + (int)Math.Round(bdx * alpha), blk.Top + (int)Math.Round(bdy * alpha), blk.Width, blk.Height);
+                for (int y = blkMid.Top; y < blkMid.Bottom; y++)
+                    for (int x = blkMid.Left; x < blkMid.Right; x++) gt[y * w + x] = gtBlock[y * w + x];
+
+                using Bitmap bA = MakeBitmap(A, w, h), bB = MakeBitmap(B, w, h);
+                bool ok = engine.DebugInterpSynthetic(bA, bB, alpha, 60, out Bitmap? mid, out float[] field, out Size fs, out string timing);
+                if (!ok || mid == null) { log.Add("synthetic run failed (interpolation unavailable?)"); return; }
+                using (mid)
+                {
+                    log.Add("GPU: " + timing);
+                    int[] M = ReadPixels(mid);
+                    int m = (int)(24 * Math.Max(1, scale));
+                    var bgRect = new Rectangle(m, m, w - 2 * m, h * 30 / 100 - m);              // top band: background only
+                    var blkRect = new Rectangle(blkMid.Left + m, blkMid.Top + m, blkMid.Width - 2 * m, blkMid.Height - 2 * m);
+                    log.Add($"synthesised vs truth (alpha {alpha}): background PSNR {Psnr(M, gt, w, bgRect):0.0} dB, moving block PSNR {Psnr(M, gt, w, blkRect):0.0} dB");
+                    // for scale: how good is just blending A and B, and just showing A
+                    var blend = new int[A.Length];
+                    for (int i = 0; i < A.Length; i++)
+                    {
+                        int r = 0;
+                        for (int sh = 0; sh < 24; sh += 8) r |= ((((A[i] >> sh) & 255) + ((B[i] >> sh) & 255)) / 2) << sh;
+                        blend[i] = r | unchecked((int)0xFF000000);
+                    }
+                    log.Add($"  (a plain 50% blend of A and B scores: background {Psnr(blend, gt, w, bgRect):0.0} dB, block {Psnr(blend, gt, w, blkRect):0.0} dB)");
+
+                    // the field: block centres at 8fx+4 (source pixels)
+                    int nBg = 0, okBg = 0, nBk = 0, okBk = 0; double eBg = 0, eBk = 0;
+                    for (int fy = 0; fy < fs.Height; fy++)
+                        for (int fx = 0; fx < fs.Width; fx++)
+                        {
+                            int cx = fx * 8 + 4, cy = fy * 8 + 4;
+                            double vx = field[(fy * fs.Width + fx) * 2], vy = field[(fy * fs.Width + fx) * 2 + 1];
+                            var inner = Rectangle.Inflate(blk, -m, -m);
+                            var outer = Rectangle.Inflate(blk, m * 2, m * 2);
+                            if (inner.Contains(cx, cy))
+                            {
+                                nBk++; double e = Math.Max(Math.Abs(vx - bdx), Math.Abs(vy - bdy)); eBk += e; if (e <= 1.0 * Math.Max(1, scale)) okBk++;
+                            }
+                            else if (!outer.Contains(cx, cy) && cx > m && cy > m && cx < w - m && cy < h - m)
+                            {
+                                nBg++; double e = Math.Max(Math.Abs(vx - gdx), Math.Abs(vy - gdy)); eBg += e; if (e <= 1.0 * Math.Max(1, scale)) okBg++;
+                            }
+                        }
+                    log.Add($"field {fs.Width}x{fs.Height}: background truth ({gdx:0.#},{gdy:0.#}) -> {okBg}/{nBg} blocks within 1 px (mean error {eBg / Math.Max(1, nBg):0.00} px); " +
+                            $"block truth ({bdx:0.#},{bdy:0.#}) -> {okBk}/{nBk} within 1 px (mean error {eBk / Math.Max(1, nBk):0.00} px)");
+
+                    if (stillsDir != null)
+                    {
+                        Directory.CreateDirectory(stillsDir);
+                        bA.Save(Path.Combine(stillsDir, "synA.png"), ImageFormat.Png);
+                        bB.Save(Path.Combine(stillsDir, "synB.png"), ImageFormat.Png);
+                        mid.Save(Path.Combine(stillsDir, "synMid.png"), ImageFormat.Png);
+                        using Bitmap gtb = MakeBitmap(gt, w, h);
+                        gtb.Save(Path.Combine(stillsDir, "synTruth.png"), ImageFormat.Png);
+                        log.Add("stills saved to " + stillsDir);
+                    }
+                }
             }
             catch (Exception ex) { log.Add("EXCEPTION: " + ex); }
             finally

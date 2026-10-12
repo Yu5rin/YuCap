@@ -419,7 +419,7 @@ public sealed partial class MainForm
             }
 
             // 3. smoothness / load
-            var cases = BuildRenderCases(modes, o.Quick);
+            var cases = BuildRenderCases(modes, o.Quick, o.Target.RefreshHz);
             var vrrNotes = new List<(bool Ll, PacingQuality Q)>();
             foreach (RenderCase c in cases)
             {
@@ -468,6 +468,7 @@ public sealed partial class MainForm
         }
 
         steps.Add((L.T("音声の確認"), secAudio, () => AudioStep(secAudio)));
+        steps.Add((L.T("遅延の確認"), secAudio, () => LatencyStep(secAudio, videoOk)));
         steps.Add((L.T("ダイアログの確認"), secDlg, () => DialogStep(secDlg)));
 
         _testTotal = steps.Count;
@@ -477,7 +478,7 @@ public sealed partial class MainForm
             SetCaption(++_testStep, desc);
             try
             {
-                if (videoOk && !_video.IsRunning && desc != L.T("ダイアログの確認") && desc != L.T("音声の確認"))
+                if (videoOk && !_video.IsRunning && desc != L.T("ダイアログの確認") && desc != L.T("音声の確認") && desc != L.T("遅延の確認"))
                 {
                     Log.Info("test mode: the video stopped - restarting before the next step");
                     Exception? ex = ReplaceEngine("d3d", null);
@@ -541,6 +542,7 @@ public sealed partial class MainForm
         _settings.AvOffsetMs = 0;
         _settings.CropLeft = _settings.CropTop = _settings.CropRight = _settings.CropBottom = 0;
         _settings.LowLatency = false;
+        _settings.Interpolation = false;   // only the 補間 cases of section 3 turn it on
         _settings.ScalingQuality = "fsr";
         _settings.FsrSharpness = 50;
         _settings.Rotation = 0; _settings.Mirror = false;
@@ -823,10 +825,10 @@ public sealed partial class MainForm
     //  3. smoothness / load
     // =============================================================================================
 
-    private sealed record RenderCase(string Label, CaptureMode Mode, ScalingQuality Quality, bool LowLatency);
+    private sealed record RenderCase(string Label, CaptureMode Mode, ScalingQuality Quality, bool LowLatency, bool Interp = false);
     private sealed record PacingQuality(bool Known, bool Working, string Case);
 
-    private static List<RenderCase> BuildRenderCases(List<CaptureMode> modes, bool quick)
+    private static List<RenderCase> BuildRenderCases(List<CaptureMode> modes, bool quick, double refreshHz)
     {
         var list = new List<RenderCase>();
         (string Name, int W, int H, bool Four)[] defs =
@@ -854,15 +856,50 @@ public sealed partial class MainForm
                 }
             }
         }
+
+        // Frame interpolation: every source frame rate the screen refreshes clearly faster than (the
+        // setting only works from refresh >= 1.1 x fps). Per rate the best mode (NV12 first, then the
+        // largest picture), plus the 1080p one when that is a different mode.
+        if (refreshHz > 0)
+        {
+            foreach (int fps in modes.Select(m => m.Fps).Distinct().Where(f => f > 0 && f * 1.1 <= refreshHz).OrderBy(f => f))
+            {
+                var atFps = modes.Where(m => m.Fps == fps).ToList();
+                CaptureMode best = atFps.OrderByDescending(m => m.Compression == "NV12" ? 1 : 0)
+                    .ThenByDescending(m => (long)m.Width * m.Height).First();
+                var picks = new List<CaptureMode> { best };
+                CaptureMode? hd = atFps.Where(m => m.Height == 1080 && !m.Equals(best))
+                    .OrderByDescending(m => m.Compression == "NV12" ? 1 : 0).FirstOrDefault();
+                if (hd != null) picks.Add(hd);
+                foreach (CaptureMode m in picks)
+                    list.Add(new RenderCase($"{ResolutionName(m)}{fps}（{fps}fps） / 標準 / フレーム補間", m, ScalingQuality.Standard, false, true));
+            }
+        }
         return list;
     }
 
+    private static string ResolutionName(CaptureMode m) => m.Height switch
+    {
+        2160 => "4K", 1440 => "1440p", 1080 => "1080p", 720 => "720p", _ => $"{m.Height}p",
+    };
+
     private async Task RenderStep(TestSection sec, RenderCase c, List<(bool Ll, PacingQuality Q)> vrr)
+    {
+        try { await RenderStepCore(sec, c, vrr); }
+        finally
+        {
+            // interpolation belongs to its own cases only; the user's value comes back with the settings snapshot
+            if (_settings.Interpolation) { _settings.Interpolation = false; try { _video.Interpolation = false; } catch { } }
+        }
+    }
+
+    private async Task RenderStepCore(TestSection sec, RenderCase c, List<(bool Ll, PacingQuality Q)> vrr)
     {
         var item = new TestItem { Name = c.Label };
         try
         {
             _settings.ScalingQuality = c.Quality == ScalingQuality.Fsr ? "fsr" : "standard";
+            _settings.Interpolation = c.Interp;
             EnsureEngine(c.LowLatency, c.Mode);
         }
         catch (Exception ex)
@@ -882,6 +919,7 @@ public sealed partial class MainForm
         var recvSw = Stopwatch.StartNew();
         try { st = await CollectStats(RenderMeasureMs); }
         finally { meas = _video.EndMeasure(); }   // also when Esc aborts the wait
+        InterpolationStatus? interpSt = c.Interp ? _video.InterpolationState : null;   // still running: asked after the window
         long recvN = _video.FramesReceived - recv0, presN = _video.FramesPresented - pres0;
         long drops = _video.FramesDropped - drop0;
         double recvEl = recvSw.Elapsed.TotalSeconds;
@@ -891,7 +929,9 @@ public sealed partial class MainForm
         double panel = _topt.Target.RefreshHz;
         double inFps = recvFps;
         double shown = recvEl > 0 ? presN / recvEl : 0;
-        double budget = 1000.0 / Math.Max(1, srcFps);
+        // With interpolation every refresh gets a new picture, so a frame's time budget is one refresh.
+        bool interpOn = c.Interp && interpSt is { Active: true } && panel > 0;
+        double budget = 1000.0 / Math.Max(1, interpOn ? panel : srcFps);
 
         item.Num("映像", $"{ModeLabel(c.Mode)}  → {_topt.Target.Bounds.Width}x{_topt.Target.Bounds.Height} に拡大")
             .Num("拡大の画質", c.Quality == ScalingQuality.Fsr ? "FSR（高画質）" : "標準")
@@ -900,13 +940,30 @@ public sealed partial class MainForm
         Verdict v = Verdict.Ok;
         var why = new List<string>();
 
+        if (c.Interp)
+        {
+            item.Num("フレーム補間", interpOn
+                ? $"働いています（映像 {interpSt!.SourceFps:0.0} fps → モニターの更新 {interpSt.RefreshHz:0} Hz に合わせて間のコマを作成）"
+                : $"働いていません（{InterpIdleText(interpSt)}）");
+            why.Add("フレーム補間は、映像のコマ数よりモニターの更新が十分速いときに、前後のコマの動きから間のコマを作って、更新のたびに新しい絵を出す機能です。補間のために映像が約 1 コマぶん遅れます（この試験では遅延は測っていません）。");
+            if (!interpOn) { v = Worst(v, Verdict.Ng); why.Add("フレーム補間が働いていないため、この項目は補間なしの表示になっています。"); }
+        }
+
         // ---- shown frame rate ----
-        double expect = panel > 0 ? Math.Min(srcFps, panel) : srcFps;
+        double expect = panel > 0 ? (interpOn ? panel : Math.Min(srcFps, panel)) : srcFps;
         double shownRatio = expect > 0 ? shown / expect : 0;
         item.Num("映像のコマ数", $"{inFps:0.0} fps（捨てたコマ {drops}）")
-            .Num("表示されたコマ数", $"{shown:0.0} fps（期待 {expect:0} fps＝映像 {srcFps:0} fps とモニター {panel:0} Hz の小さい方 → {Pct(shownRatio)}）");
+            .Num("表示されたコマ数", interpOn
+                ? $"{shown:0.0} fps（期待 {expect:0} fps＝モニターの更新と同じ数 → {Pct(shownRatio)}）"
+                : $"{shown:0.0} fps（期待 {expect:0} fps＝映像 {srcFps:0} fps とモニター {panel:0} Hz の小さい方 → {Pct(shownRatio)}）");
         if (shownRatio > 1.1) why.Add("モニターのリフレッシュより多くのコマを出しています（同期なしの表示のため、画面の途中で絵が切り替わるティアリングが出ることがあります。可変リフレッシュ対応のモニターでは出ません）。");
-        if (shownRatio < 0.90) { v = Worst(v, Verdict.Ng); why.Add("表示されたコマ数が期待の 9 割に届いていません。"); }
+        bool srcShort = c.Interp && srcFps > 0 && recvFps < srcFps * 0.9;   // the card itself delivers fewer frames than named
+        if (shownRatio < 0.90 && srcShort)
+        {
+            v = Worst(v, Verdict.Warn);
+            why.Add($"キャプチャカードが指定の {srcFps:0} fps で届けられず（実際 {recvFps:0.0} fps）、映像が来ない間は補間する元がないため、表示されたコマ数が期待に届いていません。補間の不具合ではなく、このモードの取り込みの限界です。");
+        }
+        else if (shownRatio < 0.90) { v = Worst(v, Verdict.Ng); why.Add("表示されたコマ数が期待の 9 割に届いていません。"); }
         else if (shownRatio < 0.98) { v = Worst(v, Verdict.Warn); why.Add("表示されたコマ数がわずかに足りません。"); }
 
         // ---- GPU ----
@@ -928,10 +985,19 @@ public sealed partial class MainForm
             item.Num("GPU 処理時間", g > 0 ? $"平均 {g:0.00} ms（細かい数字は取れませんでした）" : "計測できませんでした");
         }
 
+        // ---- latency inside YuCap (frame received -> shown) ----
+        {
+            var ls = TestProbes.LatencyStats(meas?.LatencyMs);
+            string approx = meas is { LatencyEstimated: true } ? "約 " : "";
+            item.Num("映像の遅れ（YuCap の中）", ls != null
+                ? $"中央 {approx}{ls.Value.Median:0} ms ／ 95% {approx}{ls.Value.P95:0} ms"
+                : "測定できません（" + (meas == null ? "記録を取れませんでした" : "画面に出た時刻を取得できなかったため") + "）");
+        }
+
         // ---- pacing ----
         if (meas != null)
         {
-            TestProbes.PacingAnalysis p = TestProbes.AnalyzePacing(meas.Pacing, srcFps, panel);
+            TestProbes.PacingAnalysis p = TestProbes.AnalyzePacing(meas.Pacing, interpOn ? panel : srcFps, panel);
             item.Num("コマの出方の記録", p.Source)
                 .Num("記録の状況", p.StatsNote);
             if (p.Frames > 0)
@@ -979,6 +1045,16 @@ public sealed partial class MainForm
         item.Explanation = string.Join("\n", why);
         sec.Items.Add(item);
     }
+
+    private static string InterpIdleText(InterpolationStatus? st) => st == null ? "状態を取れませんでした" : st.Idle switch
+    {
+        InterpolationIdle.RefreshTooLow => $"モニターの更新 {st.RefreshHz:0} Hz が映像 {st.SourceFps:0.0} fps より十分高くありません",
+        InterpolationIdle.LowLatency => "低遅延モードでは使えません",
+        InterpolationIdle.NoSignal => "映像のコマ数が分かりませんでした",
+        InterpolationIdle.Unavailable => "補間用のシェーダーを使えませんでした",
+        InterpolationIdle.Disabled => "設定がオフでした",
+        _ => "理由不明",
+    };
 
     private void VrrSummary(TestSection sec, List<(bool Ll, PacingQuality Q)> vrr)
     {
@@ -1435,6 +1511,88 @@ public sealed partial class MainForm
         item.Explanation = "「たまっていた音声」は、音を出すまでに待っている量で、そのまま音の遅れの目安になります。小さすぎて音が途切れるなら音声バッファ設定を上げ、遅れが気になるなら下げてください。実際に映像と合っているかは 10 の項目で目で確かめます。";
         sec.Items.Add(item);
     }
+
+    /// <summary>Picture and sound delay inside YuCap / Windows (informational; never NG), with the user's own settings.</summary>
+    private async Task LatencyStep(TestSection sec, bool videoOk)
+    {
+        var item = new TestItem { Name = "遅延（音と映像のずれ）", Verdict = Verdict.Info };
+        _settings.AvOffsetMs = _testSaved?.AvOffsetMs ?? 0;
+        double[] vLat = Array.Empty<double>();
+        bool vEst = false;
+        string vWhy = "Direct3D の映像が動いていませんでした";
+        if (videoOk)
+        {
+            try
+            {
+                EnsureEngine(_testSaved?.LowLatency ?? false, _savedMode);
+                ApplyAvSync();
+                await Wait(SettleMs);
+                _video.BeginMeasure();
+                var aSamples0 = new List<double>();
+                RenderMeasurement? meas = null;
+                try
+                {
+                    var sw0 = Stopwatch.StartNew();
+                    while (sw0.ElapsedMilliseconds < 4000)
+                    {
+                        if (_audio.IsRunning && _audio.LatencyMs > 0) aSamples0.Add(_audio.LatencyMs);
+                        await Wait(100);
+                    }
+                }
+                finally { meas = _video.EndMeasure(); }
+                vLat = meas?.LatencyMs ?? Array.Empty<double>();
+                vEst = meas is { LatencyEstimated: true };
+                if (vLat.Length < 5) vWhy = "画面に出た時刻を取得できませんでした";
+                _latencyAudioSamples = aSamples0;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { vWhy = ex.Message; _latencyAudioSamples = new List<double>(); }
+        }
+        else
+        {
+            ApplyAvSync();
+            _latencyAudioSamples = new List<double>();
+            if (_audio.IsRunning)
+            {
+                var sw = Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < 3000)
+                {
+                    if (_audio.LatencyMs > 0) _latencyAudioSamples.Add(_audio.LatencyMs);
+                    await Wait(100);
+                }
+            }
+        }
+
+        var vs = TestProbes.LatencyStats(vLat);
+        var asx = TestProbes.LatencyStats(_latencyAudioSamples.ToArray());
+        string approx = vEst ? "約 " : "";
+        item.Num("映像の遅れ（YuCap の中）", vs != null
+            ? $"中央 {approx}{vs.Value.Median:0} ms ／ 95% {approx}{vs.Value.P95:0} ms"
+            : $"測定できません（{vWhy}）");
+        item.Num("音の遅れ（YuCap の中）", asx != null
+            ? $"中央 {asx.Value.Median:0} ms ／ 95% {asx.Value.P95:0} ms（取り込みの区切り＋たまっている音声＋出力デバイスの待ち）"
+            : _audio.IsRunning ? "測定できません" : "音声は動いていませんでした（音声なし）");
+        string summary;
+        if (vs != null && asx != null)
+        {
+            double d = asx.Value.Median - vs.Value.Median;
+            string which = Math.Abs(d) < 10 ? "ほぼ同じです" : d > 0 ? $"音のほうが {d:0} ms 遅れています" : $"映像のほうが {-d:0} ms 遅れています";
+            item.Num("映像と音の差", which);
+            summary = which;
+        }
+        else
+        {
+            item.Num("映像と音の差", "求められません（どちらかを測定できなかったため）");
+            summary = vs == null && asx == null ? "映像・音とも測定できませんでした" : vs == null ? "映像の遅れを測定できませんでした" : "音の遅れを測定できませんでした";
+        }
+        item.Num("音ズレ補正の設定", _settings.AvOffsetMs == 0 ? "なし" : _settings.AvOffsetMs > 0 ? $"音を {_settings.AvOffsetMs} ms 遅らせる" : $"音を {-_settings.AvOffsetMs} ms 早める（映像を遅らせる）");
+        item.Summary = summary;
+        item.Explanation = "ここで測っているのは、キャプチャカードから YuCap に届いてから、Windows が画面に映す・音を鳴らすまでの時間です（音ズレ補正・映像の遅延・コマの間隔調整・フレーム補間による遅れも含みます）。" +
+            "キャプチャカードの中や、テレビ・スピーカーの中で生じる遅れは測れないため含まれていません。実際の映像と音のずれは、この数字に加えてそれらの遅れが乗ります。目安として使い、最終的には音ズレ補正の画面で目と耳で合わせてください。";
+        sec.Items.Add(item);
+    }
+
+    private List<double> _latencyAudioSamples = new();
 
     // =============================================================================================
     //  9. dialogs

@@ -151,6 +151,35 @@ internal static partial class Program
             RunGpuBench(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_gpu_bench.txt"));
             return;
         }
+        if (args.Length > 0 && args[0] == "--interp-synth")
+        {
+            string synOut = Path.Combine(Path.GetTempPath(), "yucap_interp_synth.txt"), synIn = "", synStills = "";
+            double synScale = 1;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("--in", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) synIn = args[++i];
+                else if (args[i].Equals("--stills", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) synStills = args[++i];
+                else if (args[i].Equals("--scale", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                    double.TryParse(args[++i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out synScale);
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal)) synOut = args[i];
+            }
+            RunInterpSynth(synOut, synIn, synStills.Length > 0 ? synStills : null, synScale > 0 ? synScale : 1);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--interp-probe")
+        {
+            string interpOut = Path.Combine(Path.GetTempPath(), "yucap_interp_probe.txt");
+            string? interpStills = null;
+            CaptureMode? interpMode = null;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("--mode", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) interpMode = ParseMode(args[++i]);
+                else if (args[i].Equals("--stills", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) interpStills = args[++i];
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal)) interpOut = args[i];
+            }
+            RunInterpProbe(interpOut, interpMode, interpStills);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--hdr-probe")
         {
             RunHdrProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_hdr_probe.txt"));
@@ -191,6 +220,9 @@ internal static partial class Program
                 "  --selftest [出力先]       自己診断を実行して終了\n" +
                 "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
                 "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
+                "  --restart-stress [出力先] [回数] [--fullscreen] [--fast]   映像の再起動を繰り返し、毎回映像が戻るか調べて終了\n" +
+                "  --interp-probe [出力先] [--mode <指定>] [--stills <フォルダ>]   フレーム補間を実機の映像で調べて終了\n" +
+                "  --interp-synth [出力先] --in <画像> [--scale <倍率>] [--stills <フォルダ>]   既知の動きでフレーム補間を調べて終了\n" +
                 "  --test-mode [--display <番号>] [--quick]   自動試験を実行してレポートを作り、終了\n" +
                 "  --check-update      更新の有無を確認して終了"),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);

@@ -47,6 +47,7 @@ public sealed partial class MainForm
             CropRight = _settings.CropRight,
             CropBottom = _settings.CropBottom,
             LowLatency = _settings.LowLatency,
+            Interpolation = _settings.Interpolation,
             SaveDisplaySize = _settings.SaveDisplaySize,
         };
         p.SetMode(_savedMode);
@@ -153,6 +154,7 @@ public sealed partial class MainForm
         _settings.CropRight = p.CropRight;
         _settings.CropBottom = p.CropBottom;
         _settings.LowLatency = p.LowLatency;
+        _settings.Interpolation = p.Interpolation;
         _settings.SaveDisplaySize = p.SaveDisplaySize;
         _savedMode = p.ToMode();
         _cliMode = null;   // an explicit choice overrides the --mode switch, as for a menu pick

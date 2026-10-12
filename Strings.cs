@@ -346,6 +346,31 @@ internal static class L
         ["実行ファイルの場所を特定できません。"] = "Could not determine the executable's location.",
         ["映像デバイスの切り替えに失敗しました。\n\n{0}"] = "Failed to switch video device.\n\n{0}",
         ["音声デバイスの切り替えに失敗しました。\n\n{0}"] = "Failed to switch audio device.\n\n{0}",
+        ["音声の出力先の切り替えに失敗しました。\n\n{0}"] = "Failed to switch the audio output.\n\n{0}",
+        ["音声の出力先"] = "Audio output",
+        ["音声の出力先: {0}"] = "Audio output: {0}",
+        ["Windows の既定"] = "Windows default",
+        ["Windows の既定（{0}）"] = "Windows default ({0})",
+        ["（Windows の既定）"] = "(Windows default)",
+        ["（選んだ出力先は接続されていません）"] = "(the chosen output is not connected)",
+        ["音声の出力先が見つからないため、Windows の既定で再生します: {0}"] = "The chosen audio output was not found; playing on the Windows default: {0}",
+        ["音声の出力先に戻しました: {0}"] = "Back on the chosen audio output: {0}",
+        ["出力先: {0}"] = "Output: {0}",
+        ["音量を上げる"] = "Volume up",
+        ["音量を下げる"] = "Volume down",
+        ["音量を上げる:"] = "Volume up:",
+        ["音量を下げる:"] = "Volume down:",
+        ["遅延（YuCap 内）"] = "Latency (inside YuCap)",
+        ["映像 {0} ／ 音 {1}"] = "video {0} / audio {1}",
+        ["約 {0:0} ms"] = "~{0:0} ms",
+        ["いまの遅れ（YuCap の中だけ）: 映像 {0} ／ 音 {1}"] = "Current delay (inside YuCap only): video {0} / audio {1}",
+        ["→ 測定中、または測定できません"] = "-> measuring, or not measurable",
+        ["→ 映像と音は、ほぼ揃っています"] = "-> video and audio are almost in step",
+        ["→ 音が {0:0} ms 遅れています"] = "-> the audio is {0:0} ms behind",
+        ["→ 映像が {0:0} ms 遅れています"] = "-> the video is {0:0} ms behind",
+        ["キャプチャーボードやテレビの中の遅れは含みません。目安として使ってください。"] = "Delays inside the capture card and the TV are not included. Use this as a guide.",
+        ["目安に合わせる"] = "Match to the guide",
+        ["遅延の確認"] = "Checking latency",
         ["映像モードの変更に失敗しました。\n\n{0}"] = "Failed to change video mode.\n\n{0}",
         ["音声の再初期化に失敗しました。\n\n{0}"] = "Failed to reinitialize audio.\n\n{0}",
 
@@ -371,6 +396,9 @@ internal static class L
          "  --selftest [出力先]       自己診断を実行して終了\n" +
          "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
          "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
+         "  --restart-stress [出力先] [回数] [--fullscreen] [--fast]   映像の再起動を繰り返し、毎回映像が戻るか調べて終了\n" +
+         "  --interp-probe [出力先] [--mode <指定>] [--stills <フォルダ>]   フレーム補間を実機の映像で調べて終了\n" +
+         "  --interp-synth [出力先] --in <画像> [--scale <倍率>] [--stills <フォルダ>]   既知の動きでフレーム補間を調べて終了\n" +
          "  --test-mode [--display <番号>] [--quick]   自動試験を実行してレポートを作り、終了\n" +
          "  --check-update      更新の有無を確認して終了"] =
             "YuCap command line options:\n\n" +
@@ -385,6 +413,9 @@ internal static class L
             "  --selftest [path]       run the self-test and exit\n" +
             "  --gpu-bench [path]      measure the GPU cost of 4K upscaling and exit\n" +
             "  --hdr-probe [path]      write an HDR input report and exit\n" +
+            "  --restart-stress [path] [count] [--fullscreen] [--fast]   restart the video repeatedly, check it returns each time, and exit\n" +
+            "  --interp-probe [path] [--mode <spec>] [--stills <dir>]   test frame interpolation on the live video and exit\n" +
+            "  --interp-synth [path] --in <picture> [--scale <n>] [--stills <dir>]   test frame interpolation on a known motion and exit\n" +
             "  --test-mode [--display <n>] [--quick]   run the automatic test, write the report and exit\n" +
             "  --check-update      check for an update and exit",
         ["現在: {0}\n更新はありません。\n\nエンドポイント:\n{1}"] =
@@ -467,6 +498,25 @@ internal static class L
         ["低遅延モード: オン"] = "Low-latency mode: on",
         ["低遅延モード: オフ"] = "Low-latency mode: off",
         ["低遅延モードを切り替えられなかったため、元に戻しました"] = "Could not switch low-latency mode; reverted",
+
+        // ---- Frame interpolation ----
+        ["フレーム補間"] = "Frame interpolation",
+        ["画面の更新が映像のコマ数より十分速いときだけ、間のコマを作って滑らかにします。映像が 1 コマぶん遅れます。"] =
+            "Only when the display refreshes clearly faster than the video, makes in-between frames to look smoother. Adds one frame of delay.",
+        ["フレーム補間: オフ"] = "Frame interpolation: off",
+        ["フレーム補間: オン"] = "Frame interpolation: on",
+        ["フレーム補間: Direct3D 描画で使えます"] = "Frame interpolation: available with Direct3D rendering",
+        ["フレーム補間: オン（映像が始まると働きます）"] = "Frame interpolation: on (starts once video is running)",
+        ["フレーム補間: オン（{0:0}→{1:0} fps）"] = "Frame interpolation: on ({0:0}→{1:0} fps)",
+        ["フレーム補間: オン（低遅延モード中は使えません）"] = "Frame interpolation: on (not available in low-latency mode)",
+        ["フレーム補間: オン（画面 {0:0}Hz が映像 {1:0}fps より十分高くないため今は働きません）"] =
+            "Frame interpolation: on (idle: the {0:0} Hz display is not clearly faster than the {1:0} fps video)",
+        ["フレーム補間: この環境では使えません"] = "Frame interpolation: not available on this system",
+        ["補間"] = "Interpolation",
+        ["待機（低遅延モード）"] = "idle (low-latency mode)",
+        ["待機（画面 {0:0}Hz）"] = "idle (display {0:0} Hz)",
+        ["待機（映像待ち）"] = "idle (waiting for video)",
+        ["使えません"] = "unavailable",
         ["低遅延"] = "Low latency",
         ["表示どおりの大きさで保存する（拡大の画質を反映。Direct3D 描画のとき）"] = "Save at the displayed size (includes the scaling quality; Direct3D rendering only)",
         ["表示方法"] = "Present",

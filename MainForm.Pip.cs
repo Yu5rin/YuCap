@@ -281,6 +281,9 @@ public sealed partial class MainForm
         TryRegisterHotkey(HkSnapshot, (Keys)_settings.HotkeySnapshot, failed);
         TryRegisterHotkey(HkMute, (Keys)_settings.HotkeyMute, failed);
         TryRegisterHotkey(HkPip, (Keys)_settings.HotkeyPip, failed);
+        // The volume keys auto-repeat while held (no MOD_NOREPEAT), like the arrow keys in the window.
+        TryRegisterHotkey(HkVolUp, (Keys)_settings.HotkeyVolumeUp, failed, repeat: true);
+        TryRegisterHotkey(HkVolDown, (Keys)_settings.HotkeyVolumeDown, failed, repeat: true);
         if (failed.Count == 0)
         {
             _settings.HotkeyConflictNotified = null;   // resolved; warn again if it returns
@@ -298,13 +301,13 @@ public sealed partial class MainForm
         ShowOsd(L.F("ホットキー使用中のため無効: {0}（オプションで変更できます）", signature), OsdLongMilliseconds);
     }
 
-    private void TryRegisterHotkey(int id, Keys combo, List<string> failed)
+    private void TryRegisterHotkey(int id, Keys combo, List<string> failed, bool repeat = false)
     {
         // Defensive: an id left over from a previous register (toggle, click-
         // through safety hatch) makes a re-register fail — clear it first.
         UnregisterHotKey(Handle, id);
         if ((combo & Keys.KeyCode) == Keys.None) return; // disabled
-        uint mods = ModNoRepeat;
+        uint mods = repeat ? 0u : ModNoRepeat;
         if (combo.HasFlag(Keys.Control)) mods |= ModControl;
         if (combo.HasFlag(Keys.Alt)) mods |= ModAlt;
         if (combo.HasFlag(Keys.Shift)) mods |= ModShift;
@@ -383,11 +386,13 @@ public sealed partial class MainForm
 
     private void ShowHotkeySettings()
     {
-        var dlg = Ui.NewDialog(L.T("ホットキー設定"), 440, 250);
+        var dlg = Ui.NewDialog(L.T("ホットキー設定"), 440, 322);
 
         Keys snapCombo = (Keys)_settings.HotkeySnapshot;
         Keys muteCombo = (Keys)_settings.HotkeyMute;
         Keys pipCombo = (Keys)_settings.HotkeyPip;
+        Keys volUpCombo = (Keys)_settings.HotkeyVolumeUp;
+        Keys volDownCombo = (Keys)_settings.HotkeyVolumeDown;
 
         const int tbX = 140, tbWidth = 200;
         int clearX = tbX + tbWidth + Ui.Gap;
@@ -436,7 +441,10 @@ public sealed partial class MainForm
         var (tbMute, _) = MakeRow("ミュート:", Ui.Pad + 36, muteCombo, k => muteCombo = k);
         var (tbPip, _) = MakeRow("PiP切替:", Ui.Pad + 72, pipCombo, k => pipCombo = k);
 
-        int hintY = Ui.Pad + 72 + 36;
+        var (tbVolUp, _) = MakeRow("音量を上げる:", Ui.Pad + 108, volUpCombo, k => volUpCombo = k);
+        var (tbVolDown, _) = MakeRow("音量を下げる:", Ui.Pad + 144, volDownCombo, k => volDownCombo = k);
+
+        int hintY = Ui.Pad + 144 + 36;
         Ui.Hint(L.T("欄を選んでキーの組み合わせを押してください。［解除］または Backspace で割り当てを外せます。"),
             Ui.Pad, hintY, 440 - 2 * Ui.Pad);
 
@@ -447,6 +455,10 @@ public sealed partial class MainForm
             snapCombo = Keys.Control | Keys.Alt | Keys.S;
             muteCombo = Keys.Control | Keys.Alt | Keys.M;
             pipCombo = Keys.Control | Keys.Alt | Keys.P;
+            volUpCombo = Keys.Control | Keys.Alt | Keys.Up;
+            volDownCombo = Keys.Control | Keys.Alt | Keys.Down;
+            tbVolUp.Text = FormatHotkey(volUpCombo);
+            tbVolDown.Text = FormatHotkey(volDownCombo);
             tbSnap.Text = FormatHotkey(snapCombo);
             tbMute.Text = FormatHotkey(muteCombo);
             tbPip.Text = FormatHotkey(pipCombo);
@@ -464,10 +476,11 @@ public sealed partial class MainForm
             // Reject the same combo assigned to two actions: RegisterHotKey
             // would only fail on the second one, and telling the user "another
             // application is using this key" would be false and unactionable.
-            bool duplicate =
-                ((snapCombo & Keys.KeyCode) != Keys.None && snapCombo == muteCombo) ||
-                ((snapCombo & Keys.KeyCode) != Keys.None && snapCombo == pipCombo) ||
-                ((muteCombo & Keys.KeyCode) != Keys.None && muteCombo == pipCombo);
+            Keys[] all = { snapCombo, muteCombo, pipCombo, volUpCombo, volDownCombo };
+            bool duplicate = false;
+            for (int i = 0; i < all.Length; i++)
+                for (int j = i + 1; j < all.Length; j++)
+                    if ((all[i] & Keys.KeyCode) != Keys.None && all[i] == all[j]) duplicate = true;
             if (duplicate)
             {
                 MessageBox.Show(this, L.T("同じキーが複数の操作に割り当てられています。"), "YuCap",
@@ -475,10 +488,8 @@ public sealed partial class MainForm
                 continue;
             }
 
-            Keys reserved = IsReservedCombo(snapCombo) ? snapCombo
-                : IsReservedCombo(muteCombo) ? muteCombo
-                : IsReservedCombo(pipCombo) ? pipCombo
-                : Keys.None;
+            Keys reserved = Keys.None;
+            foreach (Keys c in all) if (reserved == Keys.None && IsReservedCombo(c)) reserved = c;
             if ((reserved & Keys.KeyCode) != Keys.None)
             {
                 MessageBox.Show(this, L.F("{0} は Windows の基本操作と重なるため使えません。", FormatHotkey(reserved)),
@@ -492,6 +503,8 @@ public sealed partial class MainForm
         _settings.HotkeySnapshot = (int)snapCombo;
         _settings.HotkeyMute = (int)muteCombo;
         _settings.HotkeyPip = (int)pipCombo;
+        _settings.HotkeyVolumeUp = (int)volUpCombo;
+        _settings.HotkeyVolumeDown = (int)volDownCombo;
 
         // Don't let this dialog create the same unreachable-PiP state that
         // EnsurePipHotkeyForClickThrough guards against elsewhere: clearing the
@@ -514,6 +527,8 @@ public sealed partial class MainForm
         UnregisterHotKey(Handle, HkSnapshot);
         UnregisterHotKey(Handle, HkMute);
         UnregisterHotKey(Handle, HkPip);
+        UnregisterHotKey(Handle, HkVolUp);
+        UnregisterHotKey(Handle, HkVolDown);
     }
 
     private void ToggleGlobalHotkeys()

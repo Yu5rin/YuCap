@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using NAudio.CoreAudioApi;
@@ -52,6 +53,27 @@ internal sealed class SoftLimitSampleProvider : ISampleProvider
     }
 }
 
+/// <summary>Counts the frames handed to the output, so the audio still waiting in the device buffer can be worked out
+/// (frames given minus frames played). Placed last in the chain, after the limiter.</summary>
+internal sealed class CountingSampleProvider : ISampleProvider
+{
+    private readonly ISampleProvider _source;
+    private long _frames;
+    public CountingSampleProvider(ISampleProvider source) => _source = source;
+    public WaveFormat WaveFormat => _source.WaveFormat;
+    public long Frames => Interlocked.Read(ref _frames);
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        int n = _source.Read(buffer, offset, count);
+        if (n > 0) Interlocked.Add(ref _frames, n / Math.Max(1, _source.WaveFormat.Channels));
+        return n;
+    }
+}
+
+/// <summary>An active audio render (output) endpoint.</summary>
+public sealed record AudioOutputInfo(string Name, string Id);
+
 /// <summary>
 /// WASAPI passthrough: captures from a capture endpoint (the capture card's
 /// line-in) and plays it out of the default render device, with software volume.
@@ -71,6 +93,12 @@ public sealed class AudioEngine : IDisposable
     private float _volume = 1.0f; // 0.0 .. 2.0
     private bool _muted;
     private string? _renderDeviceId;
+    private string? _requestedOutputId;   // null = follow the Windows default
+    private CountingSampleProvider? _counter;
+    private long _lastPacketTick;
+    private double _packetMs = 10;
+    private double _latencyEma;
+    private long _latencyTick;
 
     /// <summary>Target capture-to-playback latency in milliseconds. Actively
     /// held (see OnDataAvailable), so this is roughly the delay you hear.</summary>
@@ -117,6 +145,27 @@ public sealed class AudioEngine : IDisposable
         catch { /* the stream is being torn down */ }
     }
 
+    /// <summary>Friendly name of the render device that is actually playing (null when stopped).</summary>
+    public string? RenderDeviceName { get; private set; }
+    /// <summary>True when playback follows the Windows default output (no device chosen, or the chosen one is missing).</summary>
+    public bool FollowingDefault => _requestedOutputId == null || RenderFellBack;
+    /// <summary>A specific output was requested but it is not available, so the default is playing instead.</summary>
+    public bool RenderFellBack { get; private set; }
+
+    /// <summary>Smoothed time from the capture card handing audio to YuCap until it is played (ms):
+    /// capture packet + our backlog (incl. the extra delay) + what is queued in the output device. 0 when unknown.
+    /// Does not include the capture card's or the speaker's own delay. Safe to read from any thread.</summary>
+    public double LatencyMs
+    {
+        get
+        {
+            if (_output == null) return 0;
+            long t = Volatile.Read(ref _latencyTick);
+            if (t == 0 || Stopwatch.GetTimestamp() - t > 2 * Stopwatch.Frequency) return 0;
+            return Volatile.Read(ref _latencyEma);
+        }
+    }
+
     public string? CurrentDeviceName { get; private set; }
     public string? CurrentDeviceId { get; private set; }
     public bool IsRunning => _output != null;
@@ -144,6 +193,7 @@ public sealed class AudioEngine : IDisposable
     public bool DefaultRenderChanged()
     {
         if (_renderDeviceId == null) return false;
+        if (!FollowingDefault) return false;   // a chosen output does not care what Windows' default is
         try
         {
             using var e = new MMDeviceEnumerator();
@@ -166,6 +216,43 @@ public sealed class AudioEngine : IDisposable
         return result;
     }
 
+    /// <summary>Enumerate active audio render (output) endpoints.</summary>
+    public static List<AudioOutputInfo> EnumerateRenderDevices()
+    {
+        var result = new List<AudioOutputInfo>();
+        using var enumerator = new MMDeviceEnumerator();
+        foreach (var d in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+        {
+            result.Add(new AudioOutputInfo(d.FriendlyName, d.ID));
+            d.Dispose();
+        }
+        return result;
+    }
+
+    /// <summary>Name of the current Windows default output, or null if there is none.</summary>
+    public static string? DefaultRenderName()
+    {
+        try
+        {
+            using var e = new MMDeviceEnumerator();
+            using MMDevice d = e.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            return d.FriendlyName;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>True when the render endpoint exists and is active.</summary>
+    public static bool RenderDeviceActive(string id)
+    {
+        try
+        {
+            using var e = new MMDeviceEnumerator();
+            using MMDevice d = e.GetDevice(id);
+            return d.State == DeviceState.Active;
+        }
+        catch { return false; }
+    }
+
     public static AudioDeviceInfo? PickPreferred(IReadOnlyList<AudioDeviceInfo> devices, string keyword)
     {
         if (devices.Count == 0) return null;
@@ -178,14 +265,31 @@ public sealed class AudioEngine : IDisposable
     /// Start passthrough from the given capture device to the default render device.
     /// Throws on failure; caller catches and reports.
     /// </summary>
-    public void Start(AudioDeviceInfo info)
+    public void Start(AudioDeviceInfo info, string? outputId = null)
     {
         Stop();
 
         var enumerator = new MMDeviceEnumerator();
         MMDevice captureDevice = enumerator.GetDevice(info.Id);
-        MMDevice renderDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        MMDevice? renderDevice = null;
+        bool fellBack = false;
+        if (!string.IsNullOrEmpty(outputId))
+        {
+            try
+            {
+                MMDevice d = enumerator.GetDevice(outputId);
+                if (d.State == DeviceState.Active) renderDevice = d; else d.Dispose();
+            }
+            catch { /* removed or unknown id */ }
+            if (renderDevice == null)
+            {
+                fellBack = true;
+                Log.Info("Audio: chosen output is not available - using the Windows default");
+            }
+        }
+        renderDevice ??= enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
         enumerator.Dispose();
+        Log.Info($"Audio: output = {renderDevice.FriendlyName} ({(string.IsNullOrEmpty(outputId) || fellBack ? "Windows default" : "chosen")})");
 
         var capture = new WasapiCapture(captureDevice);
         var buffer = new BufferedWaveProvider(capture.WaveFormat)
@@ -212,10 +316,11 @@ public sealed class AudioEngine : IDisposable
         var volumeProvider = new VolumeSampleProvider(sample) { Volume = _muted ? 0f : _volume };
         // Gain first, then the limiter catches whatever the gain pushed over.
         var limiter = new SoftLimitSampleProvider(volumeProvider);
+        var counter = new CountingSampleProvider(limiter);
 
         var output = new WasapiOut(renderDevice, AudioClientShareMode.Shared, true,
             Math.Max(MinBufferMs, BufferMilliseconds));
-        output.Init(limiter);
+        output.Init(counter);
         output.PlaybackStopped += (_, e) => { if (e.Exception != null) IsFaulted = true; };
 
         capture.DataAvailable += OnDataAvailable;
@@ -224,6 +329,11 @@ public sealed class AudioEngine : IDisposable
         _buffer = buffer;
         _volumeProvider = volumeProvider;
         _limiter = limiter;
+        _counter = counter;
+        _requestedOutputId = string.IsNullOrEmpty(outputId) ? null : outputId;
+        RenderFellBack = fellBack;
+        RenderDeviceName = renderDevice.FriendlyName;
+        _lastPacketTick = 0; _packetMs = 10; _latencyEma = 0; Volatile.Write(ref _latencyTick, 0);
         _output = output;
         _captureDevice = captureDevice;
         _renderDevice = renderDevice;
@@ -243,10 +353,42 @@ public sealed class AudioEngine : IDisposable
 
     private byte[]? _dropScratch;
 
+    /// <summary>Capture thread: update the smoothed latency (packet interval + backlog + device queue).</summary>
+    private void UpdateLatency(BufferedWaveProvider buffer)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (_lastPacketTick != 0)
+        {
+            double iv = (now - _lastPacketTick) * 1000.0 / Stopwatch.Frequency;
+            if (iv > 0 && iv < 200) _packetMs = _packetMs * 0.9 + iv * 0.1;
+        }
+        _lastPacketTick = now;
+
+        double queued = 0;
+        var counter = _counter;
+        var output = _output;
+        if (counter != null && output != null)
+        {
+            try
+            {
+                WaveFormat of = output.OutputWaveFormat;
+                double played = output.GetPosition() * 1000.0 / of.AverageBytesPerSecond;
+                double given = counter.Frames * 1000.0 / counter.WaveFormat.SampleRate;
+                queued = Math.Max(0, given - played);
+            }
+            catch { queued = 0; }
+        }
+        double total = _packetMs + buffer.BufferedDuration.TotalMilliseconds + queued;
+        double prev = _latencyEma;
+        _latencyEma = Volatile.Read(ref _latencyTick) == 0 ? total : prev * 0.9 + total * 0.1;
+        Volatile.Write(ref _latencyTick, now);
+    }
+
     private void OnDataAvailable(object? sender, WaveInEventArgs e)
     {
         var buffer = _buffer;
         if (buffer == null) return;
+        try { UpdateLatency(buffer); } catch { /* measurement only */ }
 
         // Capture and render run on independent clocks, so the backlog drifts —
         // and nothing pulls it back down on its own. The setting is therefore
@@ -362,6 +504,10 @@ public sealed class AudioEngine : IDisposable
         _buffer = null;
         _volumeProvider = null;
         _limiter = null;
+        _counter = null;
+        RenderDeviceName = null;
+        RenderFellBack = false;
+        _requestedOutputId = null;
         _renderDevice = null;
         _captureDevice = null;
         _renderDeviceId = null;

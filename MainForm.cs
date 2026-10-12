@@ -31,7 +31,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const int PbtApmSuspend = 0x4, PbtApmResumeSuspend = 0x7, PbtApmResumeAutomatic = 0x12;
 
     // Global hotkeys (RegisterHotKey).
-    private const int HkSnapshot = 1, HkMute = 2, HkPip = 3;
+    private const int HkSnapshot = 1, HkMute = 2, HkPip = 3, HkVolUp = 4, HkVolDown = 5;
     private const uint ModAlt = 0x1, ModControl = 0x2, ModShift = 0x4, ModNoRepeat = 0x4000;
     [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
@@ -89,6 +89,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     // that must follow its state is kept in lists.
     private readonly List<ToolStripMenuItem> _qualityRoots = new();
     private readonly List<ToolStripMenuItem> _qualityItems = new();
+    private readonly List<ToolStripMenuItem> _interpItems = new();
     private readonly List<ToolStripMenuItem> _sharpnessItems = new();
 
     private ToolStripMenuItem _miAdjust = null!;       // 表示 → 映像の調整...
@@ -129,6 +130,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private ToolStripMenuItem _videoDevicesRoot = null!;
     private ToolStripMenuItem _audioDevicesRoot = null!;
+    private ToolStripMenuItem _audioOutputRoot = null!;
     private ToolStripMenuItem _videoModeRoot = null!;
     private ToolStripMenuItem _cmiVideoModeRoot = null!;
 
@@ -664,12 +666,16 @@ public sealed partial class MainForm : Form, IMessageFilter
         _audioDevicesRoot.DropDownOpening += (_, _) => RebuildAudioDeviceList();
         _videoDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _audioDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
+        _audioOutputRoot = new ToolStripMenuItem(L.T("音声の出力先"));
+        _audioOutputRoot.DropDownOpening += (_, _) => RebuildAudioOutputList();
+        _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _videoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
         _videoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_videoModeRoot);
         _videoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
 
         device.DropDownItems.Add(_videoDevicesRoot);
         device.DropDownItems.Add(_audioDevicesRoot);
+        device.DropDownItems.Add(_audioOutputRoot);
         device.DropDownItems.Add(_videoModeRoot);
         device.DropDownItems.Add(new ToolStripSeparator());
         _miMute = new ToolStripMenuItem(L.T("ミュート"), null, (_, _) => ToggleMute())
@@ -734,6 +740,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildAspectSubmenu());
         view.DropDownItems.Add(BuildQualitySubmenu());
+        view.DropDownItems.Add(BuildInterpolationItem());
         _miAdjust = new ToolStripMenuItem(L.T("映像の調整..."), null, (_, _) => ShowAdjustmentsDialog());
         view.DropDownItems.Add(_miAdjust);
         _miCrop = new ToolStripMenuItem(L.T("黒い縁の切り取り..."), null, (_, _) => ShowCropDialog());
@@ -899,6 +906,14 @@ public sealed partial class MainForm : Form, IMessageFilter
         return m;
     }
 
+    /// <summary>フレーム補間 (check item). Greyed out unless the engine can interpolate (Direct3D only).</summary>
+    private ToolStripMenuItem BuildInterpolationItem()
+    {
+        var item = new ToolStripMenuItem(L.T("フレーム補間"), null, (_, _) => ToggleInterpolation());
+        _interpItems.Add(item);
+        return item;
+    }
+
     /// <summary>拡大の画質 > 標準 / 高画質（FSR）, シャープさ. Greyed out unless the active
     /// engine can do it (Direct3D only) and the display mode actually scales smoothly.</summary>
     private ToolStripMenuItem BuildQualitySubmenu()
@@ -1054,6 +1069,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         _ctx.Items.Add(BuildAspectSubmenu());
         _ctx.Items.Add(BuildQualitySubmenu());
+        _ctx.Items.Add(BuildInterpolationItem());
         _ctx.Items.Add(BuildSizeSubmenu());
         _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
         _cmiVideoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_cmiVideoModeRoot);
@@ -1124,6 +1140,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gGlobal, L.T("スナップショットを保存"), FormatHotkey((Keys)_settings.HotkeySnapshot));
         Row(gGlobal, L.T("ミュート"), FormatHotkey((Keys)_settings.HotkeyMute));
         Row(gGlobal, L.T("PiP の切替"), FormatHotkey((Keys)_settings.HotkeyPip));
+        Row(gGlobal, L.T("音量を上げる"), FormatHotkey((Keys)_settings.HotkeyVolumeUp));
+        Row(gGlobal, L.T("音量を下げる"), FormatHotkey((Keys)_settings.HotkeyVolumeDown));
         if (!_settings.GlobalHotkeys)
             Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です）"));
 
@@ -1408,7 +1426,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 Log.Info("InitAudio: no audio device found");
                 return;
             }
-            _audio.Start(pick);
+            _audio.Start(pick, _settings.AudioOutputDeviceId);
             _currentAudioInfo = pick;
         }
         catch (Exception ex)
@@ -1463,8 +1481,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             var devices = AudioEngine.EnumerateDevices();
             bool present = _currentAudioInfo != null && devices.Any(d => d.Id == _currentAudioInfo.Id);
+            // A chosen output (not "follow Windows"): leave it when it disappears, come back when it returns.
+            string? wantOut = _settings.AudioOutputDeviceId;
+            bool outActive = wantOut != null && AudioEngine.RenderDeviceActive(wantOut);
+            bool outVanished = _audio.IsRunning && wantOut != null && !outActive && !_audio.RenderFellBack;
+            bool outReturned = _audio.IsRunning && wantOut != null && outActive && _audio.RenderFellBack;
             if (_audio.IsRunning &&
-                (_audio.IsFaulted || _audio.DefaultRenderChanged() ||
+                (_audio.IsFaulted || _audio.DefaultRenderChanged() || outVanished || outReturned ||
                  (_currentAudioInfo != null && !present)))
             {
                 _audio.Stop();
@@ -1477,9 +1500,14 @@ public sealed partial class MainForm : Form, IMessageFilter
                 {
                     try
                     {
-                        _audio.Start(pick);
+                        _audio.Start(pick, wantOut);
                         _currentAudioInfo = pick;
-                        ShowOsd(L.F("音声を再接続しました: {0}", pick.Name), OsdLongMilliseconds);
+                        if (outVanished && _audio.RenderFellBack)
+                            ShowOsd(L.F("音声の出力先が見つからないため、Windows の既定で再生します: {0}", _audio.RenderDeviceName ?? "?"), OsdLongMilliseconds);
+                        else if (outReturned && !_audio.RenderFellBack)
+                            ShowOsd(L.F("音声の出力先に戻しました: {0}", _audio.RenderDeviceName ?? "?"), OsdLongMilliseconds);
+                        else
+                            ShowOsd(L.F("音声を再接続しました: {0}", pick.Name), OsdLongMilliseconds);
                     }
                     catch { /* retried on the next change event */ }
                 }
@@ -2358,6 +2386,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _video.Adjustments = CurrentAdjustments();   // ignored by engines without the capability
             _video.Crop = new Padding(_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
             _video.LowLatency = _settings.LowLatency;    // read by the engine at its next start
+            _video.Interpolation = _settings.Interpolation;
         }
         catch (Exception ex)
         {
@@ -2460,11 +2489,15 @@ public sealed partial class MainForm : Form, IMessageFilter
         : ms < 0 ? L.F("音声を {0}ms 早める", -ms)
         : L.T("補正なし");
 
+    /// <summary>"54 ms", "約 54 ms" for an estimate, "—" when unknown (0).</summary>
+    private static string LatencyText(double ms, bool estimated) =>
+        ms <= 0 ? "—" : estimated ? L.F("約 {0:0} ms", ms) : $"{ms:0} ms";
+
     private void ShowAvSyncDialog()
     {
         int before = _settings.AvOffsetMs;   // キャンセル puts this back
 
-        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440, 262);
+        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440, 408);
         int w = dlg.ClientSize.Width;
         int inner = w - 2 * Ui.Pad;
 
@@ -2486,8 +2519,18 @@ public sealed partial class MainForm : Form, IMessageFilter
         };
         var hint = Ui.Hint(L.T("映像の動きと音が合う位置にしてください。手をたたく動画などで合わせると分かりやすいです。"),
             Ui.Pad, 122, inner);
+        // Live numbers: how long picture and sound take inside YuCap / Windows (offset included).
+        var live = new Label
+        {
+            AutoSize = false, Location = new Point(Ui.Pad, 170), Size = new Size(inner, 44),
+            Font = new Font(dlg.Font, FontStyle.Bold),
+        };
+        var liveHint = Ui.Hint(L.T("キャプチャーボードやテレビの中の遅れは含みません。目安として使ってください。"),
+            Ui.Pad, 218, inner);
+        var match = Ui.Button(L.T("目安に合わせる"), Ui.Pad, 258, 140);
+        long matchedTick = 0;
         var mfHint = Ui.Hint(L.T("音声を早める補正は Direct3D 描画のときに使えます。標準の描画では 0 として扱います。"),
-            Ui.Pad, 164, inner);
+            Ui.Pad, 300, inner);
         mfHint.Visible = !_video.SupportsVideoDelay && track.Value < 0;
 
         bool snapping = false;
@@ -2505,7 +2548,44 @@ public sealed partial class MainForm : Form, IMessageFilter
         var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
         reset.Click += (_, _) => track.Value = 0;
 
-        dlg.Controls.AddRange(new Control[] { left, right, track, value, hint, mfHint, reset });
+        // audio latency - video latency; positive = the sound comes later than the picture.
+        bool Diff(out double v, out double a, out double d)
+        {
+            v = _video.IsRunning ? _video.VideoLatencyMs : 0;
+            a = _audio.IsRunning ? _audio.LatencyMs : 0;
+            d = a - v;
+            return v > 0 && a > 0;
+        }
+        void UpdateLive()
+        {
+            bool known = Diff(out double v, out double a, out double d);
+            string line = L.F("いまの遅れ（YuCap の中だけ）: 映像 {0} ／ 音 {1}",
+                LatencyText(v, _video.VideoLatencyEstimated), LatencyText(a, false));
+            string verdict = !known ? L.T("→ 測定中、または測定できません")
+                : Math.Abs(d) < 10 ? L.T("→ 映像と音は、ほぼ揃っています")
+                : d > 0 ? L.F("→ 音が {0:0} ms 遅れています", d)
+                : L.F("→ 映像が {0:0} ms 遅れています", -d);
+            live.Text = line + "\n" + verdict;
+            bool settling = matchedTick != 0 && Environment.TickCount64 - matchedTick < 2500;   // the numbers still show the old offset
+            match.Enabled = known && !settling;
+        }
+        match.Click += (_, _) =>
+        {
+            if (!Diff(out _, out _, out double d)) return;
+            // The measured numbers already contain the current offset, so the correction is added to it.
+            // Positive d (sound later) lowers the offset (earlier sound / later picture); the dialog moves in 10 ms steps.
+            int target = (int)Math.Round((track.Value - d) / 10.0, MidpointRounding.AwayFromZero) * 10;
+            track.Value = Math.Clamp(target, track.Minimum, track.Maximum);
+            matchedTick = Environment.TickCount64;
+            UpdateLive();
+        };
+        var timer = new System.Windows.Forms.Timer { Interval = 250 };
+        timer.Tick += (_, _) => UpdateLive();
+        dlg.FormClosed += (_, _) => timer.Dispose();
+        UpdateLive();
+        timer.Start();
+
+        dlg.Controls.AddRange(new Control[] { left, right, track, value, hint, live, liveHint, match, mfHint, reset });
         Ui.AddOkCancel(dlg);
 
         if (dlg.ShowDialog(this) != DialogResult.OK)
@@ -2526,6 +2606,51 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateChecks();
         UpdateStatus();
         ShowOsd(L.F("拡大の画質: {0}", quality == "fsr" ? L.T("高画質（FSR）") : L.T("標準")));
+    }
+
+    private void ToggleInterpolation()
+    {
+        if (!_video.SupportsInterpolation) return;
+        _settings.Interpolation = !_settings.Interpolation;
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        ShowOsd(InterpolationOsdText(), _settings.Interpolation ? OsdLongMilliseconds : null);
+    }
+
+    /// <summary>The OSD line after toggling フレーム補間: on and running, or on but idle with the reason.</summary>
+    private string InterpolationOsdText()
+    {
+        if (!_settings.Interpolation) return L.T("フレーム補間: オフ");
+        if (!_video.SupportsInterpolation) return L.T("フレーム補間: Direct3D 描画で使えます");
+        InterpolationStatus? st = _video.InterpolationState;
+        if (st == null || st.Idle == InterpolationIdle.NoSignal) return L.T("フレーム補間: オン（映像が始まると働きます）");
+        return st.Idle switch
+        {
+            InterpolationIdle.None => L.F("フレーム補間: オン（{0:0}→{1:0} fps）", st.SourceFps, st.RefreshHz),
+            InterpolationIdle.LowLatency => L.T("フレーム補間: オン（低遅延モード中は使えません）"),
+            InterpolationIdle.RefreshTooLow => L.F("フレーム補間: オン（画面 {0:0}Hz が映像 {1:0}fps より十分高くないため今は働きません）", st.RefreshHz, st.SourceFps),
+            InterpolationIdle.Unavailable => L.T("フレーム補間: この環境では使えません"),
+            _ => L.T("フレーム補間: オン"),
+        };
+    }
+
+    /// <summary>The info overlay's 補間 line.</summary>
+    private string InterpolationInfoText()
+    {
+        if (!_video.SupportsInterpolation) return "—";
+        if (!_settings.Interpolation) return L.T("オフ");
+        InterpolationStatus? st = _video.InterpolationState;
+        if (st == null) return "—";
+        return st.Idle switch
+        {
+            InterpolationIdle.None => $"{st.SourceFps:0}→{st.RefreshHz:0} fps",
+            InterpolationIdle.LowLatency => L.T("待機（低遅延モード）"),
+            InterpolationIdle.RefreshTooLow => L.F("待機（画面 {0:0}Hz）", st.RefreshHz),
+            InterpolationIdle.NoSignal => L.T("待機（映像待ち）"),
+            InterpolationIdle.Unavailable => L.T("使えません"),
+            _ => L.T("オフ"),
+        };
     }
 
     private void SetSharpness(int pct)
@@ -2903,6 +3028,64 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
+    /// <summary>Submenu 音声の出力先: the Windows default plus every active output, rebuilt each time it opens.</summary>
+    private void RebuildAudioOutputList()
+    {
+        _audioOutputRoot.DropDownItems.Clear();
+        string? chosen = _settings.AudioOutputDeviceId;
+        try
+        {
+            string defName = AudioEngine.DefaultRenderName() ?? L.T("なし");
+            var def = new ToolStripMenuItem(L.F("Windows の既定（{0}）", defName)) { Checked = chosen == null };
+            def.Click += (_, _) => SwitchAudioOutput(null, null);
+            _audioOutputRoot.DropDownItems.Add(def);
+            _audioOutputRoot.DropDownItems.Add(new ToolStripSeparator());
+
+            var outputs = AudioEngine.EnumerateRenderDevices();
+            foreach (var o in outputs)
+            {
+                var info = o;
+                var item = new ToolStripMenuItem(info.Name) { Checked = chosen != null && info.Id == chosen };
+                item.Click += (_, _) => SwitchAudioOutput(info.Id, info.Name);
+                _audioOutputRoot.DropDownItems.Add(item);
+            }
+            if (chosen != null && !outputs.Any(o => o.Id == chosen))
+                _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（選んだ出力先は接続されていません）")) { Checked = true, Enabled = false });
+            if (outputs.Count == 0)
+                _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
+        }
+        catch (Exception ex)
+        {
+            Log.Info("RebuildAudioOutputList failed: " + ex.Message);
+            _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
+        }
+    }
+
+    /// <summary>Play the capture audio on another output (null = follow the Windows default). Volume, mute and
+    /// the A/V delay live in the engine / settings and carry over to the restarted stream.</summary>
+    private void SwitchAudioOutput(string? id, string? name)
+    {
+        string? previous = _settings.AudioOutputDeviceId;
+        _settings.AudioOutputDeviceId = id;
+        if (_audio.IsRunning && _currentAudioInfo != null)
+        {
+            try { _audio.Start(_currentAudioInfo, id); }
+            catch (Exception ex)
+            {
+                _settings.AudioOutputDeviceId = previous;
+                MessageBox.Show(this, L.F("音声の出力先の切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
+                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                try { _audio.Start(_currentAudioInfo, previous); } catch { /* the next device change retries */ }
+                UpdateStatus();
+                return;
+            }
+            // volume / mute / ExtraDelayMs are fields of the engine, so the new stream has them; OnDataAvailable re-queues the extra delay as silence
+        }
+        SaveSettings();
+        ShowOsd(L.F("音声の出力先: {0}", name ?? _audio.RenderDeviceName ?? AudioEngine.DefaultRenderName() ?? L.T("Windows の既定")));
+        UpdateStatus();
+    }
+
     private void SwitchVideoDevice(VideoDeviceInfo info)
     {
         if (_frozen) ToggleFreeze();
@@ -3047,7 +3230,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         try
         {
-            _audio.Start(info);
+            _audio.Start(info, _settings.AudioOutputDeviceId);
             _currentAudioInfo = info;
             ShowOsd(L.F("音声: {0}", info.Name));
         }
@@ -3098,7 +3281,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _audio.BufferMilliseconds = (int)num.Value;
         if (_audio.IsRunning && _currentAudioInfo != null)
         {
-            try { _audio.Start(_currentAudioInfo); }
+            try { _audio.Start(_currentAudioInfo, _settings.AudioOutputDeviceId); }
             catch (Exception ex)
             {
                 MessageBox.Show(this, L.F("音声の再初期化に失敗しました。\n\n{0}", Errors.Describe(ex)),
@@ -3171,6 +3354,8 @@ public sealed partial class MainForm : Form, IMessageFilter
                 case HkSnapshot: SaveSnapshot(); break;
                 case HkMute: ToggleMute(); break;
                 case HkPip: TogglePip(); break;
+                case HkVolUp: NudgeVolume(+VolumeStep); break;
+                case HkVolDown: NudgeVolume(-VolumeStep); break;
             }
             return;
         }
@@ -3316,11 +3501,14 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         if (_audio.CurrentDeviceName != null)
         {
-            // Measured latency floor = audio currently sitting in the buffer.
-            int delay = (int)(Math.Round(_audio.BufferedMs / 10) * 10);
+            // Whole in-app audio delay (capture packet + backlog + device queue); backlog only until measured.
+            double lat = _audio.LatencyMs > 0 ? _audio.LatencyMs : _audio.BufferedMs;
+            int delay = (int)(Math.Round(lat / 10) * 10);
             string shortName = Ellipsize(_audio.CurrentDeviceName, 20);
             _lblAudio.Text = $"{aLabel}: {shortName}  {L.T("遅延")} ~{delay}ms";
-            _lblAudio.ToolTipText = $"{aLabel}: {_audio.CurrentDeviceName}  {L.T("遅延")} ~{delay}ms";
+            _lblAudio.ToolTipText = $"{aLabel}: {_audio.CurrentDeviceName}  {L.T("遅延")} ~{delay}ms"
+                + "\n" + L.F("出力先: {0}", (_audio.RenderDeviceName ?? "?")
+                    + (_audio.FollowingDefault ? " " + L.T("（Windows の既定）") : string.Empty));
         }
         else
         {
@@ -3377,6 +3565,14 @@ public sealed partial class MainForm : Form, IMessageFilter
         _miCrop.Enabled = _video.SupportsCrop;
         _miCrop.ToolTipText = _video.SupportsCrop
             ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+        foreach (var it in _interpItems)
+        {
+            it.Enabled = _video.SupportsInterpolation;
+            it.Checked = _video.SupportsInterpolation && _settings.Interpolation;
+            it.ToolTipText = _video.SupportsInterpolation
+                ? L.T("画面の更新が映像のコマ数より十分速いときだけ、間のコマを作って滑らかにします。映像が 1 コマぶん遅れます。")
+                : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+        }
         _miLowLatency.Enabled = _video.SupportsLowLatency;
         _miLowLatency.Checked = _video.SupportsLowLatency && _settings.LowLatency;
         _miLowLatency.ToolTipText = _video.SupportsLowLatency
@@ -3467,6 +3663,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (keyData == (Keys)_settings.HotkeySnapshot) { SaveSnapshot(); return true; }
             if (keyData == (Keys)_settings.HotkeyMute) { ToggleMute(); return true; }
             if (keyData == (Keys)_settings.HotkeyPip) { TogglePip(); return true; }
+            if (keyData == (Keys)_settings.HotkeyVolumeUp) { NudgeVolume(+VolumeStep); return true; }
+            if (keyData == (Keys)_settings.HotkeyVolumeDown) { NudgeVolume(-VolumeStep); return true; }
         }
 
         // Bit 30 of lParam ("previous key state") is set on every WM_KEYDOWN
@@ -3669,7 +3867,11 @@ public sealed partial class MainForm : Form, IMessageFilter
             L.T("画面") + ": " + screen,
             L.T("拡大") + ": " + DescribeScaling(),
             L.T("遅延") + ": " + delay,
+            L.T("遅延（YuCap 内）") + ": " + L.F("映像 {0} ／ 音 {1}",
+                LatencyText(_video.IsRunning ? _video.VideoLatencyMs : 0, _video.VideoLatencyEstimated),
+                LatencyText(_audio.IsRunning ? _audio.LatencyMs : 0, false)),
             L.T("色調整") + ": " + color,
+            L.T("補間") + ": " + InterpolationInfoText(),
             L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
         }));
         PositionInfo();
