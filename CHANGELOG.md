@@ -3,6 +3,18 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)、
 バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [1.7.0] - 2026-10-12
+
+### 追加
+- **テストモード（自動試験）** — ヘルプ → テストモードで、映像の取り込み・表示のなめらかさ・GPU の負荷・通知の表示・
+  高画質拡大（FSR）の効き・HDR・各機能・ダイアログの表示崩れを自動で調べ、結果をレポートにまとめます。
+  レポートは「ピクチャ」フォルダの YuCap\テストレポート に保存され、終わるとブラウザで開きます。
+  試験中に変えた設定は、終了したとき（途中で中止したときも）元に戻ります
+
+### 修正
+- 「黒い縁の切り取り」を英語表示にしたとき、ボタンの文字が切れたり、ラベルが入力欄に重なったりする問題を直しました。
+  ほかのダイアログのボタンも、文字の長さに合わせて広がるようにしました
+
 ## [1.6.0] - 2026-10-12
 
 ### 追加
@@ -199,6 +211,7 @@
 
 初回リリース。
 
+[1.7.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.6.0
 [1.5.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.5.0
 [1.4.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.4.0
