@@ -3,6 +3,18 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)、
 バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [1.7.1] - 2026-10-12
+
+### 修正
+- **Direct3D 描画で、60fps の映像が 60Hz の画面でカクつく問題を直しました** — 1440p60 を高画質（FSR）で表示すると、
+  4コマに1コマが2回表示されていました。画面の書き換えに合わせて表示するようにし、映像の遅れは数 ms 増えるだけです。
+  遅れを最小にしたいときの低遅延モードは、これまでどおりです
+- Direct3D 描画で映像モードを変えた直後などに、まれに映像が出ないことがある問題への対策を入れました
+
+### 変更
+- テストレポートの画面に「保存（HTML）」「保存（テキスト）」ボタンを付けました。ファイル名は実行した日時になります。
+  保存したファイルが文字化けしないようにしました
+
 ## [1.7.0] - 2026-10-12
 
 ### 追加
@@ -211,6 +223,7 @@
 
 初回リリース。
 
+[1.7.1]: https://github.com/Yu5rin/YuCap/releases/tag/v1.7.1
 [1.7.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.6.0
 [1.5.0]: https://github.com/Yu5rin/YuCap/releases/tag/v1.5.0
