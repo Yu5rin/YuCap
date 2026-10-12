@@ -128,6 +128,23 @@ internal static partial class Program
             return;
         }
 
+        // Restart stress (Direct3D only): ResetHandle/Attach/Start N times, check the picture returns each time.
+        if (args.Length > 0 && args[0] == "--restart-stress")
+        {
+            int n = 40;
+            bool stressFull = false, stressFast = false;
+            string stressOut = Path.Combine(Path.GetTempPath(), "yucap_restart_stress.txt");
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("--fullscreen", StringComparison.OrdinalIgnoreCase)) stressFull = true;
+                else if (args[i].Equals("--fast", StringComparison.OrdinalIgnoreCase)) stressFast = true;
+                else if (int.TryParse(args[i], out int v) && v > 0) n = v;
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal)) stressOut = args[i];
+            }
+            RunRestartStress(stressOut, n, stressFull, stressFast);
+            return;
+        }
+
         // GPU benchmark / HDR probe (Direct3D only; see Program.Probes.cs).
         if (args.Length > 0 && args[0] == "--gpu-bench")
         {
@@ -538,7 +555,7 @@ internal static partial class Program
                             engine.VideoDelayMs = 200;
                             System.Threading.Thread.Sleep(1500);
                             double actual = engine.VideoDelayActualMs;
-                            log.Add($"video delay 200ms: actual\u2248{actual:0}ms ({(actual >= 180 && actual <= 230 ? "ok" : "CHECK")})");
+                            log.Add($"video delay 200ms: actual\u2248{actual:0}ms ({(actual >= 180 && actual <= 230 + engine.VideoPacingMarginMs ? "ok" : "CHECK")})");
                             engine.VideoDelayMs = 0;
                             System.Threading.Thread.Sleep(500);
                             log.Add($"video delay off: actual={engine.VideoDelayActualMs:0}ms");
@@ -687,7 +704,15 @@ internal static partial class Program
                         after.Tick += (_, _) =>
                         {
                             after.Stop();
-                            log.Add($"AFTER RESTART: {VerifyVideo(engine)}");
+                            string afterVerdict = VerifyVideo(engine);
+                            log.Add($"AFTER RESTART: {afterVerdict}");
+                            if (afterVerdict.StartsWith("NOT RENDERING"))
+                            {
+                                // Tell "the renderer shows nothing" from "the source itself is blank".
+                                log.Add($"  received={engine.FramesReceived} presented={engine.FramesPresented}"
+                                    + $" margin={engine.VideoPacingMarginMs:0.0}ms"
+                                    + $" sourceMeanLuma={MeanLuma(engine.PhotoSnapshot()):0.0}");
+                            }
                             Finish();
                         };
                         after.Start();

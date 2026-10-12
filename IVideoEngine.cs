@@ -120,6 +120,9 @@ public interface IVideoEngine : IDisposable
     /// <summary>Measured delay of the frames actually shown while <see cref="VideoDelayMs"/> is
     /// set (ms); 0 when no delay is active or nothing was shown yet.</summary>
     double VideoDelayActualMs => 0;
+    /// <summary>Extra hold-back the renderer adds on its own to even out arrival jitter (display-driven
+    /// vsync pacing), in ms; part of what <see cref="VideoDelayActualMs"/> measures. 0 when not used.</summary>
+    double VideoPacingMarginMs => 0;
     /// <summary>Cut a black border off the picture (Direct3D only). Left/Top/Right/Bottom are in
     /// SOURCE pixels, before rotation. <see cref="DisplayResolution"/> becomes the cropped (then
     /// rotated) size, so layout, FSR and stills all follow the cropped picture; at least 64x64

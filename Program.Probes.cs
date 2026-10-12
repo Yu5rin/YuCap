@@ -12,6 +12,7 @@ namespace YuCap;
 // Diagnostic commands that answer hardware questions before the hardware is at hand:
 //   --gpu-bench <out.txt>   can this GPU upscale to 4K at the source frame rate?
 //   --hdr-probe <out.txt>   does the capture card deliver HDR, and is Windows HDR on?
+//   --restart-stress <out.txt> [N]   restart the Direct3D preview N times; does video always come back?
 // Both run the Direct3D engine in a real (small) window on the live capture device.
 internal static partial class Program
 {
@@ -35,6 +36,142 @@ internal static partial class Program
         if (sorted.Count == 0) return "n/a";
         int i = Math.Clamp((int)Math.Ceiling(p * sorted.Count) - 1, 0, sorted.Count - 1);
         return sorted[i].ToString("0.00");
+    }
+
+    // =====================================================================
+    //  --restart-stress
+    // =====================================================================
+
+    /// <summary>Quick "is there a picture" test on one snapshot: true when the image is not uniform.</summary>
+    private static bool SnapshotHasPicture(IVideoEngine engine)
+    {
+        using Bitmap? a = engine.Snapshot();
+        if (a == null) return false;
+        int minL = 255, maxL = 0;
+        for (int gy = 1; gy <= 4; gy++)
+            for (int gx = 1; gx <= 4; gx++)
+            {
+                Color c = a.GetPixel(a.Width * gx / 5, a.Height * gy / 5);
+                int l = (c.R + c.G + c.B) / 3;
+                minL = Math.Min(minL, l); maxL = Math.Max(maxL, l);
+            }
+        return maxL - minL >= 8;
+    }
+
+    private static void RunRestartStress(string outPath, int count, bool fullscreen, bool fast)
+    {
+        var log = new List<string>();
+        Form form = NewProbeWindow("YuCap restart-stress", out VideoBox canvas);
+        IVideoEngine engine = VideoEngines.Create("d3d");
+        var rng = new Random(12345);
+
+        form.Shown += (_, _) =>
+        {
+            try
+            {
+                log.Add($"YuCap {Application.ProductVersion} - restart stress, {count} iterations (Direct3D)"
+                    + (fullscreen ? ", borderless fullscreen" : "") + (fast ? ", fast extra restarts" : ""));
+                if (fullscreen)
+                {
+                    // Same state as the self-test's restart: borderless, screen-sized, topmost.
+                    form.FormBorderStyle = FormBorderStyle.None;
+                    form.Bounds = Screen.FromControl(form).Bounds;
+                    form.TopMost = true;
+                    Application.DoEvents();
+                }
+                var dev = VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), Settings.DeviceKeyword);
+                if (dev == null) { log.Add("no capture device"); return; }
+                engine.Attach(canvas.Handle);
+                engine.Start(dev, null);
+                PumpFor(500);
+                List<CaptureMode> modes = engine.GetModes();
+                CaptureMode? Find(int w, int h, int fps) => modes.Where(m => m.Width == w && m.Height == h && m.Fps == fps)
+                    .OrderBy(m => m.Compression == "NV12" ? 0 : 1).FirstOrDefault();
+                CaptureMode?[] cycle = { Find(1920, 1080, 120), Find(2560, 1440, 60) };
+                log.Add("modes under test: " + string.Join(" / ", cycle.Select(m => m == null ? "default" : $"{m.Compression} {m.Width}x{m.Height}@{m.Fps}")));
+                log.Add(string.Empty);
+
+                var firstRx = new List<double>(); var firstPresent = new List<double>(); var firstPicture = new List<double>();
+                int failures = 0, noPresent = 0;
+                for (int i = 1; i <= count; i++)
+                {
+                    CaptureMode? mode = cycle[(i / 2) % 2];   // changes every other iteration
+                    Log.Info($"STRESS iteration {i}/{count} start");
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    string err = "";
+                    try
+                    {
+                        if (fast)
+                        {
+                            // Restart again before the previous session has shown anything.
+                            for (int extra = rng.Next(1, 4); extra > 0; extra--)
+                            {
+                                canvas.ResetHandle();
+                                engine.Attach(canvas.Handle);
+                                engine.Start(dev, mode);
+                                PumpFor(rng.Next(0, 500));
+                            }
+                        }
+                        canvas.ResetHandle();
+                        engine.Attach(canvas.Handle);
+                        engine.Start(dev, mode);
+                        Rectangle scr = canvas.ClientRectangle;
+                        engine.SetVideoRect(new Rectangle(0, 0, scr.Width, scr.Height));
+                    }
+                    catch (Exception ex) { err = ex.Message.Split((char)10)[0]; }
+                    long startMs = sw.ElapsedMilliseconds;
+                    sw.Restart();
+                    double tRx = -1, tPres = -1, tPic = -1;
+                    while (err == "" && sw.ElapsedMilliseconds < 3000)
+                    {
+                        PumpFor(50);
+                        if (tRx < 0 && engine.FramesReceived > 0) tRx = sw.ElapsedMilliseconds;
+                        if (tPres < 0 && engine.FramesPresented > 0) tPres = sw.ElapsedMilliseconds;
+                        if (SnapshotHasPicture(engine)) { tPic = sw.ElapsedMilliseconds; break; }
+                    }
+                    bool ok = err == "" && tPic >= 0;
+                    if (ok && VerifyVideo(engine).StartsWith("NOT RENDERING")) ok = false;
+                    double lateRecovery = -1;
+                    if (!ok && err == "")
+                    {
+                        // Does it ever come back? (A black picture that never recovers is the bug.)
+                        var rs = System.Diagnostics.Stopwatch.StartNew();
+                        while (rs.ElapsedMilliseconds < 5000) { PumpFor(50); if (SnapshotHasPicture(engine)) { lateRecovery = 3000 + rs.ElapsedMilliseconds; break; } }
+                    }
+                    if (!ok) failures++;
+                    if (tPres < 0) noPresent++;
+                    if (tRx >= 0) firstRx.Add(tRx);
+                    if (tPres >= 0) firstPresent.Add(tPres);
+                    if (tPic >= 0) firstPicture.Add(tPic);
+                    string line = $"#{i,3} {(ok ? "ok  " : "FAIL")} mode={(mode == null ? "default" : $"{mode.Width}x{mode.Height}@{mode.Fps}")}" +
+                        $" start={startMs}ms firstRx={tRx:0}ms firstPresent={tPres:0}ms firstPicture={tPic:0}ms" +
+                        $" margin={engine.VideoPacingMarginMs:0.0}ms rx={engine.FramesReceived} presented={engine.FramesPresented}" +
+                        $" renderLoopPresented={(engine.FramesPresented > 0 ? "yes" : "NO")}" +
+                        (err != "" ? " error=" + err : "") + (lateRecovery >= 0 ? $" recoveredAfter={lateRecovery:0}ms" : (ok ? "" : " NEVER-RECOVERED"));
+                    log.Add(line);
+                    Log.Info("STRESS " + line);
+                }
+
+                log.Add(string.Empty);
+                string Pct(List<double> v)
+                {
+                    var t = v.OrderBy(x => x).ToList();
+                    return t.Count == 0 ? "n/a" : $"p50={Percentile(t, 0.5)} p90={Percentile(t, 0.9)} max={Percentile(t, 1.0)} ms";
+                }
+                log.Add($"SUMMARY failures={failures}/{count}  never-presented={noPresent}");
+                log.Add("  first frame received: " + Pct(firstRx));
+                log.Add("  first present:        " + Pct(firstPresent));
+                log.Add("  first picture:        " + Pct(firstPicture));
+            }
+            catch (Exception ex) { log.Add("EXCEPTION: " + ex); }
+            finally
+            {
+                try { engine.Dispose(); } catch { }
+                try { File.WriteAllLines(outPath, log); } catch { }
+                form.BeginInvoke(new Action(form.Close));
+            }
+        };
+        Application.Run(form);
     }
 
     // =====================================================================

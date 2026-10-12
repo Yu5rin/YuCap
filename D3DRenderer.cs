@@ -287,6 +287,9 @@ internal sealed class D3DRenderer : IDisposable
             _syncInterval = 1;
             _presentFlags = PresentFlags.None;
             _swapFlags = SwapChainFlags.FrameLatencyWaitableObject;
+            // Display-driven pacing renders right after each refresh; a third buffer keeps that work
+            // from waiting for the buffer the display is still reading.
+            desc.BufferCount = 3;
             _swap = factory.CreateSwapChainForComposition(Device, desc);
             try
             {
@@ -454,8 +457,8 @@ internal sealed class D3DRenderer : IDisposable
     // =====================================================================
 
     /// <summary>Render thread: size the ring for <paramref name="delayMs"/> at <paramref name="fps"/>
-    /// (fps x delay + 2 slots, so the frame that is due always still exists while newer ones
-    /// keep arriving), or free it when the delay is 0. The ring only grows while a delay is
+    /// (fps x delay + 3 slots, so the frame that is due always still exists while newer ones
+    /// keep arriving, plus one frame of backlog), or free it when the delay is 0. The ring only grows while a delay is
     /// active, so dragging a slider does not reallocate textures at every step.
     /// Returns true when the active/inactive state or the size changed.</summary>
     public bool ConfigureRing(int delayMs, int fps)
@@ -468,7 +471,7 @@ internal sealed class D3DRenderer : IDisposable
                 FreeRing();
                 return true;
             }
-            int need = (int)Math.Ceiling((fps > 0 ? fps : 60) * delayMs / 1000.0) + 2;
+            int need = (int)Math.Ceiling((fps > 0 ? fps : 60) * delayMs / 1000.0) + 3;
             if (need == _ringNeed) return false;
             if (_ringNeed == 0) _shownSeq = _ringSeq;   // nothing in the ring is "pending" yet
             _ringNeed = need;
@@ -494,6 +497,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             slot = _ring[0];
             foreach (Slot s in _ring) if (s.Seq < slot.Seq) slot = s;
+            if (slot.Seq > _shownSeq) _ringDropped++;   // overwritten before its turn
         }
         if (slot.W != w || slot.H != h || slot.Gpu != gpu || (gpu ? slot.Nv12 : slot.Y) == null)
         {
@@ -557,20 +561,35 @@ internal sealed class D3DRenderer : IDisposable
         }
     }
 
-    /// <summary>Make the newest frame whose arrival is at least the delay ago the current one
-    /// (GPU-side copy into the frame textures that Convert reads). Older due frames that were
-    /// never shown - because the render thread was waiting for vsync - are simply skipped, never
-    /// lost before their turn: they stay in the ring until the newest due one replaces them.</summary>
+    private long _ringDropped;
+    private readonly List<Slot> _elig = new();
+
+    /// <summary>Frames the ring lost (skipped or overwritten before being shown) since the last call.</summary>
+    public long TakeRingDropped()
+    {
+        lock (FrameLock) { long d = _ringDropped; _ringDropped = 0; return d; }
+    }
+
+    /// <summary>Make a frame whose arrival is at least the delay ago the current one (GPU-side copy
+    /// into the frame textures that Convert reads). It is the OLDEST such frame that has not been
+    /// shown, so a late frame followed by an on-time one costs a frame of backlog instead of a
+    /// repeated and a dropped frame (a small jitter buffer); only when more than two are waiting
+    /// is the surplus skipped, leaving one behind. With a source much faster than the display this
+    /// shows every Nth frame, as expected.</summary>
     public bool AdvanceDelayed(long nowTicks, long delayTicks, out long arrival)
     {
         arrival = 0;
         lock (FrameLock)
         {
-            Slot? best = null;
+            _elig.Clear();
             foreach (Slot s in _ring)
-                if (s.Seq > _shownSeq && s.Arrival <= nowTicks - delayTicks && (best == null || s.Seq > best.Seq))
-                    best = s;
-            if (best == null) return false;
+                if (s.Seq > _shownSeq && s.Arrival <= nowTicks - delayTicks) _elig.Add(s);
+            int c = _elig.Count;
+            if (c == 0) return false;
+            _elig.Sort((a, b) => a.Seq.CompareTo(b.Seq));
+            int idx = c >= 3 ? c - 2 : 0;
+            Slot best = _elig[idx];
+            _ringDropped += idx;
 
             EnsureFrameTextures(best.W, best.H, best.Gpu);
             if (best.Gpu) Ctx.CopyResource(_nv12!, best.Nv12!);
@@ -583,6 +602,10 @@ internal sealed class D3DRenderer : IDisposable
             return true;
         }
     }
+
+    /// <summary>True when frames are presented once per refresh (vsync) through a swap chain
+    /// that offers a frame-latency waitable; false for the tearing / sync-0 path.</summary>
+    public bool VsyncPaced => _syncInterval != 0 && LatencyWaitable != IntPtr.Zero;
 
     // =====================================================================
     //  Render passes (render thread)

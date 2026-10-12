@@ -57,6 +57,11 @@ internal sealed class TestReport
 
     public TestReport(string folder) { Folder = folder; }
 
+    /// <summary>File name (without extension) named after the run's start; no colons, so it is valid on Windows.</summary>
+    public string FileStem => $"YuCap テストレポート {Started:yyyy-MM-dd HH-mm-ss}";
+    public string HtmlPath => Path.Combine(Folder, FileStem + ".html");
+    public string TextPath => Path.Combine(Folder, FileStem + ".txt");
+
     public TestSection AddSection(string title, string lead = "")
     {
         var s = new TestSection { Title = title, Lead = lead };
@@ -68,15 +73,15 @@ internal sealed class TestReport
 
     public int Count(Verdict v) => AllItems.Count(i => i.Verdict == v);
 
-    /// <summary>Write report.html and report.txt (called after every section, so an abort leaves a partial report).</summary>
+    /// <summary>Write the dated .html and .txt, both UTF-8 with BOM (called after every section, so an abort leaves a partial report).</summary>
     public void Save()
     {
         try
         {
             Directory.CreateDirectory(Folder);
             var utf8 = new UTF8Encoding(true);
-            File.WriteAllText(Path.Combine(Folder, "report.html"), ToHtml(), utf8);
-            File.WriteAllText(Path.Combine(Folder, "report.txt"), ToText(), utf8);
+            File.WriteAllText(HtmlPath, ToHtml(), utf8);
+            File.WriteAllText(TextPath, ToText(), utf8);
         }
         catch (Exception ex) { Log.Info("test report: save failed - " + ex.Message); }
     }
@@ -117,7 +122,59 @@ internal sealed class TestReport
 
     // ------------------------------------------------------------------ html
 
+    // Saves the page itself (or the embedded text) as a file; no external resources. The names are baked in.
+    internal const string SaveScript = @"
+(function(){
+var STEM='@@STEM@@';
+var st=document.getElementById('save-status');
+function say(t){st.textContent=t;}
+function save(name,mime,getText,bom,desc,ext){
+  say('');
+  var text=getText();
+  var data=(bom?'\uFEFF':'')+text;
+  var blob=new Blob([data],{type:mime+';charset=utf-8'});
+  function fallback(){
+    var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+    document.body.appendChild(a);a.click();
+    setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},1000);
+    say('保存しました');
+  }
+  if(window.showSaveFilePicker){
+    var acc={};acc[mime]=[ext];
+    window.showSaveFilePicker({suggestedName:name,types:[{description:desc,accept:acc}]}).then(function(h){
+      return h.createWritable().then(function(w){return w.write(blob).then(function(){return w.close();});});
+    }).then(function(){say('保存しました');}).catch(function(e){
+      if(e&&e.name==='AbortError')return;
+      try{fallback();}catch(e2){say('保存できませんでした: '+(e2&&e2.message||e2));}
+    });
+  }else{
+    try{fallback();}catch(e){say('保存できませんでした: '+(e&&e.message||e));}
+  }
+}
+document.getElementById('save-html').addEventListener('click',function(){
+  save(STEM+'.html','text/html',function(){return '<!DOCTYPE html>\n'+document.documentElement.outerHTML;},false,'HTML ファイル','.html');
+});
+document.getElementById('save-text').addEventListener('click',function(){
+  save(STEM+'.txt','text/plain',function(){return document.getElementById('report-text').textContent.replace(/<\\\//g,'</');},true,'テキストファイル','.txt');
+});
+})();
+";
+
     private static string E(string s) => WebUtility.HtmlEncode(s);
+
+    /// <summary>The image as a data: URI so the single .html file shows everything wherever it is
+    /// saved or sent; falls back to the relative name when the file cannot be read.</summary>
+    private string ImageSrc(string file)
+    {
+        try
+        {
+            string path = Path.Combine(Folder, file);
+            if (File.Exists(path))
+                return "data:image/png;base64," + Convert.ToBase64String(File.ReadAllBytes(path));
+        }
+        catch { }
+        return file;
+    }
 
     public string ToHtml()
     {
@@ -148,8 +205,15 @@ table.num{border-collapse:collapse;margin:6px 0;font-size:14px}table.num td{padd
 .item img{max-width:100%;border:1px solid var(--line);margin-top:8px}
 .state{display:inline-block;padding:2px 12px;border-radius:6px;font-weight:700}.state.中止,.state.エラー{background:var(--ng);color:#fff}.state.実行中{background:var(--warn);color:#fff}.state.完了{background:var(--ok);color:#fff}
 .lead{color:var(--sub);margin:0 0 6px;white-space:pre-line}
+.tools{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 14px}
+.tools button{font:inherit;font-size:14px;padding:4px 14px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+.tools button:hover{border-color:var(--info)}
+#save-status{font-size:13px;color:var(--sub)}
+@media print{.tools{display:none}}
 ");
         sb.Append("</style></head><body><main>");
+        sb.Append("<div class=\"tools\"><button type=\"button\" id=\"save-html\">保存（HTML）</button>" +
+                  "<button type=\"button\" id=\"save-text\">保存（テキスト）</button><span id=\"save-status\"></span></div>");
         sb.Append($"<h1>YuCap テストレポート <span class=\"state {E(State)}\">{E(State)}</span></h1>");
         sb.Append($"<div class=\"sub\">{E(Header)}\n開始: {Started:yyyy-MM-dd HH:mm:ss}</div>");
         if (!string.IsNullOrEmpty(Failure))
@@ -196,11 +260,14 @@ table.num{border-collapse:collapse;margin:6px 0;font-size:14px}table.num td{padd
                     sb.Append($"<div class=\"bar\"><span class=\"l\">{E(l)}</span><i style=\"width:{Math.Max(1, (int)(f * 300))}px\"></i>{E(t)}</div>");
                 if (it.Explanation.Length > 0) sb.Append($"<p class=\"why\">{E(it.Explanation)}</p>");
                 foreach (string img in it.Images)
-                    sb.Append($"<div><img src=\"{E(img)}\" alt=\"{E(img)}\"></div>");
+                    sb.Append($"<div><img src=\"{E(ImageSrc(img))}\" alt=\"{E(img)}\"></div>");
                 sb.Append("</div>");
             }
         }
-        sb.Append("</main></body></html>");
+        sb.Append("</main>");
+        sb.Append("<script type=\"text/plain\" id=\"report-text\">").Append(ToText().Replace("</", "<\\/")).Append("</script>");
+        sb.Append("<script id=\"save-script\">").Append(SaveScript.Replace("@@STEM@@", FileStem)).Append("</script>");
+        sb.Append("</body></html>");
         return sb.ToString();
     }
 }

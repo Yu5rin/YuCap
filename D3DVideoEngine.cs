@@ -139,6 +139,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         set { _videoDelayMs = Math.Clamp(value, 0, 1000); _s?.Poke(); }
     }
     public double VideoDelayActualMs => _s?.DelayActualMs ?? 0;
+    public double VideoPacingMarginMs => _s?.PacingMarginMs ?? 0;
 
     public List<CaptureMode> GetModes() => new(_modes);
     public bool IsRectUpdateStuck(int thresholdMs) => false;
@@ -350,6 +351,63 @@ public sealed class D3DVideoEngine : IVideoEngine
         public string PresentMode => _r?.PresentMode ?? string.Empty;
         public D3DRenderer? Renderer => _r;
 
+        // Display-driven pacing (vsync path): frames are held for a small margin so that arrival
+        // jitter does not decide which refresh shows them. The capture thread measures the jitter.
+        private double _marginMs;
+        public double PacingMarginMs => Volatile.Read(ref _marginMs);
+        private volatile bool _ringActive;     // the ring (not the single frame slot) receives frames
+        private long _lastArrival;
+        private double _nominalMs;
+        private readonly double[] _dev = new double[90];
+        private int _devCount, _devPos, _sinceCalc;
+        private double _loggedMargin;
+
+        [DllImport("dwmapi.dll")] private static extern int DwmFlush();
+
+        /// <summary>Capture thread: fold one arrival into the jitter estimate (p90 of how far the
+        /// arrival interval strays from nominal) and update the margin.</summary>
+        private void TrackArrival(long arrival)
+        {
+            double nominal = Fps > 0 ? 1000.0 / Fps : 16.7;
+            double maxMargin = nominal * 0.5;
+            if (_nominalMs == 0)
+            {
+                _nominalMs = nominal;
+                double m0 = Math.Clamp(nominal * 0.25, 2.0, Math.Max(2.0, maxMargin));
+                Volatile.Write(ref _marginMs, m0);
+                _loggedMargin = m0;
+            }
+            long last = _lastArrival;
+            _lastArrival = arrival;
+            if (last == 0) return;
+            double iv = (arrival - last) * 1000.0 / Stopwatch.Frequency;
+            if (iv > nominal * 6) return;   // a stall, not jitter
+            if (iv > nominal * 0.5 && iv < nominal * 1.5) _nominalMs = _nominalMs * 0.98 + iv * 0.02;
+            _dev[_devPos] = Math.Abs(iv - _nominalMs);
+            _devPos = (_devPos + 1) % _dev.Length;
+            if (_devCount < _dev.Length) _devCount++;
+            if (++_sinceCalc < 30 || _devCount < 60) return;
+            _sinceCalc = 0;
+            double[] tmp = new double[_devCount];
+            Array.Copy(_dev, tmp, _devCount);
+            Array.Sort(tmp);
+            double p90 = tmp[(int)(tmp.Length * 0.9)];
+            double target = Math.Clamp(p90, 2.0, Math.Max(2.0, maxMargin));
+            double cur = Volatile.Read(ref _marginMs);
+            double next = cur * 0.7 + target * 0.3;
+            Volatile.Write(ref _marginMs, next);
+            if (Math.Abs(next - _loggedMargin) >= Math.Max(2.0, _loggedMargin * 0.4))
+            {
+                _loggedMargin = next;
+                Log.Info($"D3D: pacing margin now {next:0.0}ms (arrival jitter p90 {p90:0.0}ms)");
+            }
+        }
+
+        // Start-up trace (temporary diagnostics): state transitions are logged for the first 2 s only.
+        private readonly long _t0 = Stopwatch.GetTimestamp();
+        private long TraceMs => (Stopwatch.GetTimestamp() - _t0) * 1000 / Stopwatch.Frequency;
+        private bool Early => TraceMs < 2000;
+
         public Session(D3DVideoEngine e, IntPtr hwnd, VideoDeviceInfo info, CaptureMode? mode)
         {
             _e = e; _hwnd = hwnd; _info = info; _wantedMode = mode;
@@ -530,56 +588,108 @@ public sealed class D3DVideoEngine : IVideoEngine
             int trackedDelay = 0, delaySamples = 0;
             bool delayLogged = false;
 
+            // Vsync path: the display, not the capture card, clocks presentation (see below).
+            // Low-latency mode (sync 0 / tearing) keeps presenting on arrival.
+            bool displayDriven = r.VsyncPaced;
+            bool presentedLast = false;
+            bool marginLogged = false;
+            int iter = 0;
+            bool dueLogged = false;
+            // Presentation must never depend on pacing state alone: the first frame of a session, any
+            // change of the destination rectangle or window size, and a long silence all force a present.
+            Rectangle lastDstSeen = Rectangle.Empty;
+            long lastPresentTick = Stopwatch.GetTimestamp();
+
             while (!_stopping)
             {
-                // With a video delay the next frame is due at a known time: sleep until then
-                // instead of until the next capture wake-up, or every frame would be shown up
-                // to one frame late.
-                int waitMs = 250;
-                int delayBefore = _e._videoDelayMs;
-                if (delayBefore > 0)
+                bool newFrame, reconvert, dirty;
+                iter++;
+                int userDelayMs = _e._videoDelayMs;
+                double marginMs = displayDriven ? PacingMarginMs : 0;
+                if (displayDriven && !marginLogged && marginMs > 0)
                 {
-                    long due = r.NextDueTicks(delayBefore * Stopwatch.Frequency / 1000);
-                    if (due != long.MaxValue)
-                        waitMs = (int)Math.Clamp((due - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency, 1, 250);
+                    marginLogged = true;   // the capture thread sets the first margin with the first frame
+                    Log.Info($"D3D: pacing = display-driven, margin={marginMs:0.0}ms");
                 }
-                _wake.WaitOne(waitMs);
-                if (_stopping) break;
+                int delayMs = userDelayMs + (int)Math.Round(marginMs);   // what the ring holds frames back by
+                bool waitedLatency = false;
+                long arrivalShown = 0;
 
-                // Stills first: they must see the state the user is looking at.
-                ServiceRequests(r);
+                if (displayDriven)
+                {
+                    // One iteration per refresh. After a Present the swap chain's waitable signals
+                    // when the display has taken that frame; when we did not present, DwmFlush
+                    // gives the same once-per-refresh beat. Then pick what to show.
+                    long t0 = Stopwatch.GetTimestamp();
+                    if (presentedLast && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
+                    else if (DwmFlush() != 0) _wake.WaitOne(4);
+                    if ((Stopwatch.GetTimestamp() - t0) * 1000 < Stopwatch.Frequency) _wake.WaitOne(3);   // returned at once: do not spin
+                    waitedLatency = true;
+                    if (iter <= 4 && Early)
+                        Log.Info($"D3D: t+{TraceMs}ms iter={iter} waited {(Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency:0.0}ms via {(presentedLast ? "latency-waitable" : "DwmFlush")}");
+                    presentedLast = false;
+                    if (_stopping) break;
+                    ServiceRequests(r);
+                    if (!IsWindow(_hwnd)) { RequestStop("window gone"); break; }
+                    Interlocked.Exchange(ref _frameReady, 0);   // arrivals feed the ring here, not presentation
+                    newFrame = false;
+                }
+                else
+                {
+                    // With a video delay the next frame is due at a known time: sleep until then
+                    // instead of until the next capture wake-up, or every frame would be shown up
+                    // to one frame late.
+                    int waitMs = 250;
+                    if (userDelayMs > 0)
+                    {
+                        long due = r.NextDueTicks(userDelayMs * Stopwatch.Frequency / 1000);
+                        if (due != long.MaxValue)
+                            waitMs = (int)Math.Clamp((due - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency, 1, 250);
+                    }
+                    _wake.WaitOne(waitMs);
+                    if (_stopping) break;
 
-                if (!IsWindow(_hwnd)) { RequestStop("window gone"); break; }
+                    // Stills first: they must see the state the user is looking at.
+                    ServiceRequests(r);
 
-                bool newFrame = Interlocked.Exchange(ref _frameReady, 0) == 1;
-                bool reconvert = Interlocked.Exchange(ref _dirtyConvert, 0) == 1;
-                bool dirty = Interlocked.Exchange(ref _dirtyCompose, 0) == 1;
+                    if (!IsWindow(_hwnd)) { RequestStop("window gone"); break; }
+                    newFrame = Interlocked.Exchange(ref _frameReady, 0) == 1;
+                    delayMs = userDelayMs;
+                }
+                reconvert = Interlocked.Exchange(ref _dirtyConvert, 0) == 1;
+                dirty = Interlocked.Exchange(ref _dirtyCompose, 0) == 1;
 
-                // Video delay: the capture thread files frames into the renderer's ring; show
-                // the newest one that arrived at least `delay` ago. Done after any wait for the
-                // swap chain below, so frames that became due meanwhile are not left behind.
-                int delayMs = _e._videoDelayMs;
+                // The capture thread files frames into the renderer's ring; show the oldest
+                // due one that arrived at least `delayMs` ago (user delay + pacing margin).
                 if (r.ConfigureRing(delayMs, Fps))
                 {
                     Log.Info(delayMs > 0
                         ? $"D3D: video delay configured {delayMs}ms (ring {r.RingSlots} frames)"
                         : "D3D: video delay off");
                 }
-                bool delayed = delayMs > 0;
-                bool waitedLatency = false;
-                long arrivalShown = 0;
-                if (delayed)
+                bool ringed = delayMs > 0;
+                _ringActive = ringed;
+                if (ringed)
                 {
                     newFrame = false;   // capture arrivals do not drive presentation here
-                    long delayTicks = delayMs * Stopwatch.Frequency / 1000;
-                    if (r.HasDueFrame(Stopwatch.GetTimestamp(), delayTicks))
+                    long delayTicks = drawnOnce ? delayMs * Stopwatch.Frequency / 1000 : 0;   // the first frame needs no pacing margin
+                    bool due = r.HasDueFrame(Stopwatch.GetTimestamp(), delayTicks);
+                    if (!dueLogged && Early && (due || iter <= 3))
                     {
-                        if (r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
+                        if (due) dueLogged = true;
+                        Log.Info($"D3D: t+{TraceMs}ms iter={iter} ringed delay={delayMs}ms due={due} hasFrame={r.HasFrame} rx={FramesReceived} presentedLast={presentedLast}");
+                    }
+                    if (due)
+                    {
+                        if (!waitedLatency && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
                         waitedLatency = true;
                         newFrame = r.AdvanceDelayed(Stopwatch.GetTimestamp(), delayTicks, out arrivalShown);
                     }
+                    long rd = r.TakeRingDropped();
+                    if (rd > 0) Interlocked.Add(ref _dropped, rd);
                 }
-                else
+                bool delayed = userDelayMs > 0;
+                if (!delayed)
                 {
                     trackedDelay = 0;
                     Volatile.Write(ref _delayActual, 0);
@@ -595,8 +705,19 @@ public sealed class D3DVideoEngine : IVideoEngine
                     dirty = true;
                 }
 
-                if ((newFrame || reconvert || dirty) && r.HasFrame && client.Width > 0 && client.Height > 0)
+                Rectangle dstSeen = _e.CurrentDst();
+                if (dstSeen != lastDstSeen) dirty = true;                     // rect change: independent of Poke
+                if (!drawnOnce) dirty = true;                                 // session start: present as soon as there is a frame
+                else if ((Stopwatch.GetTimestamp() - lastPresentTick) * 4 > Stopwatch.Frequency) dirty = true;   // nothing shown for 250 ms
+                if (!r.HasFrame || client.Width <= 0 || client.Height <= 0)
                 {
+                    // Nothing to draw yet: keep the requests instead of dropping them.
+                    if (reconvert) Volatile.Write(ref _dirtyConvert, 1);
+                }
+                else if (newFrame || reconvert || dirty)
+                {
+                    lastDstSeen = dstSeen;
+                    lastPresentTick = Stopwatch.GetTimestamp();
                     if (newFrame)
                     {
                         // Wait until the swap chain has room, so latency stays at one frame.
@@ -622,6 +743,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                         break;
                     }
                     drawnOnce = true;
+                    presentedLast = true;
                     Interlocked.Increment(ref _presented);
                     if (delayed && newFrame && arrivalShown != 0)
                     {
@@ -644,7 +766,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     if (!firstPresentLogged)
                     {
                         firstPresentLogged = true;
-                        Log.Info("D3D: first frame presented");
+                        Log.Info($"D3D: first frame presented (t+{TraceMs}ms)");
                     }
                 }
 
@@ -760,10 +882,12 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if (sample == null) continue;
 
                         Interlocked.Increment(ref _inFrames);
+                        TrackArrival(arrival);
                         SubmitSample(r, sample, width, height, yuv, arrival, ref texIid);
-                        if (Interlocked.Exchange(ref _frameReady, 1) == 1) Interlocked.Increment(ref _dropped);
+                        // With the ring active the render thread counts what the ring loses.
+                        if (Interlocked.Exchange(ref _frameReady, 1) == 1 && !_ringActive) Interlocked.Increment(ref _dropped);
                         TryWake();
-                        if (firstFrame) { firstFrame = false; Log.Info("D3D: first frame received"); }
+                        if (firstFrame) { firstFrame = false; Log.Info($"D3D: first frame received (t+{TraceMs}ms)"); }
                     }
                 }
             }

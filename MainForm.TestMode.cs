@@ -308,13 +308,15 @@ public sealed partial class MainForm
 
         if (openReport)
         {
-            try
-            {
-                Process.Start(new ProcessStartInfo(Path.Combine(_rep.Folder, "report.html")) { UseShellExecute = true });
-            }
-            catch (Exception ex) { Log.Info("test mode: could not open the report - " + ex.Message); }
+            OpenInBrowser(_rep.HtmlPath);
         }
         if (Program.Options.TestMode) Close();
+    }
+
+    private static void OpenInBrowser(string path)
+    {
+        try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+        catch (Exception ex) { Log.Info("test mode: could not open the report - " + ex.Message); }
     }
 
     private static void CopySettings(AppSettings from, AppSettings to)
@@ -809,11 +811,10 @@ public sealed partial class MainForm
         bool displaySlower = panelHz > 0 && panelHz < nominal * 0.98;
         if (displaySlower && drops > 0)
             item.Num("捨てたコマについて", $"モニターが {panelHz:0} Hz のため、{nominal:0} fps の映像は全部は表示できず、捨てるのは正常です");
-        if (!displaySlower && drops > 0 && item.Verdict == Verdict.Ok && avg > 0 && drops > avg * (CaptureMeasureMs / 1000.0) * 0.01)
+        if (!displaySlower && drops > 0 && avg > 0 && drops > avg * (CaptureMeasureMs / 1000.0) * 0.01)
         {
-            item.Verdict = Verdict.Warn;
-            item.Summary += "／描画が追いつかず飛ばしたコマがあります";
-            item.Explanation += "\n描画が追いつかず飛ばしたコマがあります。GPU の負荷が高い可能性があります（3 の項目を見てください）。";
+            // This step is about frames ARRIVING; a few frames not shown is information only.
+            item.Num("捨てたコマについて", "映像は指定どおり届いていますが、画面に出す側で一部を捨てました。モニターの更新の間隔と映像のコマの間隔が近いと（例: 60 fps の映像と 59.94 Hz のモニター）、少数は捨てられることがあります。表示の滑らかさは 3 の項目で調べています。");
         }
         sec.Items.Add(item);
     }
@@ -909,11 +910,13 @@ public sealed partial class MainForm
         else if (shownRatio < 0.98) { v = Worst(v, Verdict.Warn); why.Add("表示されたコマ数がわずかに足りません。"); }
 
         // ---- GPU ----
+        double gpuShare = -1;   // 95th percentile GPU time as a share of the frame budget; -1 = unknown
         double[] gpu = meas?.GpuMs ?? Array.Empty<double>();
         if (gpu.Length >= 10)
         {
             double[] sorted = gpu.OrderBy(x => x).ToArray();
             double g = gpu.Average(), p95 = sorted[Math.Clamp((int)Math.Ceiling(0.95 * sorted.Length) - 1, 0, sorted.Length - 1)], mx = sorted[^1];
+            gpuShare = p95 / budget;
             item.Num("GPU 処理時間", $"平均 {g:0.00} ms / 95% {p95:0.00} ms / 最大 {mx:0.00} ms（1コマの持ち時間 {budget:0.00} ms、{gpu.Length} コマ）");
             if (p95 > budget) { v = Worst(v, Verdict.Ng); why.Add($"GPU の処理が 1 コマの持ち時間（{budget:0.0}ms）を超えています。この設定は GPU の力が足りません。"); }
             else if (p95 > budget * 0.8) { v = Worst(v, Verdict.Warn); why.Add($"GPU の処理が持ち時間の 8 割を超えています（余裕がありません）。他のアプリが GPU を使うと詰まる可能性があります。"); }
@@ -957,6 +960,14 @@ public sealed partial class MainForm
                 why.Add("この表示方式では画面に出た時刻が取れなかったため、描画側の間隔で代用しました。実際に画面でカクつくかは、目で確かめてください。");
         }
         else why.Add("コマの出方の記録を取れませんでした。");
+
+        if (drops > 0 || shownRatio < 0.98)
+        {
+            if (gpuShare >= 0 && gpuShare < 0.5)
+                why.Add("コマが一部表示されていませんが、GPU には十分な余裕があります。原因は負荷ではなく、モニターの更新のタイミングと映像のコマのタイミングが近いこと（例: 60 fps の映像と 59.94 Hz のモニター）です。この場合、少数のコマが飛ぶのは想定内です。");
+            else if (gpuShare >= 0.8)
+                why.Add("GPU の処理時間に余裕がなく、描画が間に合わずコマが飛んでいる可能性があります。");
+        }
 
         item.Verdict = v;
         item.Summary = v switch
@@ -1295,7 +1306,8 @@ public sealed partial class MainForm
         ApplyRenderOptions();
         await Wait(500);
         double after = _video.VideoDelayActualMs;
-        bool ok = actual >= 180 && actual <= 230;
+        double pad = _video.VideoPacingMarginMs;   // the renderer's own jitter margin is part of the measured age
+        bool ok = actual >= 180 && actual <= 230 + pad;
         item.Num("指定した遅れ", "200 ms").Num("実測", $"{actual:0} ms").Num("0 に戻したあと", $"{after:0} ms");
         item.Verdict = ok && after < 1 ? Verdict.Ok : Verdict.Warn;
         item.Summary = ok ? "指定どおり遅らせられます" : "実測が指定とずれています";
