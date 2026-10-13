@@ -1102,12 +1102,18 @@ public sealed partial class MainForm : Form, IMessageFilter
             FullRowSelect = true,
             HeaderStyle = ColumnHeaderStyle.Nonclickable,
             GridLines = false,
-            Location = new Point(Ui.Pad, Ui.Pad),
-            Size = new Size(520 - 2 * Ui.Pad, 470 - 2 * Ui.Pad - Ui.ButtonHeight - Ui.Gap),
-            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
         };
         lv.Columns.Add(L.T("操作"), 300);
         lv.Columns.Add(L.T("キー・マウス"), 180);
+        // Column widths follow the list's real width (about 62 / 38 %), so they hold at any display scaling.
+        void FitColumns()
+        {
+            int w = lv.ClientSize.Width;
+            if (w <= 0) return;
+            lv.Columns[0].Width = (int)(w * 0.62);
+            lv.Columns[1].Width = w - lv.Columns[0].Width;
+        }
+        lv.ClientSizeChanged += (_, _) => FitColumns();
 
         var gHere = new ListViewGroup(L.T("YuCap の画面で"));
         var gGlobal = new ListViewGroup(L.T("どこからでも（グローバルホットキー）"));
@@ -1145,12 +1151,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (!_settings.GlobalHotkeys)
             Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です）"));
 
-        var close = Ui.Button(L.T("閉じる"), 520 - Ui.Pad - Ui.ButtonWidth, 470 - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
-        close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
-        close.DialogResult = DialogResult.OK;
-
-        dlg.Controls.Add(lv);
-        dlg.Controls.Add(close);
+        var close = new Button { Text = L.T("閉じる"), DialogResult = DialogResult.OK };
+        Ui.Frame(dlg, lv, true, close);
         dlg.AcceptButton = close;
         dlg.CancelButton = close;
         dlg.ShowDialog(this);
@@ -2212,13 +2214,28 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         using var dlg = Ui.NewDialog(L.T("優先デバイス設定"), 340, 130);
 
-        var lbl = Ui.Label(L.T("キーワード:"), Ui.Pad, 20);
-        var txt = new TextBox { Text = _settings.DeviceKeyword, Location = new Point(110, 16), Width = 210 };
-        var hint = Ui.Hint(
-            L.T("デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）"),
-            Ui.Pad, 50, 340 - 2 * Ui.Pad);
-        dlg.Controls.AddRange(new Control[] { lbl, txt, hint });
-        Ui.AddOkCancel(dlg);
+        // Table layout: sizes come from the controls themselves, so nothing overlaps at any display scaling.
+        var body = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            RowCount = 2,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = Padding.Empty,
+        };
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var lbl = Ui.Label(L.T("キーワード:"), 0, 0);
+        lbl.Anchor = AnchorStyles.Left;
+        lbl.Margin = new Padding(0, 0, Ui.Gap, Ui.Gap);
+        var txt = new TextBox { Text = _settings.DeviceKeyword, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, Ui.Gap) };
+        var hint = Ui.FlowHint(
+            L.T("デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）"));
+        body.Controls.Add(lbl, 0, 0);
+        body.Controls.Add(txt, 1, 0);
+        body.Controls.Add(hint, 0, 1);
+        body.SetColumnSpan(hint, 2);
+        Ui.FrameOkCancel(dlg, body);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         string keyword = string.IsNullOrWhiteSpace(txt.Text) ? "JVA14" : txt.Text.Trim();

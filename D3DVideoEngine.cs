@@ -741,16 +741,30 @@ public sealed class D3DVideoEngine : IVideoEngine
 
                 if (displayDriven)
                 {
-                    // One iteration per refresh. After a Present the swap chain's waitable signals
-                    // when the display has taken that frame; when we did not present, DwmFlush
-                    // gives the same once-per-refresh beat. Then pick what to show.
+                    // One iteration per refresh. The beat is the vertical blank of the output the window is on
+                    // (IDXGIOutput.WaitForVBlank), which is the same clock the panel runs on whichever monitor
+                    // that is. Right after it the frame presented one refresh ago has been taken by DWM, so a
+                    // short, bounded look at the swap chain's latency waitable only guards against over-queuing
+                    // when DWM is late; it never waits a whole refresh (that would halve the rate). Without a
+                    // usable beat: after a Present the waitable signals when the display has taken that frame,
+                    // and when we did not present DwmFlush gives the same once-per-refresh beat.
                     long t0 = Stopwatch.GetTimestamp();
-                    if (presentedLast && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
-                    else if (DwmFlush() != 0) _wake.WaitOne(4);
-                    if ((Stopwatch.GetTimestamp() - t0) * 1000 < Stopwatch.Frequency) _wake.WaitOne(3);   // returned at once: do not spin
+                    double roughMs = 1000.0 / Math.Max(1, RefreshHz() > 0 ? RefreshHz() : 60);
+                    bool viaBeat = r.Beat.Wait(r.Device, _hwnd, roughMs);
+                    if (viaBeat)
+                    {
+                        if (presentedLast && r.LatencyWaitable != IntPtr.Zero)
+                            WaitForSingleObject(r.LatencyWaitable, (uint)Math.Clamp(roughMs * 0.35, 1, 6));
+                    }
+                    else
+                    {
+                        if (presentedLast && r.LatencyWaitable != IntPtr.Zero) WaitForSingleObject(r.LatencyWaitable, 100);
+                        else if (DwmFlush() != 0) _wake.WaitOne(4);
+                        if ((Stopwatch.GetTimestamp() - t0) * 1000 < Stopwatch.Frequency) _wake.WaitOne(3);   // returned at once: do not spin
+                    }
                     waitedLatency = true;
                     if (iter <= 4 && Early)
-                        Log.Info($"D3D: t+{TraceMs}ms iter={iter} waited {(Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency:0.0}ms via {(presentedLast ? "latency-waitable" : "DwmFlush")}");
+                        Log.Info($"D3D: t+{TraceMs}ms iter={iter} waited {(Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency:0.0}ms via {(viaBeat ? "vblank" : presentedLast ? "latency-waitable" : "DwmFlush")}");
                     presentedLast = false;
                     if (_stopping) break;
                     ServiceRequests(r);
@@ -850,6 +864,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 if (resized)
                 {
                     r.Resize(now);
+                    r.Beat.Recheck();
                     Log.Info($"D3D: resize {client.Width}x{client.Height} -> {now.Width}x{now.Height}");
                     client = now;
                     dirty = true;
@@ -901,8 +916,8 @@ public sealed class D3DVideoEngine : IVideoEngine
                         long content = contentTicks != 0 ? contentTicks : (interp || ringed ? 0 : r.LatestArrival);
                         if (content != 0)
                         {
-                            r.Latency.SetRefreshMs(1000.0 / Math.Max(1, RefreshHz()));
-                            r.Latency.Shown(r.LastPresentCount, content, Stopwatch.GetTimestamp());
+                            r.Latency.SetRefreshMs(r.Beat.Active && r.Beat.PeriodMs > 1 ? r.Beat.PeriodMs : 1000.0 / Math.Max(1, RefreshHz()));
+                            r.Latency.Shown(r.LastPresentCount, content, Stopwatch.GetTimestamp(), r.Beat.Active ? r.Beat.Count : -1);
                         }
                     }
                     if (delayed && newFrame && (arrivalShown != 0 || interp))

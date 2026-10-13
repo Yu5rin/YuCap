@@ -11,6 +11,10 @@ namespace YuCap;
 /// <see cref="SyncQpc"/> is in QueryPerformanceCounter ticks (the same clock as <see cref="Stopwatch"/>).</summary>
 public readonly record struct StatSample(uint PresentCount, uint PresentRefreshCount, uint SyncRefreshCount, long SyncQpc);
 
+/// <summary>The vertical blank (counted by <see cref="VBlankBeat"/>) that a present followed: its running index,
+/// the QPC time it was observed, and an epoch that changes whenever the beat moves to another output.</summary>
+public readonly record struct VBlankMark(long Index, long Qpc, int Epoch);
+
 /// <summary>
 /// Raw frame-pacing data collected by the Direct3D renderer between <see cref="IVideoEngine.BeginMeasure"/>
 /// and <see cref="IVideoEngine.EndMeasure"/> (test mode only; nothing is recorded otherwise).
@@ -27,6 +31,7 @@ public sealed class PacingCapture
     private readonly object _gate = new();
     private readonly List<long> _presentTicks = new();
     private readonly List<StatSample> _stats = new();
+    private readonly List<VBlankMark> _marks = new();
     private uint _lastPresentCount = uint.MaxValue;
 
     public int StatsAttempts { get; private set; }
@@ -36,12 +41,16 @@ public sealed class PacingCapture
 
     public long[] PresentTicks { get { lock (_gate) return _presentTicks.ToArray(); } }
     public StatSample[] Stats { get { lock (_gate) return _stats.ToArray(); } }
+    /// <summary>For each recorded present: the vertical blank it followed (Index &lt; 0 = no vblank beat was active).
+    /// Same length and order as <see cref="PresentTicks"/>.</summary>
+    public VBlankMark[] Marks { get { lock (_gate) return _marks.ToArray(); } }
 
-    /// <summary>Called by the renderer right after a successful Present (render thread).</summary>
-    internal void Record()
+    /// <summary>Called by the renderer right after a successful Present (render thread).
+    /// <paramref name="vblank"/> is the beat's state at that moment (index and QPC time of the last vertical blank).</summary>
+    internal void Record(VBlankMark vblank)
     {
         long now = Stopwatch.GetTimestamp();
-        lock (_gate) _presentTicks.Add(now);
+        lock (_gate) { _presentTicks.Add(now); _marks.Add(vblank); }
     }
 
     // ---- frame statistics poller ----
@@ -131,6 +140,8 @@ internal sealed class VideoLatencyTracker
     private const int Ring = 128;
     private readonly uint[] _pc = new uint[Ring];
     private readonly long[] _content = new long[Ring];
+    private readonly long[] _vb = new long[Ring];   // vblank index the present followed (-1 = none / used)
+    private long _lastStatsTick;
     private int _count;
     private double _ema;
     private long _lastSampleTick;
@@ -157,15 +168,16 @@ internal sealed class VideoLatencyTracker
     public void SetRefreshMs(double ms) { if (ms > 1 && ms < 100) _refreshMs = ms; }
 
     /// <summary>Render thread: a present that shows new content went through.</summary>
-    public void Shown(uint presentCount, long contentTicks, long returnedTick)
+    public void Shown(uint presentCount, long contentTicks, long returnedTick, long vblankIndex = -1)
     {
         if (contentTicks == 0) return;
         int i = _count++ % Ring;
         _pc[i] = presentCount;
         _content[i] = contentTicks;
+        _vb[i] = vblankIndex;
         if (_firstShown == 0) _firstShown = returnedTick;
-        // No statistics for a second: estimate from when Present returned.
-        if (!_statsEverOk && returnedTick - _firstShown > Stopwatch.Frequency)
+        // No statistics for a second: estimate from when Present returned (unless the vblank beat supplies it).
+        if (!_statsEverOk && vblankIndex < 0 && returnedTick - _firstShown > Stopwatch.Frequency)
         {
             double ms = (returnedTick - contentTicks) * 1000.0 / Stopwatch.Frequency + _refreshMs;
             Add(ms, estimated: true);
@@ -189,11 +201,38 @@ internal sealed class VideoLatencyTracker
                 _pc[i] = uint.MaxValue;   // count each shown frame once
                 if (ms < 0 || ms > 5000) return;
                 _statsEverOk = true;
+                Volatile.Write(ref _lastStatsTick, Stopwatch.GetTimestamp());
+                _vb[i] = -1;
                 Add(ms, estimated: false);
                 return;
             }
         }
         catch { /* swap chain gone or statistics unsupported */ }
+    }
+
+    /// <summary>Render thread, once per loop right after the vblank beat returned: where GetFrameStatistics gives
+    /// nothing (it often does not on a secondary monitor), estimate from the beat. A frame presented after vblank k is
+    /// composed for the next one, so latency = (time of vblank k+1 + one refresh for DWM) - content time.</summary>
+    public void PollVBlank(long count, long qpc, double periodMs)
+    {
+        if (_count == 0 || periodMs <= 1) return;
+        long now = Stopwatch.GetTimestamp();
+        if (now - Volatile.Read(ref _lastStatsTick) < Stopwatch.Frequency / 2) return;   // real statistics are flowing
+        double periodTicks = periodMs * Stopwatch.Frequency / 1000.0;
+        int n = Math.Min(_count, Ring);
+        for (int k = 0; k < n; k++)
+        {
+            int i = (_count - 1 - k) % Ring;
+            long vb = _vb[i];
+            if (vb < 0) continue;
+            if (count <= vb) continue;                        // the next vblank has not happened yet
+            _vb[i] = -1;
+            if (count - vb > 4) continue;                     // too old to place
+            double next = qpc - (count - vb - 1) * periodTicks;
+            double ms = (next - _content[i]) * 1000.0 / Stopwatch.Frequency + periodMs;
+            if (ms < 0 || ms > 5000) continue;
+            Add(ms, estimated: true);
+        }
     }
 
     private void Add(double ms, bool estimated)

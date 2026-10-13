@@ -75,6 +75,16 @@ internal static class Ui
         };
     }
 
+    /// <summary>Dimmed explanatory text for a <see cref="Frame"/> layout: wraps to the width the dialog really has
+    /// (a table row would otherwise be measured on one line and cut off the wrapped text).</summary>
+    public static Label FlowHint(string text) => new WrapLabel
+    {
+        Text = text,
+        ForeColor = SystemColors.GrayText,
+        Anchor = AnchorStyles.Left | AnchorStyles.Right,
+        Margin = Padding.Empty,
+    };
+
     /// <summary>Width a button needs to show <paramref name="text"/> without clipping (text + padding),
     /// never less than <paramref name="minWidth"/>. Keeps English captions from being truncated in
     /// widths drawn for the Japanese ones.</summary>
@@ -126,6 +136,103 @@ internal static class Ui
         dlg.CancelButton = cancel;
         dlg.Controls.Add(ok);
         dlg.Controls.Add(cancel);
+        return ok;
+    }
+
+    /// <summary>
+    /// DPI-proof dialog layout: a root table (docked to fill the dialog) with the body in the top row and a
+    /// right-aligned row of buttons below it, both sized from the controls' real sizes by WinForms layout instead
+    /// of pixel positions drawn at 96 dpi. At 150/200% the controls, fonts and wrapped text then cannot end up on
+    /// top of each other, whatever scaling the dialog really got. The dialog grows beyond the requested
+    /// client size when its content needs more room, and never shrinks below it.
+    ///
+    /// <paramref name="body"/> sits at the top of the free space; with <paramref name="fill"/> it is docked to fill
+    /// it (lists). <paramref name="buttons"/> are given in left-to-right order. The first is the accept button
+    /// and the last one the cancel button unless the caller changes them afterwards.
+    /// </summary>
+    public static void Frame(Form dlg, Control body, bool fill, params Button[] buttons)
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(Pad),
+            Margin = Padding.Empty,
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        if (fill) { body.Dock = DockStyle.Fill; body.Margin = new Padding(0, 0, 0, Gap); }
+        else { body.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; body.Margin = new Padding(0, 0, 0, Gap); }
+        root.Controls.Add(body, 0, 0);
+
+        var row = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Anchor = AnchorStyles.Right,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+        };
+        for (int i = buttons.Length - 1; i >= 0; i--)
+        {
+            Button b = buttons[i];
+            b.AutoSize = true;
+            b.AutoSizeMode = AutoSizeMode.GrowOnly;
+            b.MinimumSize = new Size(ButtonWidth, ButtonHeight);
+            b.Margin = new Padding(Gap, 0, 0, 0);
+            row.Controls.Add(b);
+        }
+        root.Controls.Add(row, 0, 1);
+
+        dlg.Controls.Add(root);
+
+        // The requested client size is a minimum: if the content needs more at the scaling the dialog really got
+        // (wrapped text, wider captions), the dialog grows. Form.AutoSize does not do this with a docked table.
+        void GrowToFit()
+        {
+            if (!dlg.IsHandleCreated) return;
+            int availW = Math.Max(1, dlg.ClientSize.Width - root.Padding.Horizontal);
+            Size bodyPref = fill ? Size.Empty : body.GetPreferredSize(new Size(availW, 0));
+            Size rowPref = row.GetPreferredSize(new Size(availW, 0));
+            int needH = root.Padding.Vertical + body.Margin.Vertical + bodyPref.Height + row.Margin.Vertical + rowPref.Height;
+            int needW = root.Padding.Horizontal + Math.Max(bodyPref.Width, rowPref.Width);
+            Size cs = dlg.ClientSize;
+            if (needH > cs.Height || needW > cs.Width)
+                dlg.ClientSize = new Size(Math.Max(cs.Width, needW), Math.Max(cs.Height, needH));
+        }
+        dlg.Load += (_, _) => GrowToFit();
+        dlg.Shown += (_, _) => GrowToFit();
+        dlg.DpiChanged += (_, _) => GrowToFit();
+    }
+
+    /// <summary>A single-column table that stacks its controls top to bottom, each row as tall as its control
+    /// (wrapped hints included) and as wide as the dialog. Add the controls, then hand it to <see cref="Frame"/>.</summary>
+    public static TableLayoutPanel Stack()
+    {
+        var t = new TableLayoutPanel
+        {
+            ColumnCount = 1,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = Padding.Empty,
+        };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        return t;
+    }
+
+    /// <summary>OK + キャンセル in a <see cref="Frame"/>; wires AcceptButton/CancelButton/DialogResult and returns OK.</summary>
+    public static Button FrameOkCancel(Form dlg, Control body, bool fill = false, string? okText = null)
+    {
+        var ok = new Button { Text = okText ?? "OK", DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel };
+        Frame(dlg, body, fill, ok, cancel);
+        dlg.AcceptButton = ok;
+        dlg.CancelButton = cancel;
         return ok;
     }
 
@@ -300,4 +407,22 @@ internal sealed class UiDialog : Form
 
     // While being audited the dialog is shown invisibly (see MainForm.TestMode.cs); it must not take focus.
     protected override bool ShowWithoutActivation => Ui.DialogAudit != null;
+}
+
+/// <summary>An auto-sized label that reports its height for the width available in its dialog (the dialog's client
+/// width less the padding of its root layout panel) instead of for one unwrapped line.</summary>
+internal sealed class WrapLabel : Label
+{
+    public WrapLabel() { AutoSize = true; }
+
+    public override Size GetPreferredSize(Size proposedSize)
+    {
+        int w = 0;
+        Form? f = FindForm();
+        if (f != null && f.ClientSize.Width > 0)
+            w = f.ClientSize.Width - (f.Controls.Count > 0 ? f.Controls[0].Padding.Horizontal : 0);
+        if (w <= 0) w = proposedSize.Width > 1 && proposedSize.Width < 100000 ? proposedSize.Width : 300;
+        Size s = base.GetPreferredSize(new Size(w, 0));
+        return new Size(Math.Min(s.Width, w), s.Height);
+    }
 }

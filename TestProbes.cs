@@ -123,6 +123,7 @@ internal static class TestProbes
     public sealed class PacingAnalysis
     {
         public bool UsedStats;
+        public bool UsedVBlank;                 // per-frame times from the vblank beat (no usable GetFrameStatistics)
         public string Source = string.Empty;
         public int Frames;
         public double ObservedHz;              // 0 = unknown
@@ -188,16 +189,51 @@ internal static class TestProbes
         }
         else
         {
-            long[] t = cap.PresentTicks;
             durs.Clear();
-            for (int i = 1; i < t.Length; i++)
+            // Second choice: the vertical-blank record. Each present is tagged with the vblank it followed, so the
+            // difference of two indices x the measured refresh period is how long the previous frame stayed up.
+            var vdurs = new List<double>();
+            VBlankMark[] mk = cap.Marks;
+            long idxSum = 0, tickSum = 0; int shared = 0, valid = 0;
+            for (int i = 1; i < mk.Length; i++)
             {
-                double ms = (t[i] - t[i - 1]) * 1000.0 / freq;
-                if (ms > 0 && ms < 500) durs.Add(ms);
+                if (mk[i].Index < 0 || mk[i - 1].Index < 0 || mk[i].Epoch != mk[i - 1].Epoch) continue;
+                long di = mk[i].Index - mk[i - 1].Index;
+                if (di <= 0) { if (di == 0) shared++; continue; }
+                valid++;
+                idxSum += di; tickSum += mk[i].Qpc - mk[i - 1].Qpc;
+            }
+            double periodMs = idxSum > 0 ? tickSum * 1000.0 / freq / idxSum : 0;
+            if (periodMs > 2 && valid >= 20)
+            {
+                for (int i = 1; i < mk.Length; i++)
+                {
+                    if (mk[i].Index < 0 || mk[i - 1].Index < 0 || mk[i].Epoch != mk[i - 1].Epoch) continue;
+                    long di = mk[i].Index - mk[i - 1].Index;
+                    if (di >= 1 && di <= 30) vdurs.Add(di * periodMs);
+                }
+            }
+            if (vdurs.Count >= 20)
+            {
+                durs = vdurs;
+                a.UsedVBlank = true;
+                a.Source = "垂直同期の記録（表示側の記録が取れなかったための代用）";
+                a.Frames = durs.Count;
+                a.ObservedHz = 1000.0 / periodMs;
+                a.StatsNote += $"／垂直同期の記録 {mk.Length} 件、同じ更新に重なった Present {shared} 回";
+            }
+            else
+            {
+                long[] t = cap.PresentTicks;
+                for (int i = 1; i < t.Length; i++)
+                {
+                    double ms = (t[i] - t[i - 1]) * 1000.0 / freq;
+                    if (ms > 0 && ms < 500) durs.Add(ms);
+                }
+                a.Source = "描画スレッドの Present 間隔（表示側の記録が取れなかったための代用）";
+                a.Frames = durs.Count;
             }
             a.UsedStats = false;
-            a.Source = "描画スレッドの Present 間隔（表示側の記録が取れなかったための代用）";
-            a.Frames = durs.Count;
         }
 
         if (durs.Count == 0)
@@ -234,7 +270,7 @@ internal static class TestProbes
         }
         if (!a.UsedStats)
         {
-            a.Vrr = "判定できません（表示側の時刻が取れませんでした）";
+            a.Vrr = a.UsedVBlank ? "判定できません（垂直同期の記録はリフレッシュの単位でしか分からないため）" : "判定できません（表示側の時刻が取れませんでした）";
             return a;
         }
         double hz = a.ObservedHz > 20 ? a.ObservedHz : panelHz;

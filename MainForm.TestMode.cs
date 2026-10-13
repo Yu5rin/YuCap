@@ -206,27 +206,31 @@ public sealed partial class MainForm
         if (all.Count == 0) return;
 
         using var dlg = Ui.NewDialog(L.T("テストモード（自動試験）"), 480, 300);
-        int inner = dlg.ClientSize.Width - 2 * Ui.Pad;
-
-        var lbl = Ui.Label(L.T("試験するモニター:"), Ui.Pad, 18);
+        var stack = Ui.Stack();
+        var lbl = Ui.Label(L.T("試験するモニター:"), 0, 0);
+        lbl.Margin = new Padding(0, 0, 0, Ui.Gap / 2);
         var combo = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Location = new Point(Ui.Pad, 40), Width = inner,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right,
+            Margin = new Padding(0, 0, 0, Ui.Gap * 2),
         };
         foreach (DisplayInfo d in all) combo.Items.Add(d.MenuLabel());
         combo.SelectedIndex = Math.Max(0, all.IndexOf(DefaultTestDisplay(all)));
 
         int modes = _video.IsRunning ? Math.Max(8, _video.GetModes().Count) : 20;
         int minutes = (int)Math.Ceiling((90 + modes * 8 + 10 * 11 + 70 + 60) / 60.0);
-        var est = Ui.Label(L.F("所要時間の目安: 約 {0} 分", minutes), Ui.Pad, 78);
-        var note = Ui.Hint(L.T("試験中は画面が何度も切り替わります。Esc でいつでも中止できます。終了すると設定は元に戻ります。"),
-            Ui.Pad, 108, inner);
-        var where = Ui.Hint(L.T("レポートは「ピクチャ」フォルダの YuCap\\テストレポート に保存されます。"),
-            Ui.Pad, 164, inner);
-
-        dlg.Controls.AddRange(new Control[] { lbl, combo, est, note, where });
-        Ui.AddOkCancel(dlg, L.T("開始"));
+        var est = Ui.Label(L.F("所要時間の目安: 約 {0} 分", minutes), 0, 0);
+        est.Margin = new Padding(0, 0, 0, Ui.Gap);
+        var note = Ui.FlowHint(L.T("試験中は画面が何度も切り替わります。Esc でいつでも中止できます。終了すると設定は元に戻ります。"));
+        note.Margin = new Padding(0, 0, 0, Ui.Gap);
+        var where = Ui.FlowHint(L.T("レポートは「ピクチャ」フォルダの YuCap\\テストレポート に保存されます。"));
+        stack.Controls.Add(lbl);
+        stack.Controls.Add(combo);
+        stack.Controls.Add(est);
+        stack.Controls.Add(note);
+        stack.Controls.Add(where);
+        Ui.FrameOkCancel(dlg, stack, false, L.T("開始"));
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         var opt = new TestOptions { Target = all[Math.Clamp(combo.SelectedIndex, 0, all.Count - 1)] };
@@ -1022,7 +1026,9 @@ public sealed partial class MainForm
             {
                 item.Num("可変リフレッシュ（VRR）", p.Vrr);
             }
-            if (!p.UsedStats && p.Frames > 0)
+            if (!p.UsedStats && p.UsedVBlank && p.Frames > 0)
+                why.Add("表示側の記録が取れなかったため、垂直同期（画面の更新）ごとの記録で代用しました。1コマが何回の更新ぶん出ていたかは分かりますが、細かい時刻は分かりません。");
+            else if (!p.UsedStats && p.Frames > 0)
                 why.Add("この表示方式では画面に出た時刻が取れなかったため、描画側の間隔で代用しました。実際に画面でカクつくかは、目で確かめてください。");
         }
         else why.Add("コマの出方の記録を取れませんでした。");

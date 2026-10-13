@@ -338,34 +338,40 @@ public sealed partial class MainForm
     {
         using var dlg = Ui.NewDialog(L.T("更新があります"), 420, 200);
 
+        // Stacked in a table and framed by Ui.Frame: sizes follow the real controls, not pixel positions.
+        var stack = Ui.Stack();
         var head = Ui.Label(
-            L.F("新しいバージョン {0} があります（現在 {1}）。", info.Version, Updater.CurrentVersion), 16, 20);
+            L.F("新しいバージョン {0} があります（現在 {1}）。", info.Version, Updater.CurrentVersion), 0, 0);
         head.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-        var body = Ui.Hint(L.T("更新すると YuCap は自動的に再起動します。"), 16, 48, 420 - Ui.Pad * 2);
-        var size = Ui.Hint(
-            L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0")),
-            16, 72, 420 - Ui.Pad * 2);
+        head.Margin = new Padding(0, 0, 0, Ui.Gap);
+        var body = Ui.FlowHint(L.T("更新すると YuCap は自動的に再起動します。"));
+        body.Margin = new Padding(0, 0, 0, Ui.Gap / 2);
+        var size = Ui.FlowHint(
+            L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0")));
+        size.Margin = new Padding(0, 0, 0, Ui.Gap);
         var notes = new LinkLabel
         {
             Text = L.T("リリースノートを見る"),
             AutoSize = true,
-            Location = new Point(16, 98),
+            Margin = Padding.Empty,
         };
         notes.LinkClicked += (_, _) => OpenUrl(info.PageUrl);
+        stack.Controls.Add(head);
+        stack.Controls.Add(body);
+        stack.Controls.Add(size);
+        stack.Controls.Add(notes);
 
         // Right-aligned as a group, in reading order 今すぐ更新 / 後で / この版をスキップ.
-        // Widths are sized to fit each label rather than sharing Ui.ButtonWidth.
-        int y = 200 - Ui.Pad - Ui.ButtonHeight;
-        var skip = Ui.Button(L.T("この版をスキップ"), 420 - Ui.Pad - 146, y, 146, true);
-        var later = Ui.Button(L.T("後で"), skip.Left - Ui.Gap - 100, y, 100, true);
-        var now = Ui.Button(L.T("今すぐ更新"), later.Left - Ui.Gap - 120, y, 120, true);
+        var now = new Button { Text = L.T("今すぐ更新") };
+        var later = new Button { Text = L.T("後で") };
+        var skip = new Button { Text = L.T("この版をスキップ") };
 
         var result = UpdatePrompt.Later;
         now.Click += (_, _) => { result = UpdatePrompt.Now; dlg.Close(); };
         later.Click += (_, _) => { result = UpdatePrompt.Later; dlg.Close(); };
         skip.Click += (_, _) => { result = UpdatePrompt.Skip; dlg.Close(); };
 
-        dlg.Controls.AddRange(new Control[] { head, body, size, notes, now, later, skip });
+        Ui.Frame(dlg, stack, false, now, later, skip);
         dlg.AcceptButton = now;
         dlg.CancelButton = later;
         dlg.ShowDialog(this);
@@ -380,12 +386,16 @@ public sealed partial class MainForm
         using var dlg = Ui.NewDialog(L.T("更新をダウンロード中"), 380, 120);
         dlg.ControlBox = false;   // only the Cancel button may close this while a download is in flight
 
-        var lbl = Ui.Label(L.F("{0} をダウンロードしています...", info.AssetName), 16, 18);
-        var bar = new ProgressBar { Location = new Point(16, 46), Size = new Size(348, 22), Maximum = 100 };
-        var cancelBtn = Ui.Button(L.T("キャンセル"), 380 - Ui.Pad - 90, 120 - Ui.Pad - Ui.ButtonHeight, 90, true);
+        var stack = Ui.Stack();
+        var lbl = Ui.Label(L.F("{0} をダウンロードしています...", info.AssetName), 0, 0);
+        lbl.Margin = new Padding(0, 0, 0, Ui.Gap);
+        var bar = new ProgressBar { Maximum = 100, Height = 22, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = Padding.Empty };
+        var cancelBtn = new Button { Text = L.T("キャンセル") };
         var cts = new CancellationTokenSource();
         cancelBtn.Click += (_, _) => { cts.Cancel(); dlg.Close(); };
-        dlg.Controls.AddRange(new Control[] { lbl, bar, cancelBtn });
+        stack.Controls.Add(lbl);
+        stack.Controls.Add(bar);
+        Ui.Frame(dlg, stack, false, cancelBtn);
 
         string? file = null;
         Exception? failure = null;

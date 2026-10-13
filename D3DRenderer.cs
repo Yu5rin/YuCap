@@ -871,13 +871,16 @@ internal sealed class D3DRenderer : IDisposable
         }
         Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
         Result pr = _swap.Present(_syncInterval, _presentFlags);
-        if (pr.Success) Volatile.Read(ref _pacing)?.Record();
+        if (pr.Success) Volatile.Read(ref _pacing)?.Record(Beat.Mark());
         _gpu?.Poll();
         return pr;
     }
 
     // ---- latency (YuCap-internal: frame received -> shown) ----
     internal readonly VideoLatencyTracker Latency = new();
+
+    /// <summary>The vertical-blank beat of the window's output (display-driven pacing, render thread).</summary>
+    internal readonly VBlankBeat Beat = new();
 
     /// <summary>The swap chain's present counter right after a Present (render thread); 0 if unavailable.</summary>
     public uint LastPresentCount
@@ -894,6 +897,7 @@ internal sealed class D3DRenderer : IDisposable
     {
         IDXGISwapChain1? s = _swap;
         if (s != null) Latency.Poll(s);
+        if (Beat.Active) Latency.PollVBlank(Beat.Count, Beat.LastQpc, Beat.PeriodMs);
     }
 
     // ---- measurement window (test mode) ----
@@ -1550,6 +1554,7 @@ internal sealed class D3DRenderer : IDisposable
     public void DisposeAll(bool releaseDevice)
     {
         try { Ctx?.ClearState(); Ctx?.Flush(); } catch { }
+        Beat.Dispose();
         InterpFree();
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
