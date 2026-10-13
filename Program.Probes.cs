@@ -274,7 +274,7 @@ internal static partial class Program
     //  --interp-synth
     // =====================================================================
 
-    private static int[] ReadPixels(Bitmap bmp)
+    internal static int[] ReadPixels(Bitmap bmp)
     {
         var px = new int[bmp.Width * bmp.Height];
         BitmapData bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
@@ -283,7 +283,7 @@ internal static partial class Program
         return px;
     }
 
-    private static Bitmap MakeBitmap(int[] px, int w, int h)
+    internal static Bitmap MakeBitmap(int[] px, int w, int h)
     {
         var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
         BitmapData bd = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
@@ -293,7 +293,7 @@ internal static partial class Program
     }
 
     /// <summary>out(x, y) = src(x - dx, y - dy), edge pixels repeated.</summary>
-    private static int[] ShiftPixels(int[] src, int w, int h, double dx, double dy)
+    internal static int[] ShiftPixels(int[] src, int w, int h, double dx, double dy)
     {
         var o = new int[src.Length];
         int ix = (int)Math.Round(dx), iy = (int)Math.Round(dy);
@@ -303,7 +303,7 @@ internal static partial class Program
         return o;
     }
 
-    private static double Psnr(int[] p, int[] q, int w, Rectangle r)
+    internal static double Psnr(int[] p, int[] q, int w, Rectangle r)
     {
         double se = 0; long n = 0;
         for (int y = r.Top; y < r.Bottom; y++)

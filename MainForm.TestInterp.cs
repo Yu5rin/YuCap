@@ -1,0 +1,378 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace YuCap;
+
+// =============================================================================================
+//  テストモード: フレーム補間の画質（既知の動き・実際の映像）と、重ねた表示による更新の低下
+//  Part of section 3 of the report (right after the 補間 cases); wording is Japanese only (TestReport.cs).
+// =============================================================================================
+
+public sealed partial class MainForm
+{
+    /// <summary>The mode frame interpolation is tested with: the fastest source the monitor refreshes clearly above
+    /// (the setting only works from refresh >= 1.1 x fps), 1080p first, then NV12, then the smallest picture.</summary>
+    private static CaptureMode? PickInterpMode(List<CaptureMode> modes, double refreshHz)
+    {
+        if (refreshHz <= 0) return null;
+        var ok = modes.Where(m => m.Fps > 0 && m.Fps * 1.1 <= refreshHz).ToList();
+        if (ok.Count == 0) return null;
+        int fps = ok.Max(m => m.Fps);
+        return ok.Where(m => m.Fps == fps)
+            .OrderByDescending(m => m.Height == 1080 ? 1 : 0)
+            .ThenByDescending(m => m.Compression == "NV12" ? 1 : 0)
+            .ThenBy(m => (long)m.Width * m.Height).First();
+    }
+
+    private void StopInterpForTest()
+    {
+        if (_settings.Interpolation) { _settings.Interpolation = false; try { _video.Interpolation = false; } catch { } }
+    }
+
+    // =============================================================================================
+    //  A-1. Known motion
+    // =============================================================================================
+
+    private async Task InterpSynthStep(TestSection sec, List<CaptureMode> modes)
+    {
+        var item = new TestItem { Name = "フレーム補間の画質: 既知の動きでの検算" };
+        if (_video is not D3DVideoEngine eng)
+        {
+            item.Summary = "Direct3D の映像ではないため確認できませんでした";
+            sec.Items.Add(item);
+            return;
+        }
+        CaptureMode? mode = PickMode(modes, 1920, 1080, 0) ?? modes.FirstOrDefault();
+        if (_testCaption != null) _testCaption.Visible = false;
+        Bitmap? still = null;
+        try
+        {
+            if (mode != null)
+            {
+                _settings.Interpolation = false;
+                EnsureEngine(false, mode);
+                await Wait(SettleMs);
+                Size res = _video.DisplayResolution;
+                Size outSize = res.Width >= 640 && res.Height >= 360 && res.Width <= 2560 ? res : new Size(1920, 1080);
+                still = await Task.Run(() => _video.RenderOffscreen(outSize, ScalingQuality.Standard));
+            }
+            // The verdict comes from a built-in picture (the same every time, with unambiguous detail everywhere), so it
+            // does not depend on what the source happens to show; the picture taken from the video is a reference.
+            const string file = "interp_synth.png", fileStill = "interp_synth_video.png";
+            InterpCheck.SynthResult r = await Task.Run(() => InterpCheck.RunSynthetic(eng, null, Path.Combine(_rep.Folder, file)));
+            InterpCheck.SynthResult? rs = still == null ? null
+                : await Task.Run(() => InterpCheck.RunSynthetic(eng, still, Path.Combine(_rep.Folder, fileStill)));
+            if (rs is { Ok: true, UsedStill: false }) rs = null;       // the video's picture was too flat: nothing to add
+            if (!r.Ok)
+            {
+                item.Verdict = Verdict.Ng;
+                item.Summary = "補間を試せませんでした";
+                item.Explanation = "理由: " + r.Failure;
+                sec.Items.Add(item);
+                return;
+            }
+
+            double blkBlend = r.BlkBlend;
+            bool texOk = r.BgTexN >= 50;
+            int vecN = texOk ? r.BgTexN : r.BgN, vecOk = texOk ? r.BgTexOk : r.BgOk;
+            double vecFrac = vecN > 0 ? (double)vecOk / vecN : 0;
+            item.Num("使った絵（判定用）", $"試験用に作った絵（文字・図形・模様を並べたもの）  {r.Size.Width}x{r.Size.Height}（細かさ {r.Detail:0.0}）")
+                .Num("動かし方", $"全体を右へ {InterpCheck.GlobalDx}・上へ {-InterpCheck.GlobalDy} ピクセル、四角い部分だけ左へ {-InterpCheck.BlockDx}・下へ {InterpCheck.BlockDy} ピクセル")
+                .Num("背景の PSNR（補間 / 重ねただけ）", $"{r.BgPsnr:0.0} dB / {r.BgBlend:0.0} dB")
+                .Num("動く四角の PSNR（補間 / 重ねただけ）", $"{r.BlkPsnr:0.0} dB / {blkBlend:0.0} dB")
+                .Num("動きの向きが合っていた割合（背景）", $"{Pct(vecFrac)}（{vecOk}/{vecN} ブロック、誤差 1 ピクセル以内。" + (texOk ? "模様のある所だけ" : "全部") + $"。全ブロックでは {r.BgOk}/{r.BgN}）")
+                .Num("動きの向きが合っていた割合（四角）", $"{Pct(r.BlkN > 0 ? (double)r.BlkOk / r.BlkN : 0)}（{r.BlkOk}/{r.BlkN} ブロック、平均の誤差 {r.BlkErr:0.00} ピクセル）")
+                .Num("真っ黒になったブロック / 異常な値の動き", $"{r.BadBlocks} 個 / {r.BadVectors} 個");
+            item.Images.Add(file);
+            if (rs is { Ok: true })
+            {
+                bool tx = rs.BgTexN >= 50;
+                double vf = (tx ? rs.BgTexN : rs.BgN) > 0 ? (double)(tx ? rs.BgTexOk : rs.BgOk) / (tx ? rs.BgTexN : rs.BgN) : 0;
+                item.Num("（参考）映像から取った絵での結果", $"背景 {rs.BgPsnr:0.0} dB（重ねただけ {rs.BgBlend:0.0}）、四角 {rs.BlkPsnr:0.0} dB（重ねただけ {rs.BlkBlend:0.0}）、背景の動きが合った割合 {Pct(vf)}、真っ黒なブロック {rs.BadBlocks} 個（細かさ {rs.Detail:0.0}）");
+                item.Images.Add(fileStill);
+            }
+
+            var why = new List<string>();
+            Verdict v;
+            bool bad = r.BadBlocks > 0 || r.BadVectors > 0;
+            if (bad || r.BgPsnr < 28 || r.BgPsnr < r.BgBlend + 3 || r.BlkPsnr < blkBlend || vecFrac < 0.60) v = Verdict.Ng;
+            else if (r.BgPsnr >= 33 && r.BgPsnr >= r.BgBlend + 6 && vecFrac >= 0.85 && r.BlkPsnr >= blkBlend + 3) v = Verdict.Ok;
+            else v = Verdict.Warn;
+            if (bad) why.Add("補間した絵に真っ黒なブロックや異常な動きの値がありました。補間の処理がおかしくなっています。");
+            if (r.BgPsnr < 28) why.Add($"背景が正解とかなりずれています（{r.BgPsnr:0.0} dB、28 dB 未満）。");
+            else if (r.BgPsnr < 33) why.Add($"背景は正解にやや届いていません（{r.BgPsnr:0.0} dB、33 dB 未満）。");
+            if (r.BgPsnr < r.BgBlend + 6) why.Add("背景が「2コマを重ねただけ」の絵と大差ありません。動きを追えていない可能性があります。");
+            if (r.BlkPsnr < blkBlend) why.Add("動く四角の部分が「重ねただけ」より悪くなっています。");
+            else if (r.BlkPsnr < blkBlend + 3) why.Add("動く四角の部分の改善が小さいです。");
+            if (vecFrac < 0.85) why.Add($"動きの向きが合っていた割合が {Pct(vecFrac)} で、85% に届いていません。");
+            if (v == Verdict.Ok) why.Insert(0, "背景も動く四角も、正解に近い絵を作れています。");
+            if (rs is { Ok: true })
+                why.Add("「（参考）映像から取った絵」は、いま映っている映像の 1 コマで同じ検算をしたものです。文字の行が並ぶ画面のように同じ模様が繰り返される絵は、どこへ動いたのか決まらず、補間が苦手とする（誰がやっても難しい）ため、判定には使わず参考にとどめています。実際の映像での出来は、次の「実際の映像での検算」で判定します。");
+            why.Add("調べ方: 絵を全体で一定の距離だけ動かし、一部の四角だけ別の向きに動かした「次のコマ」を作ります。2 つの真ん中の絵は正確に分かるので、補間で作った絵と比べました。PSNR は正解との近さを表す数字で、大きいほど近く、何もしない場合の目安は 10〜15 dB、見分けがつかないのは 40 dB 以上です。" +
+                "OK の目安は、背景 33 dB 以上かつ「重ねただけ」より 6 dB 以上よい、四角が「重ねただけ」より 3 dB 以上よい、動きの向きが 85% 以上合っている、真っ黒なブロックがない、です。NG は背景 28 dB 未満・「重ねただけ」より 3 dB 未満の改善・四角が「重ねただけ」より悪い・動きの合う割合 60% 未満・黒いブロックあり、のいずれかです。" +
+                "模様のない平らな所は、動きが決まらない（どこに動いても同じに見える）ため、動きの向きの数字は模様のある所だけで数えています。画像は左から「2コマを重ねただけ」「補間」「正解」です（四角の端の付近を切り出しています）。");
+            item.Verdict = v;
+            item.Summary = v switch
+            {
+                Verdict.Ok => "動きを正しく読み取り、正解に近い絵を作れています",
+                Verdict.Warn => "少し注意が必要です",
+                _ => "問題があります",
+            };
+            item.Explanation = string.Join("\n", why);
+            sec.Items.Add(item);
+        }
+        finally { still?.Dispose(); }
+    }
+
+    // =============================================================================================
+    //  A-2. Hold-out on live frames
+    // =============================================================================================
+
+    private async Task InterpLiveStep(TestSection sec, List<CaptureMode> modes)
+    {
+        var item = new TestItem { Name = "フレーム補間の画質: 実際の映像での検算" };
+        double panel = _topt.Target.RefreshHz;
+        CaptureMode? mode = PickInterpMode(modes, panel);
+        if (mode == null)
+        {
+            item.Summary = "このモニターではフレーム補間が使えないため試験しません";
+            item.Explanation = $"フレーム補間は、モニターの更新が映像のコマ数の 1.1 倍以上のときだけ働きます。このモニター（{panel:0} Hz）では、どの映像モードでも条件を満たしません。";
+            sec.Items.Add(item);
+            return;
+        }
+        if (_video is not D3DVideoEngine eng)
+        {
+            item.Summary = "Direct3D の映像ではないため確認できませんでした";
+            sec.Items.Add(item);
+            return;
+        }
+
+        // Anything over the video would make Windows compose the monitor; keep the caption away while frames are taken.
+        if (_testCaption != null) _testCaption.Visible = false;
+        Bitmap? strip = null;
+        try
+        {
+            _settings.Interpolation = true;
+            EnsureEngine(false, mode);
+            await Wait(SettleMs + 500);
+            InterpolationStatus? st = _video.InterpolationState;
+            item.Num("映像", $"{ModeLabel(mode)}（モニターの更新 {panel:0} Hz）");
+            if (st is not { Active: true })
+            {
+                item.Summary = "フレーム補間が働かなかったため確認できませんでした";
+                item.Explanation = "理由: " + InterpIdleText(st);
+                sec.Items.Add(item);
+                return;
+            }
+
+            var triples = new List<InterpCheck.Triple>();
+            int tried = 0;
+            long after = 0;
+            double bestMoving = 0;
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 3000 && tried < 14)
+            {
+                await Wait(100);
+                long a0 = after; double bm = bestMoving;
+                (long Seq, InterpCheck.Triple? T, Bitmap? Strip) got = await Task.Run<(long Seq, InterpCheck.Triple? T, Bitmap? Strip)>(() =>
+                {
+                    if (!eng.DebugInterpHoldout(a0, out long ls, out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid))
+                        return (0L, null, null);
+                    try
+                    {
+                        InterpCheck.Triple t = InterpCheck.Analyze(f0!, f1!, f2!, mid!, bm, out Bitmap? sp);
+                        return (ls, t, sp);
+                    }
+                    finally { f0?.Dispose(); f1?.Dispose(); f2?.Dispose(); mid?.Dispose(); }
+                });
+                if (got.T == null) continue;
+                after = got.Seq; tried++;
+                triples.Add(got.T);
+                if (got.Strip != null) { strip?.Dispose(); strip = got.Strip; bestMoving = got.T.Moving; }
+            }
+
+            int still = triples.Count(t => t.Moving < 0.01);
+            var moving = triples.Where(t => t.Moving >= 0.01).ToList();
+            int dup = moving.Count(t => t.Dup);
+            var used = moving.Where(t => !t.Dup).ToList();
+            item.Num("調べたコマの組", $"{triples.Count} 組（連続する 3 コマ × 約 3 秒）")
+                .Num("動きがなかった組 / 同じ絵が続いていた組 / 判定に使った組", $"{still} / {dup} / {used.Count}");
+            if (moving.Count > 0)
+                item.Num("絵が動いた範囲（中央値）", $"画面の {Pct(InterpCheck.Median(moving.Select(t => t.Moving)))}");
+
+            if (triples.Count == 0)
+            {
+                item.Summary = "連続する 3 コマを取れなかったため判定できません";
+                item.Explanation = "補間用のコマの保管場所から、間隔の揃った連続 3 コマを取り出せませんでした（映像が止まっていたか、コマの間隔が乱れていた可能性があります）。";
+            }
+            else if (used.Count < 3 && dup >= 3 && dup >= still)
+            {
+                item.Summary = "動きはありましたが、同じ絵が続いていたため判定できません";
+                item.Explanation = "映像は動いていましたが、真ん中のコマが前後のどちらかと同じ絵でした。ゲームの描画が映像のコマ数より少ない回数でしか更新されていない（例: 30 fps のゲームを 60 fps で出力している）ときに起きます。この場合は補間で作った絵と比べる「本当の真ん中のコマ」が存在しないため判定できません。映像のコマ数と同じ回数で描画しているゲームで試験してください。";
+            }
+            else if (used.Count < 3)
+            {
+                item.Summary = "映像に動きがなかったため判定できません（ゲームの画面など動きのある映像を映して試験すると判定できます）";
+                item.Explanation = "補間の良し悪しは、動いている絵でないと比べられません。映像がほぼ静止画（デスクトップなど）だったため、OK とも NG とも言わずに「情報」としています。ゲームなど動きのある画面を映してもう一度試験してください。";
+            }
+            else
+            {
+                double pI = InterpCheck.Median(used.Select(t => t.InterpPsnr)), pB = InterpCheck.Median(used.Select(t => t.BlendPsnr)), pR = InterpCheck.Median(used.Select(t => t.RepeatPsnr));
+                double aI = InterpCheck.Median(used.Select(t => t.InterpAll)), aB = InterpCheck.Median(used.Select(t => t.BlendAll)), aR = InterpCheck.Median(used.Select(t => t.RepeatAll));
+                double mI = InterpCheck.Median(used.Select(t => t.InterpMae)), mB = InterpCheck.Median(used.Select(t => t.BlendMae)), mR = InterpCheck.Median(used.Select(t => t.RepeatMae));
+                item.Num("動いた部分の PSNR（補間 / 重ね合わせ / 前のコマの繰り返し）", $"{pI:0.0} / {pB:0.0} / {pR:0.0} dB")
+                    .Num("動いた部分の平均の誤差（同じ順、0〜255）", $"{mI:0.0} / {mB:0.0} / {mR:0.0}")
+                    .Num("画面全体の PSNR（同じ順）", $"{aI:0.0} / {aB:0.0} / {aR:0.0} dB");
+                double best = Math.Max(pB, pR);
+                Verdict v = pI >= best - 0.3 ? Verdict.Ok : pI >= best - 1.5 ? Verdict.Warn : Verdict.Ng;
+                var why = new List<string>();
+                if (pI >= best + 0.5) why.Add($"補間の絵は、本当の真ん中のコマに「重ね合わせ」より {pI - pB:0.0} dB、「前のコマの繰り返し」より {pI - pR:0.0} dB 近く、はっきり良くなっています。");
+                else if (v == Verdict.Ok) why.Add("補間の絵は、重ね合わせ・繰り返しと同じくらいか、それ以上に本当の真ん中のコマに近いです。この映像では差が小さいだけで、悪くはなっていません。");
+                else if (v == Verdict.Warn) why.Add($"補間の絵が、重ね合わせか繰り返しのよい方より {best - pI:0.0} dB 離れています。軽い不具合の範囲ですが、この映像は動きが速い・画面が切り替わるなど補間の苦手な場面だった可能性もあります。");
+                else why.Add($"補間の絵が、重ね合わせか繰り返しのよい方より {best - pI:0.0} dB も本当の真ん中のコマから離れています。補間しないほうがよいくらいです。");
+                why.Add($"調べ方: 実際の映像から連続する 3 コマ（F0・F1・F2）を取り、F0 と F2 だけから、実際の補間処理で真ん中の絵を作って、本当の F1 と比べました。比べた相手は「F0 と F2 を半分ずつ重ねただけ」と「F0 をそのまま出す（繰り返し）」です。動いた部分（F0 と F2 で絵が変わった所）だけで数え、組ごとの数字の中央値で判定しています。補間は実際の使用（1 コマ間隔）より遠い 2 コマ間隔で作っているため、実際より少し厳しい条件です。" +
+                    "OK は補間が重ね合わせ・繰り返しのよい方と同じ（差 0.3 dB 以内）かそれ以上、注意は 1.5 dB 以内の劣り、NG はそれ以上の劣りです。PSNR は大きいほど本当の絵に近い数字です。画像は左から「前のコマの繰り返し」「重ね合わせ」「補間」「実際のコマ」で、一番動いた場面の一部です。");
+                if (still + dup > 0) why.Add($"動きのなかった {still} 組と、同じ絵が続いていた {dup} 組は数えていません。");
+                item.Verdict = v;
+                item.Summary = v switch
+                {
+                    Verdict.Ok => "補間は、重ね合わせや繰り返しと同じかそれ以上に本物へ近い絵を作れています",
+                    Verdict.Warn => "少し注意が必要です",
+                    _ => "問題があります",
+                };
+                item.Explanation = string.Join("\n", why);
+                if (strip != null)
+                {
+                    const string file = "interp_live.png";
+                    strip.Save(Path.Combine(_rep.Folder, file), System.Drawing.Imaging.ImageFormat.Png);
+                    item.Images.Add(file);
+                }
+            }
+            sec.Items.Add(item);
+        }
+        finally { strip?.Dispose(); StopInterpForTest(); }
+    }
+
+    // =============================================================================================
+    //  B. Updates lowered by something drawn over the video
+    // =============================================================================================
+
+    private async Task<(double Rate, double ObservedHz)> PresentRate(int ms, double srcFps, double panel)
+    {
+        _video.BeginMeasure();
+        long p0 = _video.FramesPresented;
+        var sw = Stopwatch.StartNew();
+        double rate = 0;
+        RenderMeasurement? meas = null;
+        try
+        {
+            await Wait(ms);
+            double el = sw.Elapsed.TotalSeconds;
+            rate = el > 0 ? (_video.FramesPresented - p0) / el : 0;
+        }
+        finally { meas = _video.EndMeasure(); }
+        double hz = 0;
+        try { if (meas != null) hz = TestProbes.AnalyzePacing(meas.Pacing, srcFps, panel).ObservedHz; } catch { }
+        return (rate, hz);
+    }
+
+    private async Task OverlayCapStep(TestSection sec, List<CaptureMode> modes)
+    {
+        var item = new TestItem { Name = "重ねた表示による更新の低下" };
+        double panel = _topt.Target.RefreshHz;
+        DisplayInfo? primary = Displays.List().FirstOrDefault(d => d.Primary);
+        if (_topt.Target.Primary)
+        {
+            item.Summary = "試験するモニターがメインのモニターなので、この低下は起きません";
+            item.Explanation = "この低下は、メインではないモニターを、メインのモニターとは違う更新の速さで使っているときに起きます。試験するモニターがメインのため調べていません。";
+            sec.Items.Add(item);
+            return;
+        }
+        if (primary != null && Math.Abs(primary.RefreshHz - panel) <= 1)
+        {
+            item.Summary = "メインのモニターと更新の速さが同じなので、この低下は起きません";
+            item.Num("更新の速さ", $"試験するモニター {panel:0} Hz / メインのモニター {primary.RefreshHz} Hz");
+            item.Explanation = "この低下は、2 つのモニターの更新の速さが違うときに起きます。同じ速さなので調べていません。";
+            sec.Items.Add(item);
+            return;
+        }
+
+        CaptureMode? mode = PickInterpMode(modes, panel);
+        bool interp = mode != null;
+        mode ??= PickMode(modes, 1920, 1080, 0) ?? modes.FirstOrDefault();
+        if (mode == null)
+        {
+            item.Summary = "映像のモードがないため調べられませんでした";
+            sec.Items.Add(item);
+            return;
+        }
+
+        if (_testCaption != null) _testCaption.Visible = false;
+        bool wasVisible = _info.Visible;
+        try
+        {
+            _settings.Interpolation = interp;
+            EnsureEngine(false, mode);
+            if (wasVisible) ToggleInfo();      // the baseline needs nothing over the video
+            await Wait(SettleMs);
+            double srcFps = _video.NegotiatedFps > 0 ? _video.NegotiatedFps : mode.Fps;
+            bool interpOn = interp && _video.InterpolationState is { Active: true };
+            item.Num("映像", ModeLabel(mode) + (interpOn ? "（フレーム補間オン）" : "（フレーム補間なし）"))
+                .Num("更新の速さ", $"試験するモニター {panel:0} Hz / メインのモニター {(primary != null ? primary.RefreshHz + " Hz" : "不明")}");
+            if (interp && !interpOn)
+                item.Num("注意", "フレーム補間が働かなかったため、補間なしで測っています");
+            double expect = interpOn ? panel : Math.Min(srcFps, panel);
+
+            var clear = await PresentRate(2000, srcFps, panel);
+            ToggleInfo();                      // the real info display, as in normal use
+            await Wait(700);
+            var over = await PresentRate(2000, srcFps, panel);
+            ToggleInfo();
+            await Wait(700);
+            var back = await PresentRate(1500, srcFps, panel);
+
+            item.Num("何も重ねていないとき", $"{clear.Rate:0.0} fps" + (clear.ObservedHz > 0 ? $"（実測の更新 {clear.ObservedHz:0.0} Hz）" : ""))
+                .Num("情報表示を重ねたとき", $"{over.Rate:0.0} fps" + (over.ObservedHz > 0 ? $"（実測の更新 {over.ObservedHz:0.0} Hz）" : ""))
+                .Num("情報表示を消したあと", $"{back.Rate:0.0} fps" + (back.ObservedHz > 0 ? $"（実測の更新 {back.ObservedHz:0.0} Hz）" : ""))
+                .Num("期待した数", $"{expect:0} fps");
+
+            if (clear.Rate < 5)
+            {
+                item.Verdict = Verdict.Warn;
+                item.Summary = "映像が出ていなかったため比べられませんでした";
+                item.Explanation = "何も重ねていない状態で映像のコマがほとんど表示されなかったため、重ねたときとの比較をしていません。";
+            }
+            else if (over.Rate >= clear.Rate * 0.9)
+            {
+                item.Verdict = Verdict.Ok;
+                item.Summary = "重ねた表示があっても更新は下がりません";
+                item.Explanation = $"情報表示を重ねても、表示されるコマ数は {clear.Rate:0} fps から {over.Rate:0} fps とほぼ変わりませんでした。";
+            }
+            else
+            {
+                item.Verdict = Verdict.Info;
+                item.Summary = $"情報表示を重ねると、更新が {clear.Rate:0} から {over.Rate:0} fps に下がりました";
+                item.Explanation =
+                    "Windows は、映像の上に何かが重なっている間、このモニターをメインのモニターとほぼ同じ速さ" +
+                    (primary != null ? $"（{primary.RefreshHz} Hz）" : "") +
+                    "でしか更新しません。2 つのモニターの更新の速さが違う（" + $"{panel:0} Hz と " + (primary != null ? primary.RefreshHz + " Hz" : "不明") + "）ために起きる、Windows 側の仕組みです。\n" +
+                    (back.Rate >= clear.Rate * 0.9
+                        ? $"重ねた表示を消すと、{back.Rate:0} fps に戻りました（試験で確認済み）。\n"
+                        : $"重ねた表示を消したあとも {back.Rate:0} fps のままでした（元に戻らない場合があります）。\n") +
+                    "通知、情報表示、ほかのウィンドウ、タスクバーなど、映像の上に重なるものはすべて同じ影響があります。ゲームを全力の更新の速さで見たいときは、これらを映像の上に出さないでください。\n" +
+                    "このモニターをメインのモニターにすると避けられる可能性がありますが、試験ではメインを切り替えて確かめていないため、未確認です。";
+            }
+            sec.Items.Add(item);
+        }
+        finally
+        {
+            if (_info.Visible != wasVisible) ToggleInfo();
+            StopInterpForTest();
+        }
+    }
+}

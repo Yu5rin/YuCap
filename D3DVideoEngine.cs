@@ -305,6 +305,20 @@ public sealed class D3DVideoEngine : IVideoEngine
         return ok;
     }
 
+    /// <summary>Test mode: three consecutive live frames plus the picture interpolated between the outer two.</summary>
+    internal bool DebugInterpHoldout(long afterSeq, out long lastSeq,
+        out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
+    {
+        Bitmap? r0 = null, r1 = null, r2 = null, rm = null;
+        long ls = 0;
+        bool ok = false;
+        Session? s = _s;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.InterpDebugHoldout(afterSeq, out ls, out r0, out r1, out r2, out rm); return null; }, 5000, needFrame: false, out _);
+        f0 = r0; f1 = r1; f2 = r2; mid = rm; lastSeq = ls;
+        return ok;
+    }
+
     internal bool DebugInterpSynthetic(Bitmap a, Bitmap b, double alpha, int benchFrames,
         out Bitmap? mid, out float[] fieldXy, out Size fieldSize, out string timing)
     {

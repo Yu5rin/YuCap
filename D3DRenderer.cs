@@ -1224,6 +1224,64 @@ internal sealed class D3DRenderer : IDisposable
         }
     }
 
+    /// <summary>Test-mode hook (live hold-out check): with interpolation active, take the newest three consecutive
+    /// frames F0, F1, F2 of the ring (evenly spaced in time, the first one newer than <paramref name="afterSeq"/>),
+    /// interpolate between F0 and F2 at 0.5 with the real pipeline and read all four pictures back. The live
+    /// pair cache is invalidated (redone at the next refresh).</summary>
+    internal bool InterpDebugHoldout(long afterSeq, out long lastSeq, out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
+    {
+        f0 = f1 = f2 = mid = null; lastSeq = 0;
+        if (!InterpAvailable) return false;
+        lock (FrameLock)
+        {
+            if (!_interpHold) return false;
+            Slot? s0 = null, s1 = null, s2 = null;
+            long top = 0;
+            foreach (Slot s in _ring) top = Math.Max(top, s.Seq);
+            Slot? Find(long q) { foreach (Slot s in _ring) if (s.Seq == q && q != 0) return s; return null; }
+            for (long q = top; q - 2 > afterSeq; q--)
+            {
+                Slot? c2 = Find(q), c1 = Find(q - 1), c0 = Find(q - 2);
+                if (c0 == null || c1 == null || c2 == null) continue;
+                if (c0.W != c1.W || c1.W != c2.W || c0.H != c1.H || c1.H != c2.H) continue;
+                long d1 = c1.Smooth - c0.Smooth, d2 = c2.Smooth - c1.Smooth;
+                if (d1 <= 0 || d2 <= 0 || Math.Abs(d1 - d2) > 0.35 * Math.Max(d1, d2)) continue;   // a hiccup in between: not a fair test
+                s0 = c0; s1 = c1; s2 = c2;
+                break;
+            }
+            if (s0 == null || s1 == null || s2 == null) return false;
+
+            int rot = _interpKeyValid ? _interpKey.Rotation : 0;
+            bool mir = _interpKeyValid && _interpKey.Mirror;
+            VideoAdjustments adj = _interpKeyValid ? _interpKey.Adj : VideoAdjustments.Neutral;
+            System.Windows.Forms.Padding crop = _interpKeyValid ? _interpKey.Crop : default;
+            Size o = Oriented(CropMath.Effective(new Size(s0.W, s0.H), crop).Size, rot);
+            OriFrame? o0 = null, o1 = null, o2 = null;
+            try
+            {
+                EnsureOriFrame(ref o0, o); EnsureOriFrame(ref o1, o); EnsureOriFrame(ref o2, o);
+                ConvertSlot(s0, o0!, rot, mir, adj, crop);
+                ConvertSlot(s1, o1!, rot, mir, adj, crop);
+                ConvertSlot(s2, o2!, rot, mir, adj, crop);
+                EstimateMotion(o0!, o2!);
+                EnsureOriented(o);
+                Synthesize(o0!, o2!, 0.5f);
+                var full = new Rectangle(Point.Empty, o);
+                f0 = ReadBack(o0!.Tex, full); f1 = ReadBack(o1!.Tex, full); f2 = ReadBack(o2!.Tex, full);
+                mid = ReadBack(_oriented!, full);
+                lastSeq = s2.Seq;
+                return true;
+            }
+            finally
+            {
+                Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+                o0?.Dispose(); o1?.Dispose(); o2?.Dispose();
+                _curA = _curB = _meA = _meB = 0;      // the field and _oriented now belong to this test
+                _lastAlpha = -1;
+            }
+        }
+    }
+
     private void Upload(OriFrame f, Bitmap bmp)
     {
         BitmapData bd = bmp.LockBits(new Rectangle(Point.Empty, bmp.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);

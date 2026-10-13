@@ -397,7 +397,7 @@ public sealed partial class MainForm
         TestSection secCap = rep.AddSection("2. 取り込み",
             "キャプチャカードから映像が指定のコマ数どおり届くかを、すべての映像モードで調べます。");
         TestSection secRender = rep.AddSection("3. 表示のなめらかさ・負荷",
-            "モニターに全画面で出したときの、コマ数・GPU の余裕・コマの出方（フレームペーシング）・可変リフレッシュレート（VRR）の効きを調べます。");
+            "モニターに全画面で出したときの、コマ数・GPU の余裕・コマの出方（フレームペーシング）・可変リフレッシュレート（VRR）の効きを調べます。続けて、フレーム補間の絵の正しさと、映像の上に何かを重ねたときの更新の低下も調べます。");
         TestSection secNotice = rep.AddSection("4. 通知の表示",
             "全画面のとき、通知・一時停止の画像・情報表示が映像の上に見えているかを、画面の色で確かめます。");
         TestSection secFsr = rep.AddSection("5. FSR の効き",
@@ -408,7 +408,7 @@ public sealed partial class MainForm
         TestSection secAudio = rep.AddSection("8. 音声");
         TestSection secDlg = rep.AddSection("9. ダイアログの表示崩れ",
             "設定のダイアログを日本語と英語で作り、部品が重なったり枠からはみ出したりしていないかを調べます。");
-        TestSection secManual = rep.AddSection("10. 目で確かめる項目", "数字にできないので、ご自身の目で確かめてください。");
+        TestSection secManual = rep.AddSection("10. 目で確かめる項目", "自動では測れない項目だけを載せています（好みの問題や、基準になる映像が必要なもの）。それぞれに測れない理由を書きました。");
 
         if (videoOk)
         {
@@ -431,6 +431,9 @@ public sealed partial class MainForm
                 steps.Add((L.F("表示の計測: {0}", cc.Label), secRender, () => RenderStep(secRender, cc, vrrNotes)));
             }
             steps.Add((L.F("表示の計測: {0}", L.T("まとめ")), secRender, () => { VrrSummary(secRender, vrrNotes); return Task.CompletedTask; }));
+            steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（既知の動き）")), secRender, () => InterpSynthStep(secRender, modes)));
+            steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（実際の映像）")), secRender, () => InterpLiveStep(secRender, modes)));
+            steps.Add((L.F("表示の計測: {0}", L.T("重ねた表示による更新の低下")), secRender, () => OverlayCapStep(secRender, modes)));
 
             // 4. notices, with low latency off and on
             CaptureMode? m1080 = PickMode(modes, 1920, 1080, maxFps: 60) ?? PickMode(modes, 1920, 1080, 0);
@@ -507,19 +510,25 @@ public sealed partial class MainForm
         {
             Name = "シャープさの好み", Verdict = Verdict.Info,
             Summary = "再生中に Q を押している間は標準の拡大、離すと FSR になります。",
-            Explanation = "好みは人によって違います。いろいろなシーンで見比べて、シャープさ（表示メニュー → 拡大の画質）を決めてください。5 の項目の画像も参考になります。",
+            Explanation = "【測れない理由】輪郭の強さは5の項目で数字にしていますが、どれくらいのくっきり感を心地よいと感じるかは人によって違い、正解がありません。いろいろなシーンで見比べて、シャープさ（表示メニュー → 拡大の画質）を決めてください。5 の項目の画像も参考になります。",
+        });
+        secManual.Items.Add(new TestItem
+        {
+            Name = "補間した映像の見た目の好み", Verdict = Verdict.Info,
+            Summary = "補間の正しさは3の項目で数字にしています。ぬるぬるした動きが好みかどうかは、ご自身で。",
+            Explanation = "【測れない理由】フレーム補間は動きがなめらかになる代わりに、映画のような「コマの間」の感じが薄れ、映像が少し遅れます。この感じ方の良し悪しは人によって違うため、数字では決められません。好みでなければ、メニューの「フレーム補間」をオフにしてください。",
         });
         secManual.Items.Add(new TestItem
         {
             Name = "音ズレ", Verdict = Verdict.Info,
             Summary = "手をたたく動画などで、映像の動きと音が合っているか見てください。",
-            Explanation = "ずれていたら、デバイス → 音ズレ補正 で調整します（音を遅らせる／映像を遅らせる）。8 の項目の数字は、音声側のたまっている量の目安です。",
+            Explanation = "【測れない理由】映像の遅れ（3 の数字）と音声側のたまっている量（8）は測っていますが、「映像のこの瞬間に音が鳴る」という基準を持つ映像がないと、実際の音ズレは測れません。ずれていたら、デバイス → 音ズレ補正 で調整します（音を遅らせる／映像を遅らせる）。",
         });
         secManual.Items.Add(new TestItem
         {
-            Name = "全体の見た目", Verdict = Verdict.Info,
-            Summary = "色・明るさ・文字の読みやすさ・画面のちらつきがないかを見てください。",
-            Explanation = "ゲーム画面や文字の多い画面を全画面で見て、気になる点があればその設定（プロファイル）を保存しておくと切り替えが楽になります。",
+            Name = "文字の読みやすさ・色合いの好み", Verdict = Verdict.Info,
+            Summary = "ゲーム画面や文字の多い画面を全画面で見て、読みにくい所や好みに合わない色がないか見てください。",
+            Explanation = "【測れない理由】色や明るさの調整が正しく効くかは7の項目で、映像のカクつきやちらつきは3の項目で測っています。ここに残るのは、文字が読みやすいか・色合いが好みに合うかという感じ方の部分で、数字にはできません。気になる点があれば、その設定（プロファイル）を保存しておくと切り替えが楽になります。",
         });
         rep.Save();
     }

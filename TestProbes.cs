@@ -397,6 +397,28 @@ internal static class TestProbes
         outBmp.Save(path, ImageFormat.Png);
     }
 
+    /// <summary>Several pictures side by side, each cut to the same <paramref name="tile"/>, with a caption above each.</summary>
+    public static void SaveStrip(Bitmap[] panels, string[] labels, Rectangle tile, string path)
+    {
+        const int head = 26, gap = 8;
+        int n = panels.Length;
+        using var outBmp = new Bitmap(tile.Width * n + gap * (n - 1), tile.Height + head, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(outBmp))
+        {
+            g.Clear(Color.FromArgb(24, 24, 24));
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+            using var font = new Font("Yu Gothic UI", 10f, FontStyle.Bold);
+            for (int i = 0; i < n; i++)
+            {
+                int x = i * (tile.Width + gap);
+                g.DrawString(labels[i], font, Brushes.White, x + 4, 3);
+                g.DrawImage(panels[i], new Rectangle(x, head, tile.Width, tile.Height), tile, GraphicsUnit.Pixel);
+            }
+        }
+        outBmp.Save(path, ImageFormat.Png);
+    }
+
     // ================================================================ screen sampling
 
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point p);
