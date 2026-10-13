@@ -176,10 +176,18 @@ internal sealed class VideoLatencyTracker
         _content[i] = contentTicks;
         _vb[i] = vblankIndex;
         if (_firstShown == 0) _firstShown = returnedTick;
-        // No statistics for a second: estimate from when Present returned (unless the vblank beat supplies it).
-        if (!_statsEverOk && vblankIndex < 0 && returnedTick - _firstShown > Stopwatch.Frequency)
+        // No statistics for a second: estimate from when Present returned. The vblank beat is preferred when it
+        // delivers, but when a composed monitor (something drawn over the video) gives neither real statistics nor a
+        // usable beat, nothing at all would be measured - so the present-return estimate also steps in whenever no
+        // sample of any kind has arrived for a second.
+        long lastStats = Volatile.Read(ref _lastStatsTick), lastSample = Volatile.Read(ref _lastSampleTick);
+        bool statsFlowing = lastStats != 0 && returnedTick - lastStats < Stopwatch.Frequency;
+        bool sampleFlowing = lastSample != 0 && returnedTick - lastSample < Stopwatch.Frequency;
+        if (returnedTick - _firstShown > Stopwatch.Frequency && !statsFlowing &&
+            ((!_statsEverOk && vblankIndex < 0) || !sampleFlowing))
         {
             double ms = (returnedTick - contentTicks) * 1000.0 / Stopwatch.Frequency + _refreshMs;
+            _vb[i] = -1;
             Add(ms, estimated: true);
         }
     }

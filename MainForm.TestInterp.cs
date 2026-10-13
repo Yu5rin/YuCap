@@ -29,6 +29,21 @@ public sealed partial class MainForm
             .ThenBy(m => (long)m.Width * m.Height).First();
     }
 
+    /// <summary>The mode for the live check: games mostly render at 60 fps or less, so a 60 fps (or the highest rate up to
+    /// 60) mode is preferred, because at 120 fps capture a 60 fps game shows every picture twice and the 30 fps one
+    /// four times. Falls back to the usual pick when the monitor cannot refresh clearly above any of those.</summary>
+    private static CaptureMode? PickLiveInterpMode(List<CaptureMode> modes, double refreshHz)
+    {
+        if (refreshHz <= 0) return null;
+        var ok = modes.Where(m => m.Fps >= 24 && m.Fps <= 60 && m.Fps * 1.1 <= refreshHz).ToList();
+        if (ok.Count == 0) return PickInterpMode(modes, refreshHz);
+        int fps = ok.Max(m => m.Fps);
+        return ok.Where(m => m.Fps == fps)
+            .OrderByDescending(m => m.Height == 1080 ? 1 : 0)
+            .ThenByDescending(m => m.Compression == "NV12" ? 1 : 0)
+            .ThenBy(m => (long)m.Width * m.Height).First();
+    }
+
     private void StopInterpForTest()
     {
         if (_settings.Interpolation) { _settings.Interpolation = false; try { _video.Interpolation = false; } catch { } }
@@ -137,7 +152,7 @@ public sealed partial class MainForm
     {
         var item = new TestItem { Name = "フレーム補間の画質: 実際の映像での検算" };
         double panel = _topt.Target.RefreshHz;
-        CaptureMode? mode = PickInterpMode(modes, panel);
+        CaptureMode? mode = PickLiveInterpMode(modes, panel);
         if (mode == null)
         {
             item.Summary = "このモニターではフレーム補間が使えないため試験しません";
@@ -170,55 +185,94 @@ public sealed partial class MainForm
                 return;
             }
 
+            // About half a second of frames is kept in the ring. Every 250 ms the new frames are read, repeated pictures
+            // are dropped, and one triple of consecutive DIFFERENT, evenly spaced pictures is taken from the newest ones.
+            const int pollMs = 250, runMs = 4200, maxTries = 16;
+            double srcFpsNow = _video.NegotiatedFps > 0 ? _video.NegotiatedFps : mode.Fps;
+            eng.DebugSetRingExtra((int)Math.Ceiling(srcFpsNow * 0.6) + 4);
+            await Wait(500);
+
             var triples = new List<InterpCheck.Triple>();
-            int tried = 0;
+            var live = new InterpCheck.LiveFrames();
+            int tried = 0, pickIndex = 0, lost = 0;
             long after = 0;
             double bestMoving = 0;
             var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < 3000 && tried < 14)
+            while (sw.ElapsedMilliseconds < runMs && tried < maxTries)
             {
-                await Wait(100);
-                long a0 = after; double bm = bestMoving;
-                (long Seq, InterpCheck.Triple? T, Bitmap? Strip) got = await Task.Run<(long Seq, InterpCheck.Triple? T, Bitmap? Strip)>(() =>
+                await Wait(pollMs);
+                var fresh = new List<D3DRenderer.ScanFrame>();
+                long a0 = after;
+                bool scanned = await Task.Run(() => eng.DebugInterpScan(a0, fresh));
+                if (!scanned) continue;
+                foreach (D3DRenderer.ScanFrame f in fresh) { live.Add(f.Seq, f.Smooth, f.W, f.H, f.Luma); after = Math.Max(after, f.Seq); }
+                if (!live.TryPick(ref pickIndex, out var u0, out var u1, out var u2)) continue;
+
+                double bm = bestMoving;
+                (InterpCheck.Triple? T, Bitmap? Strip) got = await Task.Run<(InterpCheck.Triple?, Bitmap?)>(() =>
                 {
-                    if (!eng.DebugInterpHoldout(a0, out long ls, out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid))
-                        return (0L, null, null);
+                    if (!eng.DebugInterpHoldout(u0.Seq, u1.Seq, u2.Seq, out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid))
+                        return (null, null);
                     try
                     {
                         InterpCheck.Triple t = InterpCheck.Analyze(f0!, f1!, f2!, mid!, bm, out Bitmap? sp);
-                        return (ls, t, sp);
+                        return (t, sp);
                     }
                     finally { f0?.Dispose(); f1?.Dispose(); f2?.Dispose(); mid?.Dispose(); }
                 });
-                if (got.T == null) continue;
-                after = got.Seq; tried++;
+                if (got.T == null) { lost++; continue; }
+                tried++;
                 triples.Add(got.T);
                 if (got.Strip != null) { strip?.Dispose(); strip = got.Strip; bestMoving = got.T.Moving; }
             }
+            eng.DebugSetRingExtra(0);
+
+            var (windows, evenWindows) = live.CountWindows();
+            double gapMs = live.MedianGapMs();
+            double uniqueFps = gapMs > 0 ? 1000.0 / gapMs : 0;
+            item.Num("映像のコマ（約 4 秒）", $"{live.Captured} コマのうち、前と違う絵は {live.Unique.Count} コマ、前と同じ絵の繰り返しは {live.Repeats} コマ" +
+                (uniqueFps > 0 ? $"（絵が変わる速さの目安 約 {uniqueFps:0} 回/秒）" : ""))
+                .Num("連続する 3 つの違う絵のうち、間隔が揃っていた組", windows > 0 ? $"{evenWindows} / {windows}（真ん中が本当の中間になるのは、前後の間隔が ±25% 以内のとき）" : "なし（違う絵が 3 つ続かなかった）");
 
             int still = triples.Count(t => t.Moving < 0.01);
             var moving = triples.Where(t => t.Moving >= 0.01).ToList();
             int dup = moving.Count(t => t.Dup);
             var used = moving.Where(t => !t.Dup).ToList();
-            item.Num("調べたコマの組", $"{triples.Count} 組（連続する 3 コマ × 約 3 秒）")
-                .Num("動きがなかった組 / 同じ絵が続いていた組 / 判定に使った組", $"{still} / {dup} / {used.Count}");
+            item.Num("調べた絵の組", $"{triples.Count} 組（違う絵が連続する 3 コマ × 約 4 秒）")
+                .Num("動きがなかった組 / 判定に使えなかった組 / 判定に使った組", $"{still} / {dup} / {used.Count}");
             if (moving.Count > 0)
                 item.Num("絵が動いた範囲（中央値）", $"画面の {Pct(InterpCheck.Median(moving.Select(t => t.Moving)))}");
 
+            // why too few pairs could be used, from what was measured (shown when the verdict cannot be given)
+            string Reasons()
+            {
+                var r = new List<string>();
+                if (live.Unique.Count < 3)
+                    r.Add($"4 秒の間に絵が変わったのは {live.Unique.Count} 回だけでした（映像がほぼ止まっていました）。");
+                else
+                {
+                    if (windows > 0 && evenWindows * 2 < windows)
+                        r.Add($"絵が変わる間隔が不揃いでした（間隔が揃っていたのは {evenWindows}/{windows} 組）。ゲームの描画の間隔が一定でないか、映像のコマ数と描画の回数が割り切れない（例: 45 fps のゲームを 60 fps で出力）ときに起きます。真ん中の絵が本当の中間にならない組は使いません。");
+                    if (still > 0) r.Add($"動きのない組が {still} 組ありました（画面の一部しか変わらない場面や、止まった場面）。");
+                    if (dup > 0) r.Add($"前後のどちらかと同じ絵だった組が {dup} 組ありました。");
+                    if (lost > 0) r.Add($"保管場所から取り出せなかった組が {lost} 組ありました。");
+                }
+                if (r.Count == 0) r.Add("条件に合う組が十分に集まりませんでした。");
+                return string.Join("\n", r);
+            }
+
             if (triples.Count == 0)
             {
-                item.Summary = "連続する 3 コマを取れなかったため判定できません";
-                item.Explanation = "補間用のコマの保管場所から、間隔の揃った連続 3 コマを取り出せませんでした（映像が止まっていたか、コマの間隔が乱れていた可能性があります）。";
+                item.Summary = live.Unique.Count < 3 ? "映像がほぼ止まっていたため判定できません（ゲームなど動きのある映像を映して試験してください）"
+                    : "間隔の揃った違う 3 コマを取れなかったため判定できません";
+                item.Explanation = Reasons() + "\n実際の映像での補間の検算は、映像のコマ数と同じ回数で描画しているゲーム（60 fps の映像なら 60 fps のゲーム）で、動きのある場面を映すと判定できます。";
             }
-            else if (used.Count < 3 && dup >= 3 && dup >= still)
+            else if (used.Count < 5)
             {
-                item.Summary = "動きはありましたが、同じ絵が続いていたため判定できません";
-                item.Explanation = "映像は動いていましたが、真ん中のコマが前後のどちらかと同じ絵でした。ゲームの描画が映像のコマ数より少ない回数でしか更新されていない（例: 30 fps のゲームを 60 fps で出力している）ときに起きます。この場合は補間で作った絵と比べる「本当の真ん中のコマ」が存在しないため判定できません。映像のコマ数と同じ回数で描画しているゲームで試験してください。";
-            }
-            else if (used.Count < 3)
-            {
-                item.Summary = "映像に動きがなかったため判定できません（ゲームの画面など動きのある映像を映して試験すると判定できます）";
-                item.Explanation = "補間の良し悪しは、動いている絵でないと比べられません。映像がほぼ静止画（デスクトップなど）だったため、OK とも NG とも言わずに「情報」としています。ゲームなど動きのある画面を映してもう一度試験してください。";
+                item.Summary = moving.Count == 0 ? "映像に動きがなかったため判定できません（ゲームの画面など動きのある映像を映して試験すると判定できます）"
+                    : $"判定に使える組が {used.Count} 組と少なかったため、判定しません";
+                item.Explanation = $"判定に使えた組は {used.Count} 組で、判定に必要な 5 組（目標は 10 組以上）に届きませんでした。\n" + Reasons() +
+                    "\n補間の良し悪しは、動いている絵でないと比べられません。OK とも NG とも言わずに「情報」としています。映像のコマ数と同じ回数で描画しているゲームで、動きのある場面を映してもう一度試験してください。";
             }
             else
             {
@@ -235,9 +289,11 @@ public sealed partial class MainForm
                 else if (v == Verdict.Ok) why.Add("補間の絵は、重ね合わせ・繰り返しと同じくらいか、それ以上に本当の真ん中のコマに近いです。この映像では差が小さいだけで、悪くはなっていません。");
                 else if (v == Verdict.Warn) why.Add($"補間の絵が、重ね合わせか繰り返しのよい方より {best - pI:0.0} dB 離れています。軽い不具合の範囲ですが、この映像は動きが速い・画面が切り替わるなど補間の苦手な場面だった可能性もあります。");
                 else why.Add($"補間の絵が、重ね合わせか繰り返しのよい方より {best - pI:0.0} dB も本当の真ん中のコマから離れています。補間しないほうがよいくらいです。");
-                why.Add($"調べ方: 実際の映像から連続する 3 コマ（F0・F1・F2）を取り、F0 と F2 だけから、実際の補間処理で真ん中の絵を作って、本当の F1 と比べました。比べた相手は「F0 と F2 を半分ずつ重ねただけ」と「F0 をそのまま出す（繰り返し）」です。動いた部分（F0 と F2 で絵が変わった所）だけで数え、組ごとの数字の中央値で判定しています。補間は実際の使用（1 コマ間隔）より遠い 2 コマ間隔で作っているため、実際より少し厳しい条件です。" +
+                why.Add($"調べ方: 実際の映像から、違う絵が連続し時間の間隔が揃った 3 コマ（F0・F1・F2）を取り、F0 と F2 だけから、実際の補間処理で真ん中の絵を作って、本当の F1 と比べました。比べた相手は「F0 と F2 を半分ずつ重ねただけ」と「F0 をそのまま出す（繰り返し）」です。動いた部分（F0 と F2 で絵が変わった所）だけで数え、組ごとの数字の中央値で判定しています。補間は実際の使用（1 コマ間隔）より遠い 2 コマ間隔で作っているため、実際より少し厳しい条件です。" +
                     "OK は補間が重ね合わせ・繰り返しのよい方と同じ（差 0.3 dB 以内）かそれ以上、注意は 1.5 dB 以内の劣り、NG はそれ以上の劣りです。PSNR は大きいほど本当の絵に近い数字です。画像は左から「前のコマの繰り返し」「重ね合わせ」「補間」「実際のコマ」で、一番動いた場面の一部です。");
-                if (still + dup > 0) why.Add($"動きのなかった {still} 組と、同じ絵が続いていた {dup} 組は数えていません。");
+                if (still + dup > 0) why.Add($"動きのなかった {still} 組と、前後のどちらかと同じ絵だった {dup} 組は数えていません。");
+                why.Add($"絵が変わらない繰り返しのコマ（{live.Repeats} コマ）は先に取り除き、違う絵が連続して、時間の間隔が揃った（±25% 以内）3 コマだけを使っています。判定に使えた組は {used.Count} 組です。" +
+                    (used.Count < 10 ? "目標の 10 組には届かなかったため、結果はやや不確かです。\n" + Reasons() : ""));
                 item.Verdict = v;
                 item.Summary = v switch
                 {

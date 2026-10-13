@@ -305,17 +305,31 @@ public sealed class D3DVideoEngine : IVideoEngine
         return ok;
     }
 
-    /// <summary>Test mode: three consecutive live frames plus the picture interpolated between the outer two.</summary>
-    internal bool DebugInterpHoldout(long afterSeq, out long lastSeq,
-        out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
+    /// <summary>Test mode: keep more frames in the ring (about half a second) for the live hold-out check.</summary>
+    internal void DebugSetRingExtra(int frames) => _s?.Renderer?.SetRingExtra(frames);
+
+    /// <summary>Test mode: the ring frames newer than <paramref name="afterSeq"/> with their luma (oldest first).</summary>
+    internal bool DebugInterpScan(long afterSeq, List<D3DRenderer.ScanFrame> into)
     {
-        Bitmap? r0 = null, r1 = null, r2 = null, rm = null;
-        long ls = 0;
+        var got = new List<D3DRenderer.ScanFrame>();
         bool ok = false;
         Session? s = _s;
         if (s != null && s.Alive)
-            s.Run(r => { ok = r.InterpDebugHoldout(afterSeq, out ls, out r0, out r1, out r2, out rm); return null; }, 5000, needFrame: false, out _);
-        f0 = r0; f1 = r1; f2 = r2; mid = rm; lastSeq = ls;
+            s.Run(r => { ok = r.InterpDebugScan(afterSeq, got); return null; }, 5000, needFrame: false, out _);
+        into.AddRange(got);
+        return ok;
+    }
+
+    /// <summary>Test mode: three chosen live frames plus the picture interpolated between the outer two.</summary>
+    internal bool DebugInterpHoldout(long q0, long q1, long q2,
+        out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
+    {
+        Bitmap? r0 = null, r1 = null, r2 = null, rm = null;
+        bool ok = false;
+        Session? s = _s;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.InterpDebugHoldout(q0, q1, q2, out r0, out r1, out r2, out rm); return null; }, 5000, needFrame: false, out _);
+        f0 = r0; f1 = r1; f2 = r2; mid = rm;
         return ok;
     }
 

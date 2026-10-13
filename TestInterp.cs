@@ -169,16 +169,17 @@ internal static class InterpCheck
                 res.BgBlend = Program.Psnr(blend, gt, w, bgRect);
                 res.BlkBlend = Program.Psnr(blend, gt, w, blkRect);
 
-                // the field: one vector per 8x8 block, centred at 8fx+4; "textured" = the block of A has real detail,
+                // the field: one vector per block (8x8 source pixels, 16x16 for a wide source), centred at bp*fx + bp/2; "textured" = the block of A has real detail,
                 // so a vector there is well defined (a flat block can match anywhere)
                 var inner = Rectangle.Inflate(blk, -m, -m);
                 var outer = Rectangle.Inflate(blk, m * 2, m * 2);
+                int bp = D3DRenderer.InterpBlockPx(new Size(w, h));
                 for (int fy = 0; fy < fs.Height; fy++)
                     for (int fx = 0; fx < fs.Width; fx++)
                     {
                         float vx = field[(fy * fs.Width + fx) * 2], vy = field[(fy * fs.Width + fx) * 2 + 1];
                         if (float.IsNaN(vx) || float.IsNaN(vy) || float.IsInfinity(vx) || float.IsInfinity(vy) || Math.Abs(vx) > w || Math.Abs(vy) > h) { res.BadVectors++; continue; }
-                        int cx = fx * 8 + 4, cy = fy * 8 + 4;
+                        int cx = fx * bp + bp / 2, cy = fy * bp + bp / 2;
                         if (inner.Contains(cx, cy))
                         {
                             res.BlkN++; double e = Math.Max(Math.Abs(vx - BlockDx), Math.Abs(vy - BlockDy)); res.BlkErr += e; if (e <= 1.0) res.BlkOk++;
@@ -188,7 +189,7 @@ internal static class InterpCheck
                             res.BgN++; double e = Math.Max(Math.Abs(vx - GlobalDx), Math.Abs(vy - GlobalDy)); res.BgErr += e;
                             bool good = e <= 1.0;
                             if (good) res.BgOk++;
-                            if (CellDetail(A, w, h, fx * 8, fy * 8) >= 8.0) { res.BgTexN++; if (good) res.BgTexOk++; }
+                            if (CellDetail(A, w, h, fx * bp + bp / 2 - 4, fy * bp + bp / 2 - 4) >= 8.0) { res.BgTexN++; if (good) res.BgTexOk++; }
                         }
                     }
                 if (res.BgN > 0) res.BgErr /= res.BgN;
@@ -300,6 +301,151 @@ internal static class InterpCheck
             }
         }
         return t;
+    }
+
+    // ================================================================ 3. which live frames are new pictures
+
+    /// <summary>
+    /// Live frames in, evenly spaced triples of DIFFERENT pictures out. A game that renders at 30 or 60 fps and is
+    /// captured at 60 or 120 fps delivers the same picture several times in a row; interpolation between two frames
+    /// can only be judged against a real middle frame, so repeated pictures are dropped first and triples are built
+    /// from consecutive unique pictures whose time gaps are about equal (then the middle one is a true midpoint).
+    /// </summary>
+    internal sealed class LiveFrames
+    {
+        public sealed class Frame { public long Seq, Ticks; public int W, H; }
+
+        /// <summary>A gap may differ from the other by this share of their mean (+-25 %).</summary>
+        public const double EvenTolerance = 0.25;
+
+        public readonly List<Frame> Unique = new();
+        public int Captured, Repeats;
+        private byte[]? _lastLuma;
+
+        /// <summary>Two pictures count as the same when almost no pixel changed by more than a few levels (capture
+        /// noise is allowed, a moving object of a few pixels is not).</summary>
+        public static bool SamePicture(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length || a.Length == 0) return false;
+            long sum = 0; int big = 0;
+            for (int i = 0; i < a.Length; i++)
+            {
+                int d = Math.Abs(a[i] - b[i]);
+                sum += d;
+                if (d > 6) big++;
+            }
+            return big <= Math.Max(8, a.Length / 20000) && sum < a.Length * 0.6;
+        }
+
+        /// <summary>Feed the frames in capture order. Returns true when the frame was a new picture. A frame is compared
+        /// with the last picture KEPT, so a slow change that adds up over several frames still counts as new.</summary>
+        public bool Add(long seq, long ticks, int w, int h, byte[] luma)
+        {
+            Captured++;
+            if (_lastLuma != null && Unique.Count > 0 && Unique[^1].W == w && Unique[^1].H == h && SamePicture(_lastLuma, luma))
+            {
+                Repeats++;
+                return false;
+            }
+            Unique.Add(new Frame { Seq = seq, Ticks = ticks, W = w, H = h });
+            _lastLuma = luma;
+            return true;
+        }
+
+        public static bool EvenlySpaced(long t0, long t1, long t2)
+        {
+            long d1 = t1 - t0, d2 = t2 - t1;
+            if (d1 <= 0 || d2 <= 0) return false;
+            return Math.Abs(d1 - d2) <= EvenTolerance * (d1 + d2) / 2.0;
+        }
+
+        /// <summary>The newest triple of consecutive unique pictures, starting at index <paramref name="minIndex"/> or
+        /// later, with the same size and evenly spaced in time. On success <paramref name="minIndex"/> moves past it
+        /// (triples never share a picture).</summary>
+        public bool TryPick(ref int minIndex, out Frame f0, out Frame f1, out Frame f2)
+        {
+            f0 = f1 = f2 = null!;
+            for (int i = Unique.Count - 3; i >= minIndex; i--)
+            {
+                Frame a = Unique[i], b = Unique[i + 1], c = Unique[i + 2];
+                if (a.W != b.W || b.W != c.W || a.H != b.H || b.H != c.H) continue;
+                if (!EvenlySpaced(a.Ticks, b.Ticks, c.Ticks)) continue;
+                f0 = a; f1 = b; f2 = c;
+                minIndex = i + 3;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Over the whole stream: how many windows of three consecutive unique pictures exist, and how many of
+        /// them are evenly spaced (the share a game with uneven frame pacing loses).</summary>
+        public (int Windows, int Even) CountWindows()
+        {
+            int n = 0, e = 0;
+            for (int i = 0; i + 2 < Unique.Count; i++)
+            {
+                n++;
+                if (EvenlySpaced(Unique[i].Ticks, Unique[i + 1].Ticks, Unique[i + 2].Ticks)) e++;
+            }
+            return (n, e);
+        }
+
+        /// <summary>Median gap between consecutive unique pictures in ms (0 when fewer than two).</summary>
+        public double MedianGapMs()
+        {
+            var g = new List<double>();
+            for (int i = 1; i < Unique.Count; i++) g.Add((Unique[i].Ticks - Unique[i - 1].Ticks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            return g.Count == 0 ? 0 : Median(g);
+        }
+    }
+
+    /// <summary>Self-check of the selection above with synthetic streams (no device): a 60 fps game, a 30 fps game
+    /// captured at 60 and at 120 fps, a 45-in-60 (uneven) game, a static picture and a frozen-then-moving one.</summary>
+    internal static string SelfCheckLiveFrames()
+    {
+        var sb = new System.Text.StringBuilder();
+        long hz = System.Diagnostics.Stopwatch.Frequency;
+        const int w = 96, h = 54;
+        byte[] Pic(int step)
+        {
+            var p = new byte[w * h];
+            int x0 = (step * 5) % (w - 12);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    p[y * w + x] = (byte)(((x + y) % 16) * 4 + (x >= x0 && x < x0 + 12 && y > 20 && y < 34 ? 150 : 0));
+            return p;
+        }
+        bool allOk = true;
+        void Run(string name, int captureFps, Func<int, int> gameStepOfCapture, int expectUniquePer100, bool expectTriples, bool expectNone = false)
+        {
+            var lf = new LiveFrames();
+            int n = captureFps * 4, chunk = captureFps / 4;     // frames are read in 250 ms batches, like the real check
+            int min = 0, picked = 0;
+            bool evenAll = true;
+            for (int k = 0; k < n; k++)
+            {
+                lf.Add(k + 1, (long)(k * hz / (double)captureFps), w, h, Pic(gameStepOfCapture(k)));
+                if ((k + 1) % chunk == 0 && lf.TryPick(ref min, out var a, out var b, out var c))
+                {
+                    picked++;
+                    evenAll &= LiveFrames.EvenlySpaced(a.Ticks, b.Ticks, c.Ticks) && a.Seq < b.Seq && b.Seq < c.Seq && a.Seq != b.Seq;
+                }
+            }
+            var (win, even) = lf.CountWindows();
+            double uniqueShare = 100.0 * lf.Unique.Count / n;
+            bool ok = Math.Abs(uniqueShare - expectUniquePer100) <= 3 && (expectTriples ? picked >= 10 : picked == 0) && evenAll;
+            allOk &= ok;
+            sb.AppendLine($"{(ok ? "OK  " : "FAIL")} {name}: captured {lf.Captured}, unique {lf.Unique.Count} ({uniqueShare:0}%), repeats {lf.Repeats}, even windows {even}/{win}, triples picked {picked}, median gap {lf.MedianGapMs():0.0} ms");
+        }
+        Run("60 fps game at 60 fps capture", 60, k => k, 100, true);
+        Run("30 fps game at 60 fps capture (30-in-60)", 60, k => k / 2, 50, true);
+        Run("30 fps game at 120 fps capture", 120, k => k / 4, 25, true);
+        Run("60 fps game at 120 fps capture", 120, k => k / 2, 50, true);
+        // 40 fps in 60: new pictures alternate 1 and 2 captures apart (gaps 16.7 / 33.3 ms) -> never evenly spaced
+        Run("40 fps game at 60 fps capture (uneven pacing)", 60, k => (k / 3) * 2 + Math.Min(k % 3, 1), 67, false);
+        Run("static desktop", 60, k => 0, 0, false);
+        sb.AppendLine(allOk ? "ALL OK" : "SOME FAILED");
+        return sb.ToString();
     }
 
     public static double Median(IEnumerable<double> v)

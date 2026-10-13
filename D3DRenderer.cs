@@ -497,13 +497,18 @@ internal sealed class D3DRenderer : IDisposable
                 FreeRing();
                 return true;
             }
-            int need = (int)Math.Ceiling((fps > 0 ? fps : 60) * delayMs / 1000.0) + 3;
+            int need = (int)Math.Ceiling((fps > 0 ? fps : 60) * delayMs / 1000.0) + 3 + Volatile.Read(ref _ringExtra);
             if (need == _ringNeed) return false;
             if (_ringNeed == 0) _shownSeq = _ringSeq;   // nothing in the ring is "pending" yet
             _ringNeed = need;
             return true;
         }
     }
+
+    private int _ringExtra;
+    /// <summary>Test mode: keep this many more frames in the ring than the delay needs, so the live hold-out check can
+    /// look back over about half a second of frames. Applied at the next ConfigureRing (every render loop).</summary>
+    public void SetRingExtra(int frames) => Volatile.Write(ref _ringExtra, Math.Clamp(frames, 0, 120));
 
     public int RingSlots { get { lock (FrameLock) return _ringNeed; } }
 
@@ -1038,10 +1043,12 @@ internal sealed class D3DRenderer : IDisposable
         f?.Dispose();
         f = new OriFrame { Size = o };
         f.Tex = MakeTarget(o.Width, o.Height, Format.B8G8R8A8_UNorm, out f.Srv, out f.Rtv);
+        int fct = InterpFactor(o);
         Size s = o;
         for (int i = 0; i < 4; i++)
         {
-            s = new Size(Math.Max(1, (s.Width + 1) / 2), Math.Max(1, (s.Height + 1) / 2));
+            int d = i == 0 ? fct : 2;
+            s = new Size(Math.Max(1, (s.Width + d - 1) / d), Math.Max(1, (s.Height + d - 1) / d));
             f.LumaSize[i] = s;
             f.Luma[i] = MakeTarget(s.Width, s.Height, Format.R16_Float, out f.LumaSrv[i], out f.LumaRtv[i]);
         }
@@ -1067,6 +1074,15 @@ internal sealed class D3DRenderer : IDisposable
         }
     }
 
+    /// <summary>How much smaller than the picture the finest luma level of the motion search is. The search cost grows
+    /// with the picture area, so a wide source (4K) is searched at 1/4 (960x540) instead of 1/2 (1920x1080): the same
+    /// cost and quality as a 1080p source, and the 3-4 ms spike per source frame that 4K produced is gone. Sources up
+    /// to 2560 px wide (1440p and below) keep the 1/2 search.</summary>
+    internal static int InterpFactor(Size oriented) => Math.Max(oriented.Width, oriented.Height) > 2560 ? 4 : 2;
+
+    /// <summary>Source pixels covered by one texel of the final motion field (4 luma pixels of the finest level).</summary>
+    internal static int InterpBlockPx(Size oriented) => 4 * InterpFactor(oriented);
+
     private static Size FieldSize(Size level) => new(Math.Max(1, (level.Width + 3) / 4), Math.Max(1, (level.Height + 3) / 4));
 
     /// <summary>Copy a ring slot into the frame textures and convert it into <paramref name="f"/>, then build its
@@ -1091,7 +1107,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             Size dst = f.LumaSize[k];
             Size from = k == 0 ? f.Size : f.LumaSize[k - 1];
-            WriteCb(_cbInterp!, new InterpCb { P0 = new Vector4(from.Width, from.Height, 0, 0) });
+            WriteCb(_cbInterp!, new InterpCb { P0 = new Vector4(from.Width, from.Height, k == 0 ? InterpFactor(f.Size) : 0, 0) });
             SetupTriangle(f.LumaRtv[k], new Rectangle(0, 0, dst.Width, dst.Height));
             Ctx.PSSetShader(k == 0 ? _psPyr1 : _psPyrD);
             Ctx.PSSetConstantBuffer(0, _cbInterp);
@@ -1132,7 +1148,7 @@ internal sealed class D3DRenderer : IDisposable
             WriteCb(_cbInterp!, new InterpCb
             {
                 P1 = new Vector4(fl.Size.Width, fl.Size.Height, 0, 0),
-                P2 = new Vector4(0, k == 0 ? 2f : 1f, 0, 0),
+                P2 = new Vector4(0, k == 0 ? InterpFactor(a.Size) : 1f, 0, 0),
             });
             SetupTriangle(fl.FinRtv, new Rectangle(0, 0, fl.Size.Width, fl.Size.Height));
             Ctx.PSSetShader(_psMed);
@@ -1151,7 +1167,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             P0 = new Vector4(o.Width, o.Height, 0, 0),
             P1 = new Vector4(f1.Size.Width, f1.Size.Height, 0, 0),
-            P2 = new Vector4(0, 0, alpha, 0),
+            P2 = new Vector4(0, 0, alpha, InterpBlockPx(a.Size)),
         });
         SetupTriangle(_orientedRtv!, new Rectangle(0, 0, o.Width, o.Height));
         Ctx.PSSetShader(_psSynth);
@@ -1224,37 +1240,101 @@ internal sealed class D3DRenderer : IDisposable
         }
     }
 
-    /// <summary>Test-mode hook (live hold-out check): with interpolation active, take the newest three consecutive
-    /// frames F0, F1, F2 of the ring (evenly spaced in time, the first one newer than <paramref name="afterSeq"/>),
-    /// interpolate between F0 and F2 at 0.5 with the real pipeline and read all four pictures back. The live
-    /// pair cache is invalidated (redone at the next refresh).</summary>
-    internal bool InterpDebugHoldout(long afterSeq, out long lastSeq, out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
+    /// <summary>One ring frame seen by the live hold-out scan: its sequence number, its (phase-locked) time on the
+    /// Stopwatch timeline and the luma of the finest search level as bytes, for telling repeated pictures apart.</summary>
+    internal sealed class ScanFrame
     {
-        f0 = f1 = f2 = mid = null; lastSeq = 0;
+        public long Seq, Smooth;
+        public int W, H;
+        public byte[] Luma = Array.Empty<byte>();
+    }
+
+    private void InterpOrientation(out int rot, out bool mir, out VideoAdjustments adj, out System.Windows.Forms.Padding crop)
+    {
+        rot = _interpKeyValid ? _interpKey.Rotation : 0;
+        mir = _interpKeyValid && _interpKey.Mirror;
+        adj = _interpKeyValid ? _interpKey.Adj : VideoAdjustments.Neutral;
+        crop = _interpKeyValid ? _interpKey.Crop : default;
+    }
+
+    /// <summary>Test-mode hook (live hold-out check, step 1): convert every ring frame newer than
+    /// <paramref name="afterSeq"/> (oldest first) and hand back its luma, so the caller can tell which frames are new
+    /// pictures and which are repeats. The live pair cache is invalidated (redone at the next refresh).</summary>
+    internal bool InterpDebugScan(long afterSeq, List<ScanFrame> into)
+    {
         if (!InterpAvailable) return false;
         lock (FrameLock)
         {
             if (!_interpHold) return false;
-            Slot? s0 = null, s1 = null, s2 = null;
-            long top = 0;
-            foreach (Slot s in _ring) top = Math.Max(top, s.Seq);
-            Slot? Find(long q) { foreach (Slot s in _ring) if (s.Seq == q && q != 0) return s; return null; }
-            for (long q = top; q - 2 > afterSeq; q--)
+            var slots = _ring.Where(s => s.Seq > afterSeq && s.W > 0 && s.H > 0).OrderBy(s => s.Seq).ToList();
+            if (slots.Count == 0) return true;
+            InterpOrientation(out int rot, out bool mir, out VideoAdjustments adj, out System.Windows.Forms.Padding crop);
+            OriFrame? sc = null;
+            try
             {
-                Slot? c2 = Find(q), c1 = Find(q - 1), c0 = Find(q - 2);
-                if (c0 == null || c1 == null || c2 == null) continue;
-                if (c0.W != c1.W || c1.W != c2.W || c0.H != c1.H || c1.H != c2.H) continue;
-                long d1 = c1.Smooth - c0.Smooth, d2 = c2.Smooth - c1.Smooth;
-                if (d1 <= 0 || d2 <= 0 || Math.Abs(d1 - d2) > 0.35 * Math.Max(d1, d2)) continue;   // a hiccup in between: not a fair test
-                s0 = c0; s1 = c1; s2 = c2;
-                break;
+                foreach (Slot s in slots)
+                {
+                    Size o = Oriented(CropMath.Effective(new Size(s.W, s.H), crop).Size, rot);
+                    EnsureOriFrame(ref sc, o);
+                    ConvertSlot(s, sc!, rot, mir, adj, crop);
+                    Size ls = sc!.LumaSize[0];
+                    into.Add(new ScanFrame { Seq = s.Seq, Smooth = s.Smooth, W = ls.Width, H = ls.Height, Luma = ReadLuma(sc, 0) });
+                }
+                return true;
             }
-            if (s0 == null || s1 == null || s2 == null) return false;
+            finally
+            {
+                Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+                sc?.Dispose();
+                _curA = _curB = _meA = _meB = 0;
+                _lastAlpha = -1;
+            }
+        }
+    }
 
-            int rot = _interpKeyValid ? _interpKey.Rotation : 0;
-            bool mir = _interpKeyValid && _interpKey.Mirror;
-            VideoAdjustments adj = _interpKeyValid ? _interpKey.Adj : VideoAdjustments.Neutral;
-            System.Windows.Forms.Padding crop = _interpKeyValid ? _interpKey.Crop : default;
+    private byte[] ReadLuma(OriFrame f, int level)
+    {
+        Size sz = f.LumaSize[level];
+        using ID3D11Texture2D staging = Device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)sz.Width, Height = (uint)sz.Height, MipLevels = 1, ArraySize = 1,
+            Format = Format.R16_Float, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging, BindFlags = BindFlags.None, CPUAccessFlags = CpuAccessFlags.Read,
+        });
+        Ctx.CopyResource(staging, f.Luma[level]);
+        MappedSubresource map = Ctx.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        var res = new byte[sz.Width * sz.Height];
+        try
+        {
+            var row = new short[sz.Width];
+            for (int y = 0; y < sz.Height; y++)
+            {
+                Marshal.Copy(map.DataPointer + y * (int)map.RowPitch, row, 0, row.Length);
+                for (int x = 0; x < sz.Width; x++)
+                    res[y * sz.Width + x] = (byte)Math.Clamp((int)Math.Round((float)BitConverter.Int16BitsToHalf(row[x]) * 255f), 0, 255);
+            }
+        }
+        finally { Ctx.Unmap(staging, 0); }
+        return res;
+    }
+
+    /// <summary>Test-mode hook (live hold-out check, step 2): take the ring frames with the sequence numbers
+    /// <paramref name="q0"/> &lt; <paramref name="q1"/> &lt; <paramref name="q2"/> (three different pictures, evenly
+    /// spaced in time - the caller picked them), interpolate between F0 and F2 at 0.5 with the real pipeline and read
+    /// all four pictures back. False when one of them has left the ring. The live pair cache is invalidated.</summary>
+    internal bool InterpDebugHoldout(long q0, long q1, long q2, out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
+    {
+        f0 = f1 = f2 = mid = null;
+        if (!InterpAvailable) return false;
+        lock (FrameLock)
+        {
+            if (!_interpHold) return false;
+            Slot? Find(long q) { foreach (Slot s in _ring) if (s.Seq == q && q != 0) return s; return null; }
+            Slot? s0 = Find(q0), s1 = Find(q1), s2 = Find(q2);
+            if (s0 == null || s1 == null || s2 == null) return false;
+            if (s0.W != s1.W || s1.W != s2.W || s0.H != s1.H || s1.H != s2.H) return false;
+
+            InterpOrientation(out int rot, out bool mir, out VideoAdjustments adj, out System.Windows.Forms.Padding crop);
             Size o = Oriented(CropMath.Effective(new Size(s0.W, s0.H), crop).Size, rot);
             OriFrame? o0 = null, o1 = null, o2 = null;
             try
@@ -1269,7 +1349,6 @@ internal sealed class D3DRenderer : IDisposable
                 var full = new Rectangle(Point.Empty, o);
                 f0 = ReadBack(o0!.Tex, full); f1 = ReadBack(o1!.Tex, full); f2 = ReadBack(o2!.Tex, full);
                 mid = ReadBack(_oriented!, full);
-                lastSeq = s2.Seq;
                 return true;
             }
             finally

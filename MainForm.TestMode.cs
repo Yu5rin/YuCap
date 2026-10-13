@@ -425,6 +425,7 @@ public sealed partial class MainForm
             // 3. smoothness / load
             var cases = BuildRenderCases(modes, o.Quick, o.Target.RefreshHz);
             var vrrNotes = new List<(bool Ll, PacingQuality Q)>();
+            _judderCases.Clear(); _interpOkFps.Clear();
             foreach (RenderCase c in cases)
             {
                 RenderCase cc = c;
@@ -899,6 +900,12 @@ public sealed partial class MainForm
         2160 => "4K", 1440 => "1440p", 1080 => "1080p", 720 => "720p", _ => $"{m.Height}p",
     };
 
+    // Cases of section 3 that judder only because the source (e.g. 120 fps) does not divide the monitor's refresh
+    // (e.g. 144 Hz), and the source rates for which a frame-interpolation case came out OK: VrrSummary joins them, so
+    // the hint "interpolation makes it even" appears only where this very run proved it.
+    private readonly List<(TestItem Item, double SrcFps)> _judderCases = new();
+    private readonly HashSet<int> _interpOkFps = new();
+
     private async Task RenderStep(TestSection sec, RenderCase c, List<(bool Ll, PacingQuality Q)> vrr)
     {
         try { await RenderStepCore(sec, c, vrr); }
@@ -966,7 +973,7 @@ public sealed partial class MainForm
             item.Num("フレーム補間", interpOn
                 ? $"働いています（映像 {interpSt!.SourceFps:0.0} fps → モニターの更新 {interpSt.RefreshHz:0} Hz に合わせて間のコマを作成）"
                 : $"働いていません（{InterpIdleText(interpSt)}）");
-            why.Add("フレーム補間は、映像のコマ数よりモニターの更新が十分速いときに、前後のコマの動きから間のコマを作って、更新のたびに新しい絵を出す機能です。補間のために映像が約 1 コマぶん遅れます（この試験では遅延は測っていません）。");
+            why.Add("フレーム補間は、映像のコマ数よりモニターの更新が十分速いときに、前後のコマの動きから間のコマを作って、更新のたびに新しい絵を出す機能です。補間のために映像が約 1 コマぶん遅れます（遅れは上の「映像の遅れ（YuCap の中）」に出ています）。");
             if (!interpOn) { v = Worst(v, Verdict.Ng); why.Add("フレーム補間が働いていないため、この項目は補間なしの表示になっています。"); }
         }
 
@@ -989,6 +996,9 @@ public sealed partial class MainForm
 
         // ---- GPU ----
         double gpuShare = -1;   // 95th percentile GPU time as a share of the frame budget; -1 = unknown
+        bool gpuOverrun = false; double gpuP95 = 0, gpuMax = 0;
+        bool judderSeen = false;       // some frames stay on screen longer than the rest (the source rate does not divide the refresh)
+        bool displayPerfect = false;   // every frame reached the screen on time (what decides if a GPU overrun matters)
         double[] gpu = meas?.GpuMs ?? Array.Empty<double>();
         if (gpu.Length >= 10)
         {
@@ -996,7 +1006,7 @@ public sealed partial class MainForm
             double g = gpu.Average(), p95 = sorted[Math.Clamp((int)Math.Ceiling(0.95 * sorted.Length) - 1, 0, sorted.Length - 1)], mx = sorted[^1];
             gpuShare = p95 / budget;
             item.Num("GPU 処理時間", $"平均 {g:0.00} ms / 95% {p95:0.00} ms / 最大 {mx:0.00} ms（1コマの持ち時間 {budget:0.00} ms、{gpu.Length} コマ）");
-            if (p95 > budget) { v = Worst(v, Verdict.Ng); why.Add($"GPU の処理が 1 コマの持ち時間（{budget:0.0}ms）を超えています。この設定は GPU の力が足りません。"); }
+            if (p95 > budget) { gpuOverrun = true; gpuP95 = p95; gpuMax = mx; }   // judged after the pacing below: the screen decides how bad it is
             else if (p95 > budget * 0.8) { v = Worst(v, Verdict.Warn); why.Add($"GPU の処理が持ち時間の 8 割を超えています（余裕がありません）。他のアプリが GPU を使うと詰まる可能性があります。"); }
             else why.Add($"GPU は持ち時間の {Pct(p95 / budget)} しか使っておらず、余裕があります。");
         }
@@ -1037,6 +1047,8 @@ public sealed partial class MainForm
                 if (p.JudderShare > 0.30) { v = Worst(v, Verdict.Ng); why.Add($"コマの出方が不揃いで、{Pct(p.JudderShare)} のコマが長く出ています（カクつきとして見えます）。"); }
                 else if (p.JudderShare > 0.05) { v = Worst(v, Verdict.Warn); why.Add($"{Pct(p.JudderShare)} のコマが本来より長く出ています（軽いカクつき）。"); }
                 else why.Add("コマはほぼ一定の間隔で出ています。");
+                judderSeen = p.JudderShare > 0.05;
+                displayPerfect = shownRatio >= 0.97 && drops == 0 && p.JudderShare <= 0.02;
                 vrr.Add((c.LowLatency, new PacingQuality(p.VrrKnown, p.VrrWorking, c.Label)));
             }
             else
@@ -1049,6 +1061,22 @@ public sealed partial class MainForm
                 why.Add("この表示方式では画面に出た時刻が取れなかったため、描画側の間隔で代用しました。実際に画面でカクつくかは、目で確かめてください。");
         }
         else why.Add("コマの出方の記録を取れませんでした。");
+
+        if (gpuOverrun)
+        {
+            if (displayPerfect)
+            {
+                v = Worst(v, Verdict.Warn);
+                why.Add($"GPU の処理時間が、ときどき 1 コマの持ち時間（{budget:0.0}ms）を超えました（95% で {gpuP95:0.0} ms、最大 {gpuMax:0.0} ms）。ただし、この試験では映像は期待どおりの数で、カクつきもなく、コマ飛びもなく表示されました。GPU の余裕は少ないものの、いまの使い方では問題として表れていません。" +
+                    "他のアプリが GPU を使うと、カクつきが出る可能性があります。" +
+                    (c.Interp ? "フレーム補間は動きの検出を映像の 1 コマごとに 1 回行うため、その瞬間だけ処理時間が跳ね上がります。" : ""));
+            }
+            else
+            {
+                v = Worst(v, Verdict.Ng);
+                why.Add($"GPU の処理が 1 コマの持ち時間（{budget:0.0}ms）を超えています（95% で {gpuP95:0.0} ms）。この設定は GPU の力が足りません。");
+            }
+        }
 
         if (drops > 0 || shownRatio < 0.98)
         {
@@ -1067,6 +1095,12 @@ public sealed partial class MainForm
         };
         item.Explanation = string.Join("\n", why);
         sec.Items.Add(item);
+        if (c.Interp)
+        {
+            if (interpOn && v == Verdict.Ok) _interpOkFps.Add((int)Math.Round(srcFps));
+        }
+        else if (judderSeen && panel > srcFps * 1.1)
+            _judderCases.Add((item, srcFps));
     }
 
     private static string InterpIdleText(InterpolationStatus? st) => st == null ? "状態を取れませんでした" : st.Idle switch
@@ -1091,11 +1125,27 @@ public sealed partial class MainForm
                 known == 0 ? "判定できませんでした" : $"{known} 件中 {works} 件で VRR が効いていました");
         }
         bool onWorks = vrr.Any(x => x.Ll && x.Q.Working), offWorks = vrr.Any(x => !x.Ll && x.Q.Working);
+        string steps =
+            "VRR を使うには、次を順に確かめてください。\n" +
+            "1. テレビ: ゲームモードにして、VRR（機種により「VRR」「可変リフレッシュレート」）をオンにします。Hisense のテレビは、設定のゲームモード／VRR の項目です。\n" +
+            "2. GPU のドライバ: NVIDIA は、NVIDIA コントロールパネル → G-SYNC の設定 → 「G-SYNC 互換を有効にする」にチェックを入れ、「ウィンドウモードと全画面モードで有効にする」を選びます。AMD は、Radeon 設定 → ディスプレイ → AMD FreeSync をオンにします。\n" +
+            "3. Windows: 設定 → システム → ディスプレイ → グラフィックス → 既定のグラフィックス設定 で、「可変リフレッシュレート」と「ウィンドウ化されたゲームの最適化」をオンにします。\n" +
+            "4. YuCap: VRR を使うのは低遅延モードのときだけです。オプション → 低遅延モードをオンにしてください（オフのときは Windows が画面を合成するため、VRR は効きません）。\n" +
+            "設定を変えたあと、もう一度試験すると、効いているかを確かめられます。";
         it.Explanation = onWorks && !offWorks
             ? "低遅延モードをオンにしたときだけ VRR が効きました。VRR を使いたいときは、オプション → 低遅延モードをオンにしてください。"
             : onWorks
                 ? "VRR が効く設定があります。どの設定かは上の各項目を見てください。"
-                : "VRR が効いている設定は確認できませんでした。モニター側（TV のゲームモード・VRR）と Windows の「可変リフレッシュレート」の設定、GPU ドライバのバージョンを確認してください。表示方式によっては、画面に出た時刻が取れず判定できないこともあります。";
+                : "VRR が効いている設定は確認できませんでした。120 fps のように、モニターの更新（例: 144 Hz）の整数倍にならない映像は、固定のリフレッシュレートでは 1 コマが 1 回か 2 回の更新で出るため、約 2 割のコマが長く見えます（軽いカクつき）。これは VRR が効いていないときの普通の動きで、故障ではありません。\n" + steps +
+                  "\n表示方式によっては、画面に出た時刻が取れず判定できないこともあります。";
+
+        // joins the judder cases with the interpolation cases of this run
+        foreach (var (item, fps) in _judderCases)
+        {
+            if (!_interpOkFps.Contains((int)Math.Round(fps))) continue;
+            item.Explanation += $"\nフレーム補間をオンにすると、同じ {fps:0} fps の映像でも、モニターの更新（{_topt.Target.RefreshHz:0} Hz）のたびに新しい絵が出るようになり、VRR がなくてもコマの出方が揃います（この試験の「{fps:0}fps / 標準 / フレーム補間」の項目で、問題ないことを確認しました）。ただしフレーム補間は低遅延モードでは使えず、映像が約 1 コマぶん遅れます。";
+        }
+        _judderCases.Clear();
         sec.Items.Add(it);
     }
 
@@ -1531,7 +1581,7 @@ public sealed partial class MainForm
             .Num("音ズレ補正の設定", _settings.AvOffsetMs == 0 ? "なし" : _settings.AvOffsetMs > 0 ? $"音を {_settings.AvOffsetMs} ms 遅らせる" : $"音を {-_settings.AvOffsetMs} ms 早める（映像を遅らせる）");
         item.Verdict = Verdict.Info;
         item.Summary = $"音声の遅れの目安は {avg:0} ms です";
-        item.Explanation = "「たまっていた音声」は、音を出すまでに待っている量で、そのまま音の遅れの目安になります。小さすぎて音が途切れるなら音声バッファ設定を上げ、遅れが気になるなら下げてください。実際に映像と合っているかは 10 の項目で目で確かめます。";
+        item.Explanation = "「たまっていた音声」は、音を出すまでに待っている量で、そのまま音の遅れの目安になります。小さすぎて音が途切れるなら音声バッファ設定を上げ、遅れが気になるなら下げてください。映像との差は、次の「遅延（音と映像のずれ）」の項目で数字にしています。実際に耳と目で合っているかは、10 の項目で確かめてください。";
         sec.Items.Add(item);
     }
 
@@ -1547,6 +1597,11 @@ public sealed partial class MainForm
         {
             try
             {
+                // The test caption is drawn over the video; with something on top Windows composes the monitor and the
+                // screen time of a frame can no longer be read from the display, so the caption stays hidden while
+                // measuring (the next SetCaption shows it again). Everything else is the user's own setting.
+                if (_testCaption != null) _testCaption.Visible = false;
+                _settings.Interpolation = _testSaved?.Interpolation ?? false;
                 EnsureEngine(_testSaved?.LowLatency ?? false, _savedMode);
                 ApplyAvSync();
                 await Wait(SettleMs);
@@ -1565,7 +1620,7 @@ public sealed partial class MainForm
                 finally { meas = _video.EndMeasure(); }
                 vLat = meas?.LatencyMs ?? Array.Empty<double>();
                 vEst = meas is { LatencyEstimated: true };
-                if (vLat.Length < 5) vWhy = "画面に出た時刻を取得できませんでした";
+                if (vLat.Length < 5) vWhy = vLat.Length == 0 ? "画面に出た時刻を取得できませんでした" : $"測定できた回数が少なすぎました（{vLat.Length} 回）";
                 _latencyAudioSamples = aSamples0;
             }
             catch (OperationCanceledException) { throw; }
@@ -1609,6 +1664,8 @@ public sealed partial class MainForm
             summary = vs == null && asx == null ? "映像・音とも測定できませんでした" : vs == null ? "映像の遅れを測定できませんでした" : "音の遅れを測定できませんでした";
         }
         item.Num("音ズレ補正の設定", _settings.AvOffsetMs == 0 ? "なし" : _settings.AvOffsetMs > 0 ? $"音を {_settings.AvOffsetMs} ms 遅らせる" : $"音を {-_settings.AvOffsetMs} ms 早める（映像を遅らせる）");
+        if (videoOk && _testSaved is { Renderer: not "d3d" })
+            item.Num("描画方式", "この項目は Direct3D で測りました（普段の設定は標準（Media Foundation）です。Media Foundation では映像の遅れを測れないため）");
         item.Summary = summary;
         item.Explanation = "ここで測っているのは、キャプチャカードから YuCap に届いてから、Windows が画面に映す・音を鳴らすまでの時間です（音ズレ補正・映像の遅延・コマの間隔調整・フレーム補間による遅れも含みます）。" +
             "キャプチャカードの中や、テレビ・スピーカーの中で生じる遅れは測れないため含まれていません。実際の映像と音のずれは、この数字に加えてそれらの遅れが乗ります。目安として使い、最終的には音ズレ補正の画面で目と耳で合わせてください。";

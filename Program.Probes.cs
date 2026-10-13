@@ -382,12 +382,13 @@ internal static partial class Program
                     }
                     log.Add($"  (a plain 50% blend of A and B scores: background {Psnr(blend, gt, w, bgRect):0.0} dB, block {Psnr(blend, gt, w, blkRect):0.0} dB)");
 
-                    // the field: block centres at 8fx+4 (source pixels)
+                    // the field: block centres at bp*fx + bp/2 (source pixels; bp = 8, or 16 for a wide source)
                     int nBg = 0, okBg = 0, nBk = 0, okBk = 0; double eBg = 0, eBk = 0;
+                    int bp = D3DRenderer.InterpBlockPx(new Size(w, h));
                     for (int fy = 0; fy < fs.Height; fy++)
                         for (int fx = 0; fx < fs.Width; fx++)
                         {
-                            int cx = fx * 8 + 4, cy = fy * 8 + 4;
+                            int cx = fx * bp + bp / 2, cy = fy * bp + bp / 2;
                             double vx = field[(fy * fs.Width + fx) * 2], vy = field[(fy * fs.Width + fx) * 2 + 1];
                             var inner = Rectangle.Inflate(blk, -m, -m);
                             var outer = Rectangle.Inflate(blk, m * 2, m * 2);

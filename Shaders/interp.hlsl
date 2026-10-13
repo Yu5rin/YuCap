@@ -1,6 +1,6 @@
 // Motion-compensated frame interpolation (see README design notes).
 // Entry points, all pixel shaders drawn with the fullscreen triangle of vs.hlsl:
-//   pyr1   RGB frame -> luma at 1/2 size            (2x2 box average)
+//   pyr1   RGB frame -> luma at 1/F size            (FxF box average; F = 2, or 4 for sources wider than 2560)
 //   pyrd   luma level -> luma level at 1/2 size     (2x2 box average)
 //   me     block matching of one pyramid level      (symmetric: A(x - v/2) against B(x + v/2))
 //   med    3x3 component-wise median of a vector field (and unit conversion on the last level)
@@ -8,9 +8,9 @@
 // One shared constant buffer layout; the meaning of the members is listed per entry point.
 cbuffer Cb : register(b0)
 {
-    float4 P0;   // pyr*: source size (xy) | me: level size (xy), 1/size (zw) | synth: oriented size (xy)
+    float4 P0;   // pyr*: source size (xy), box size F (z, pyr1 only) | me: level size (xy), 1/size (zw) | synth: oriented size (xy)
     float4 P1;   // me: field size (xy), parent field size (zw) | med: field size (xy) | synth: field size (xy)
-    float4 P2;   // me: lambda (x), coarsest (y), finest (z) | med: output scale (y) | synth: alpha (z)
+    float4 P2;   // me: lambda (x), coarsest (y), finest (z) | med: output scale (y: source pixels per finest-level pixel) | synth: alpha (z), source pixels per field texel (w)
     float4 P3;
 };
 
@@ -25,14 +25,15 @@ float4 pyr1(float4 pos : SV_Position) : SV_Target
 {
     int2 o = int2(pos.xy);
     int2 mx = int2(P0.xy) - 1;
+    int n = (int)P0.z;
     float s = 0;
-    [unroll] for (int dy = 0; dy < 2; dy++)
-    [unroll] for (int dx = 0; dx < 2; dx++)
+    [loop] for (int dy = 0; dy < n; dy++)
+    [loop] for (int dx = 0; dx < n; dx++)
     {
-        float3 c = T0.Load(int3(min(o * 2 + int2(dx, dy), mx), 0)).rgb;
+        float3 c = T0.Load(int3(min(o * n + int2(dx, dy), mx), 0)).rgb;
         s += dot(c, float3(0.299, 0.587, 0.114));
     }
-    return float4(s * 0.25, 0, 0, 1);
+    return float4(s / (n * n), 0, 0, 1);
 }
 
 float4 pyrd(float4 pos : SV_Position) : SV_Target
@@ -178,8 +179,8 @@ float4 synth(float4 pos : SV_Position) : SV_Target
     float2 isz = 1.0 / size;
     float alpha = P2.z;
 
-    // the field's texel i covers source pixels 8i .. 8i+7, so its centre sits on 8i+4
-    float2 v = T2.SampleLevel(lin, pos.xy / (P1.xy * 8.0), 0).xy;
+    // the field's texel i covers source pixels B*i .. B*i+B-1 (B = P2.w: 8, or 16 for a wide source)
+    float2 v = T2.SampleLevel(lin, pos.xy / (P1.xy * P2.w), 0).xy;
 
     float3 ca = T0.SampleLevel(lin, (pos.xy - alpha * v) * isz, 0).rgb;
     float3 cb = T1.SampleLevel(lin, (pos.xy + (1.0 - alpha) * v) * isz, 0).rgb;
