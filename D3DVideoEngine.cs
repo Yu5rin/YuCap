@@ -436,6 +436,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         private long _refreshTick;
         public void PokeInterpolation() { Volatile.Write(ref _interpReeval, 1); TryWake(); }
 
+        /// <summary>The refresh rate Windows reports for the monitor the window is on (59.94 Hz shows as 59 or 60).</summary>
         private int RefreshHz()
         {
             long now = Environment.TickCount64;
@@ -447,13 +448,26 @@ public sealed class D3DVideoEngine : IVideoEngine
             return _refreshHz;
         }
 
+        /// <summary>The rate frames can really be shown at: the measured vertical-blank period of the output the window
+        /// is on while the display-driven beat runs, else what Windows reports.</summary>
+        private double ActualRefreshHz()
+        {
+            D3DRenderer? rr = _r;
+            if (rr != null && _displayDriven && rr.Beat.Active && rr.Beat.PeriodMs > 1)
+            {
+                double measured = 1000.0 / rr.Beat.PeriodMs;
+                if (measured >= 20) return measured;
+            }
+            return RefreshHz();
+        }
+
         /// <summary>Whether interpolation should run now. It starts when the refresh is at least 1.1x the
         /// measured source frame rate and stops again below 1.05x (so a borderline pair does not flap).</summary>
         private InterpolationStatus EvaluateInterpolation(bool wasActive)
         {
             double nominal = Volatile.Read(ref _nominalMs);
             double src = nominal > 0 ? 1000.0 / nominal : 0;
-            double hz = RefreshHz();
+            double hz = ActualRefreshHz();
             if (!_e._interpolation) return new InterpolationStatus(false, src, hz, InterpolationIdle.Disabled);
             if (_r is { InterpAvailable: false }) return new InterpolationStatus(false, src, hz, InterpolationIdle.Unavailable);
             if (_lowLatency || !_displayDriven) return new InterpolationStatus(false, src, hz, InterpolationIdle.LowLatency);

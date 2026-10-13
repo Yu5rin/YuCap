@@ -762,6 +762,9 @@ public sealed partial class MainForm
     private async Task CaptureStep(TestSection sec, CaptureMode m)
     {
         var item = new TestItem { Name = "取り込み " + ModeLabel(m) };
+        // Same reason as in RenderStepCore: a caption over the video makes Windows compose the monitor, which on a
+        // mixed-refresh setup holds the picture to the main monitor's rate and makes a 120 fps source drop frames.
+        if (_testCaption != null) _testCaption.Visible = false;
         var sw = Stopwatch.StartNew();
         try { StartMode(m); }
         catch (Exception ex)
@@ -900,6 +903,11 @@ public sealed partial class MainForm
     private async Task RenderStepCore(TestSection sec, RenderCase c, List<(bool Ll, PacingQuality Q)> vrr)
     {
         var item = new TestItem { Name = c.Label };
+        // Anything drawn over the video makes Windows compose the monitor (DWM) instead of flipping the video
+        // straight to the screen, and a composed monitor runs at the refresh rate of the primary display: a
+        // 144 Hz TV beside a 60 Hz main monitor then shows 60 fps whatever YuCap does. The caption is therefore
+        // out of the way while a rate is measured (the next SetCaption shows it again).
+        if (_testCaption != null) _testCaption.Visible = false;
         try
         {
             _settings.ScalingQuality = c.Quality == ScalingQuality.Fsr ? "fsr" : "standard";

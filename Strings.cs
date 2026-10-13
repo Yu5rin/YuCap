@@ -396,6 +396,7 @@ internal static class L
          "  --selftest [出力先]       自己診断を実行して終了\n" +
          "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
          "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
+         "  --vblank-probe [出力先]   各モニターの垂直同期と表示レートを調べて終了\n" +
          "  --restart-stress [出力先] [回数] [--fullscreen] [--fast]   映像の再起動を繰り返し、毎回映像が戻るか調べて終了\n" +
          "  --interp-probe [出力先] [--mode <指定>] [--stills <フォルダ>]   フレーム補間を実機の映像で調べて終了\n" +
          "  --interp-synth [出力先] --in <画像> [--scale <倍率>] [--stills <フォルダ>]   既知の動きでフレーム補間を調べて終了\n" +
@@ -413,6 +414,7 @@ internal static class L
             "  --selftest [path]       run the self-test and exit\n" +
             "  --gpu-bench [path]      measure the GPU cost of 4K upscaling and exit\n" +
             "  --hdr-probe [path]      write an HDR input report and exit\n" +
+            "  --vblank-probe [path]   measure each display's vertical blank and present rate and exit\n" +
             "  --restart-stress [path] [count] [--fullscreen] [--fast]   restart the video repeatedly, check it returns each time, and exit\n" +
             "  --interp-probe [path] [--mode <spec>] [--stills <dir>]   test frame interpolation on the live video and exit\n" +
             "  --interp-synth [path] --in <picture> [--scale <n>] [--stills <dir>]   test frame interpolation on a known motion and exit\n" +

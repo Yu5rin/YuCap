@@ -180,6 +180,11 @@ internal static partial class Program
             RunInterpProbe(interpOut, interpMode, interpStills);
             return;
         }
+        if (args.Length > 0 && args[0] == "--vblank-probe")
+        {
+            RunVBlankProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_vblank_probe.txt"));
+            return;
+        }
         if (args.Length > 0 && args[0] == "--hdr-probe")
         {
             RunHdrProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_hdr_probe.txt"));
@@ -220,6 +225,7 @@ internal static partial class Program
                 "  --selftest [出力先]       自己診断を実行して終了\n" +
                 "  --gpu-bench [出力先]      4K 拡大の GPU 負荷を計測して終了\n" +
                 "  --hdr-probe [出力先]      HDR 入力の調査結果を書き出して終了\n" +
+                "  --vblank-probe [出力先]   各モニターの垂直同期と表示レートを調べて終了\n" +
                 "  --restart-stress [出力先] [回数] [--fullscreen] [--fast]   映像の再起動を繰り返し、毎回映像が戻るか調べて終了\n" +
                 "  --interp-probe [出力先] [--mode <指定>] [--stills <フォルダ>]   フレーム補間を実機の映像で調べて終了\n" +
                 "  --interp-synth [出力先] --in <画像> [--scale <倍率>] [--stills <フォルダ>]   既知の動きでフレーム補間を調べて終了\n" +

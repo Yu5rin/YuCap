@@ -12,6 +12,7 @@ namespace YuCap;
 // Diagnostic commands that answer hardware questions before the hardware is at hand:
 //   --gpu-bench <out.txt>   can this GPU upscale to 4K at the source frame rate?
 //   --hdr-probe <out.txt>   does the capture card deliver HDR, and is Windows HDR on?
+//   --vblank-probe <out.txt>   vblank period and swap-chain present rate of every display (also with something drawn over the video)
 //   --restart-stress <out.txt> [N]   restart the Direct3D preview N times; does video always come back?
 //   --interp-probe <out.txt> [--mode 4k30] [--stills <dir>]   frame interpolation on the live device
 //   --interp-synth <out.txt> --in <picture.png> [--scale 2] [--stills <dir>]   interpolation on a known motion
