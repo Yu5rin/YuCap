@@ -3317,31 +3317,30 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowAudioBufferSettings()
     {
-        using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 360, 210);
+        using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 360, 250);
 
-        var lbl = Ui.Label(L.T("バッファ長 (ms):"), Ui.Pad, 22);
+        var lbl = Ui.Label(L.T("安全のための余裕 (ms):"), Ui.Pad, 22);
         var num = new NumericUpDown
         {
             Minimum = AudioEngine.MinBufferMs,
-            Maximum = 1000,
+            Maximum = AudioEngine.MaxBufferMs,
             Increment = 10,
-            Value = Math.Clamp(_audio.BufferMilliseconds, AudioEngine.MinBufferMs, 1000),
+            Value = Math.Clamp(_audio.BufferMilliseconds, AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs),
             Location = new Point(190, 20),
             Width = 150,
         };
 
-        // Presets: this value is now an actively-held latency target, so these
-        // map directly to the delay you hear.
+        // Presets: the value is the safety margin YuCap keeps queued (the output device's own queue is small and fixed).
         var lblPreset = Ui.Label(L.T("プリセット:"), Ui.Pad, 58);
-        var btnLow = Ui.Button(L.T("低遅延 60"), Ui.Pad, 78, 100);
-        var btnMid = Ui.Button(L.T("標準 120"), 126, 78, 100);
-        var btnSafe = Ui.Button(L.T("安定 250"), 236, 78, 100);
-        btnLow.Click += (_, _) => num.Value = 60;
-        btnMid.Click += (_, _) => num.Value = 120;
-        btnSafe.Click += (_, _) => num.Value = 250;
+        var btnLow = Ui.Button(L.T("低遅延 20"), Ui.Pad, 78, 100);
+        var btnMid = Ui.Button(L.T("標準 40"), 126, 78, 100);
+        var btnSafe = Ui.Button(L.T("安定 100"), 236, 78, 100);
+        btnLow.Click += (_, _) => num.Value = 20;
+        btnMid.Click += (_, _) => num.Value = 40;
+        btnSafe.Click += (_, _) => num.Value = 100;
 
         var hint = Ui.Hint(
-            L.T("この値が実際の音声遅延の目安になります。\n小さいほど低遅延ですが、音切れが出たら上げてください。\n実測値はステータスバーの「遅延」に表示されます。"),
+            L.T("音を出す前に YuCap がためておく量です。\n小さいほど音の遅れが減りますが、小さすぎると音が途切れます。\n途切れるときは大きくしてください（既定は 40）。\n実際の遅れは、ステータスバーの「遅延」や情報表示で確かめられます。"),
             Ui.Pad, 114, 360 - 2 * Ui.Pad);
 
         dlg.Controls.AddRange(new Control[] { lbl, num, lblPreset, btnLow, btnMid, btnSafe, hint });

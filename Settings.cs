@@ -25,7 +25,9 @@ public sealed class AppSettings
     public bool MenuVisible { get; set; } = true;
     public bool StatusVisible { get; set; } = true;
     public int Volume { get; set; } = 100;
-    public int AudioBufferMs { get; set; } = 120;
+    public int AudioBufferMs { get; set; } = AudioEngine.DefaultBufferMs;
+    /// <summary>0 = written before the audio path was rebuilt (v1.9); the old defaults of the buffer (120 / 200 ms) then mean "never changed" and move to the new default once.</summary>
+    public int AudioSettingsVersion { get; set; }
 
     // Snapshot output.
     public string? SnapshotDir { get; set; }      // null => Pictures\CaptureViewer
@@ -167,7 +169,14 @@ public sealed class AppSettings
     {
         DisplayMode = Math.Clamp(DisplayMode, 0, 3);
         Volume = Math.Clamp(Volume, 0, 500);
-        AudioBufferMs = Math.Clamp(AudioBufferMs, 50, 1000);
+        if (AudioSettingsVersion < 1)
+        {
+            // The old buffer was the whole delay, so 120 (the old default) and 200 (a common bump) were never a deliberate
+            // choice for the new meaning (a safety margin). Any other value is kept.
+            if (AudioBufferMs is AudioEngine.LegacyDefaultMs or AudioEngine.LegacyAltMs) AudioBufferMs = AudioEngine.DefaultBufferMs;
+            AudioSettingsVersion = 1;
+        }
+        AudioBufferMs = Math.Clamp(AudioBufferMs, AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs);
         if (Rotation is not (0 or 90 or 180 or 270)) Rotation = 0;
         PipOpacity = Math.Clamp(PipOpacity, 0, 100);
         PipOpacityHover = Math.Clamp(PipOpacityHover, 10, 100);

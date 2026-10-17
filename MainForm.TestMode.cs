@@ -1651,20 +1651,39 @@ public sealed partial class MainForm
         }
         await Wait(500);
         var samples = new List<double>();
+        var packets = new List<double>(); var queues = new List<double>(); var totals = new List<double>();
+        long under0 = _audio.Underruns;
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < 3000)
         {
             samples.Add(_audio.BufferedMs);
+            if (_audio.LatencyMs > 0) { packets.Add(_audio.PacketMs); queues.Add(_audio.RenderQueueMs); totals.Add(_audio.LatencyMs); }
             await Wait(100);
         }
+        long drops = _audio.Underruns - under0;
         double avg = samples.Average();
         item.Num("音声デバイス", _audio.CurrentDeviceName ?? "?")
-            .Num("バッファの目標", $"{_audio.BufferMilliseconds} ms")
-            .Num("たまっていた音声（3 秒間の平均）", $"{avg:0} ms（{samples.Min():0}〜{samples.Max():0} ms）")
+            .Num("出力デバイス", $"{_audio.RenderDeviceName ?? "?"}（{(_audio.LowLatencyOutput ? $"低遅延の出力、{_audio.OutputPeriodMs:0.#} ms 単位" : "通常の出力")}）")
+            .Num("YuCap の余裕（設定）", $"{_audio.BufferMilliseconds} ms")
+            .Num("YuCap の余裕（実測、3 秒間の平均）", $"{avg:0} ms（{samples.Min():0}〜{samples.Max():0} ms）");
+        if (totals.Count > 0)
+            item.Num("カードの区切り", $"{packets.Average():0} ms ごとに届く")
+                .Num("出力デバイスの待ち", $"{queues.Average():0} ms")
+                .Num("YuCap 内の遅れの合計", $"{totals.Average():0} ms（カードの区切り＋YuCap の余裕＋出力デバイスの待ち）");
+        item.Num("途切れ（3 秒間）", drops == 0 ? "なし" : $"{drops} 回")
             .Num("音ズレ補正の設定", _settings.AvOffsetMs == 0 ? "なし" : _settings.AvOffsetMs > 0 ? $"音を {_settings.AvOffsetMs} ms 遅らせる" : $"音を {-_settings.AvOffsetMs} ms 早める（映像を遅らせる）");
-        item.Verdict = Verdict.Info;
-        item.Summary = $"音声の遅れの目安は {avg:0} ms です";
-        item.Explanation = "「たまっていた音声」は、音を出すまでに待っている量で、そのまま音の遅れの目安になります。小さすぎて音が途切れるなら音声バッファ設定を上げ、遅れが気になるなら下げてください。映像との差は、次の「遅延（音と映像のずれ）」の項目で数字にしています。実際に耳と目で合っているかは、10 の項目で確かめてください。";
+        if (drops > 0)
+        {
+            item.Verdict = Verdict.Warn;
+            item.Summary = $"音が {drops} 回途切れました（余裕 {_audio.BufferMilliseconds} ms）";
+            item.Explanation = "音声バッファ設定の「安全のための余裕」が足りず、音を出す分が一瞬なくなった回数です。余裕を増やすと途切れにくくなります（そのぶん音は少し遅れます）。パソコンが忙しいときや、他のアプリが音声機器を使っているときにも起きます。";
+        }
+        else
+        {
+            item.Verdict = Verdict.Info;
+            item.Summary = totals.Count > 0 ? $"音の遅れは約 {totals.Average():0} ms、途切れはありません" : $"YuCap の余裕は約 {avg:0} ms です";
+            item.Explanation = "音の遅れは「カードの区切り」（キャプチャカードが音を届ける間隔）、「YuCap の余裕」（音声バッファ設定で決まる、途切れを防ぐためのたくわえ）、「出力デバイスの待ち」（Windows が音を鳴らすまでの待ち）の合計です。小さいほど遅れが減りますが、余裕が小さすぎると音が途切れます。映像との差は、次の「遅延（音と映像のずれ）」の項目で数字にしています。実際に耳と目で合っているかは、10 の項目で確かめてください。";
+        }
         sec.Items.Add(item);
     }
 
@@ -1674,6 +1693,7 @@ public sealed partial class MainForm
         var item = new TestItem { Name = "遅延（音と映像のずれ）", Verdict = Verdict.Info };
         _settings.AvOffsetMs = _testSaved?.AvOffsetMs ?? 0;
         double[] vLat = Array.Empty<double>();
+        _latencyUnder0 = _audio.IsRunning ? _audio.Underruns : 0;
         bool vEst = false;
         string vWhy = "Direct3D の映像が動いていませんでした";
         if (videoOk)
@@ -1746,16 +1766,26 @@ public sealed partial class MainForm
             item.Num("映像と音の差", "求められません（どちらかを測定できなかったため）");
             summary = vs == null && asx == null ? "映像・音とも測定できませんでした" : vs == null ? "映像の遅れを測定できませんでした" : "音の遅れを測定できませんでした";
         }
+        if (_audio.IsRunning && asx != null)
+            item.Num("音の遅れの内訳", $"カードの区切り {_audio.PacketMs:0} ms ＋ YuCap の余裕 {_audio.BacklogMs:0} ms ＋ 出力デバイスの待ち {_audio.RenderQueueMs:0} ms");
+        long latDrops = _audio.IsRunning ? _audio.Underruns - _latencyUnder0 : 0;
+        if (_audio.IsRunning) item.Num("音の途切れ（測定中）", latDrops == 0 ? "なし" : $"{latDrops} 回");
         item.Num("音ズレ補正の設定", _settings.AvOffsetMs == 0 ? "なし" : _settings.AvOffsetMs > 0 ? $"音を {_settings.AvOffsetMs} ms 遅らせる" : $"音を {-_settings.AvOffsetMs} ms 早める（映像を遅らせる）");
         if (videoOk && _testSaved is { Renderer: not "d3d" })
             item.Num("描画方式", "この項目は Direct3D で測りました（普段の設定は標準（Media Foundation）です。Media Foundation では映像の遅れを測れないため）");
         item.Summary = summary;
-        item.Explanation = "ここで測っているのは、キャプチャカードから YuCap に届いてから、Windows が画面に映す・音を鳴らすまでの時間です（音ズレ補正・映像の遅延・コマの間隔調整・フレーム補間による遅れも含みます）。" +
+        if (latDrops > 0)
+        {
+            item.Verdict = Verdict.Warn;
+            item.Summary = $"{summary}（音が {latDrops} 回途切れました）";
+        }
+        item.Explanation = (latDrops > 0 ? "測定中に音が途切れました。音声バッファ設定の「安全のための余裕」を増やしてみてください。\n\n" : "") + "ここで測っているのは、キャプチャカードから YuCap に届いてから、Windows が画面に映す・音を鳴らすまでの時間です（音ズレ補正・映像の遅延・コマの間隔調整・フレーム補間による遅れも含みます）。" +
             "キャプチャカードの中や、テレビ・スピーカーの中で生じる遅れは測れないため含まれていません。実際の映像と音のずれは、この数字に加えてそれらの遅れが乗ります。目安として使い、最終的には音ズレ補正の画面で目と耳で合わせてください。";
         sec.Items.Add(item);
     }
 
     private List<double> _latencyAudioSamples = new();
+    private long _latencyUnder0;
 
     // =============================================================================================
     //  9. dialogs

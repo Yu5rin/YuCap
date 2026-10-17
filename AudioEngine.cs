@@ -53,24 +53,6 @@ internal sealed class SoftLimitSampleProvider : ISampleProvider
     }
 }
 
-/// <summary>Counts the frames handed to the output, so the audio still waiting in the device buffer can be worked out
-/// (frames given minus frames played). Placed last in the chain, after the limiter.</summary>
-internal sealed class CountingSampleProvider : ISampleProvider
-{
-    private readonly ISampleProvider _source;
-    private long _frames;
-    public CountingSampleProvider(ISampleProvider source) => _source = source;
-    public WaveFormat WaveFormat => _source.WaveFormat;
-    public long Frames => Interlocked.Read(ref _frames);
-
-    public int Read(float[] buffer, int offset, int count)
-    {
-        int n = _source.Read(buffer, offset, count);
-        if (n > 0) Interlocked.Add(ref _frames, n / Math.Max(1, _source.WaveFormat.Channels));
-        return n;
-    }
-}
-
 /// <summary>An active audio render (output) endpoint.</summary>
 public sealed record AudioOutputInfo(string Name, string Id);
 
@@ -83,7 +65,7 @@ public sealed record AudioOutputInfo(string Name, string Id);
 public sealed class AudioEngine : IDisposable
 {
     private WasapiCapture? _capture;
-    private WasapiOut? _output;
+    private SharedRender? _output;
     private BufferedWaveProvider? _buffer;
     private VolumeSampleProvider? _volumeProvider;
     private SoftLimitSampleProvider? _limiter;
@@ -94,15 +76,42 @@ public sealed class AudioEngine : IDisposable
     private bool _muted;
     private string? _renderDeviceId;
     private string? _requestedOutputId;   // null = follow the Windows default
-    private CountingSampleProvider? _counter;
     private long _lastPacketTick;
     private double _packetMs = 10;
     private double _latencyEma;
+    private double _backlogEma;
     private long _latencyTick;
+    private volatile bool _gotData;
 
-    /// <summary>Target capture-to-playback latency in milliseconds. Actively
-    /// held (see OnDataAvailable), so this is roughly the delay you hear.</summary>
-    public int BufferMilliseconds { get; set; } = 120;
+    /// <summary>Audio kept in YuCap's own queue as a safety margin (ms): the cushion that absorbs timing jitter
+    /// between the capture card and the output. It is the only delay YuCap adds on purpose - smaller is less delay,
+    /// too small cuts the sound off. The output device's own queue is small and fixed (see SharedRender).</summary>
+    public int BufferMilliseconds { get; set; } = DefaultBufferMs;
+
+    /// <summary>Default for <see cref="BufferMilliseconds"/>.</summary>
+    public const int DefaultBufferMs = 40;
+    /// <summary>The default before v1.9 (the whole output queue was this long); migrated to <see cref="DefaultBufferMs"/> once.</summary>
+    public const int LegacyDefaultMs = 120;
+    /// <summary>The value many users had after the old default felt too short (also migrated once).</summary>
+    public const int LegacyAltMs = 200;
+    public const int MaxBufferMs = 500;
+
+    /// <summary>Capture-side buffer length (ms) and whether to wake per engine period (event) instead of polling. Probe-tunable.</summary>
+    public static int CaptureBufferMs = 20;
+    public static bool CaptureEventSync = true;
+    /// <summary>Audio kept queued in the output device, in engine periods.</summary>
+    public static double RenderQueuePeriods = 2.0;
+
+    /// <summary>Packet interval of the capture card as seen by YuCap (ms, smoothed).</summary>
+    public double PacketMs => _packetMs;
+    /// <summary>Smoothed audio waiting in YuCap's own queue when a packet arrives (ms, includes the A/V-sync delay).</summary>
+    public double BacklogMs => Volatile.Read(ref _backlogEma);
+    /// <summary>Smoothed audio waiting in the output device (queue + stream latency, ms).</summary>
+    public double RenderQueueMs => _output == null ? 0 : _output.PaddingMs + _output.StreamLatencyMs;
+    /// <summary>How many times the sound ran dry (our queue or the device) since Start().</summary>
+    public long Underruns => _output == null ? 0 : _output.BufferStarved + _output.DeviceStarved;
+    public double OutputPeriodMs => _output?.PeriodMs ?? 0;
+    public bool LowLatencyOutput => _output?.LowLatencyApi == true;
 
     /// <summary>Largest value <see cref="ExtraDelayMs"/> accepts.</summary>
     public const int MaxExtraDelayMs = 300;
@@ -291,49 +300,58 @@ public sealed class AudioEngine : IDisposable
         enumerator.Dispose();
         Log.Info($"Audio: output = {renderDevice.FriendlyName} ({(string.IsNullOrEmpty(outputId) || fellBack ? "Windows default" : "chosen")})");
 
-        var capture = new WasapiCapture(captureDevice);
+        var capture = new WasapiCapture(captureDevice, CaptureEventSync, CaptureBufferMs);
         var buffer = new BufferedWaveProvider(capture.WaveFormat)
         {
-            // Room for the target plus the full A/V-sync delay, with the same generous margin as before.
+            // Room for the target plus the full A/V-sync delay, with a generous margin.
             BufferDuration = TimeSpan.FromMilliseconds((Math.Max(MinBufferMs, BufferMilliseconds) + MaxExtraDelayMs) * 4),
             DiscardOnBufferOverflow = true,
         };
 
-        // Build the sample chain and match it to the render mix format.
-        ISampleProvider sample = buffer.ToSampleProvider();
+        SharedRender output;
+        try { output = new SharedRender(renderDevice.ID); }
+        catch { capture.Dispose(); renderDevice.Dispose(); captureDevice.Dispose(); throw; }
 
-        int targetRate = renderDevice.AudioClient.MixFormat.SampleRate;
-        int targetChannels = renderDevice.AudioClient.MixFormat.Channels;
+        VolumeSampleProvider volumeProvider;
+        SoftLimitSampleProvider limiter;
+        try
+        {
+            // Build the sample chain and match it to the render mix format.
+            ISampleProvider sample = buffer.ToSampleProvider();
+            int targetRate = output.Rate;
+            int targetChannels = output.Channels;
 
-        if (sample.WaveFormat.Channels == 1 && targetChannels >= 2)
-            sample = new MonoToStereoSampleProvider(sample);
-        else if (sample.WaveFormat.Channels > 2 && targetChannels == 2)
-            sample = new MultiplexingSampleProvider(new[] { sample }, 2);
+            if (sample.WaveFormat.Channels == 1 && targetChannels >= 2)
+                sample = new MonoToStereoSampleProvider(sample);
+            else if (sample.WaveFormat.Channels > 2 && targetChannels == 2)
+                sample = new MultiplexingSampleProvider(new[] { sample }, 2);
 
-        if (sample.WaveFormat.SampleRate != targetRate)
-            sample = new WdlResamplingSampleProvider(sample, targetRate);
+            if (sample.WaveFormat.SampleRate != targetRate)
+                sample = new WdlResamplingSampleProvider(sample, targetRate);
 
-        var volumeProvider = new VolumeSampleProvider(sample) { Volume = _muted ? 0f : _volume };
-        // Gain first, then the limiter catches whatever the gain pushed over.
-        var limiter = new SoftLimitSampleProvider(volumeProvider);
-        var counter = new CountingSampleProvider(limiter);
+            volumeProvider = new VolumeSampleProvider(sample) { Volume = _muted ? 0f : _volume };
+            // Gain first, then the limiter catches whatever the gain pushed over.
+            limiter = new SoftLimitSampleProvider(volumeProvider);
 
-        var output = new WasapiOut(renderDevice, AudioClientShareMode.Shared, true,
-            Math.Max(MinBufferMs, BufferMilliseconds));
-        output.Init(counter);
-        output.PlaybackStopped += (_, e) => { if (e.Exception != null) IsFaulted = true; };
+            output.Init(RenderQueuePeriods);
+        }
+        catch { output.Dispose(); capture.Dispose(); renderDevice.Dispose(); captureDevice.Dispose(); throw; }
 
+        double srcPerOut = (double)capture.WaveFormat.SampleRate / output.Rate;
+        int srcBlock = capture.WaveFormat.BlockAlign;
+        output.IsStarving = frames => _gotData && buffer.BufferedBytes < (int)(frames * srcPerOut) * srcBlock;
+        output.Failed += _ => IsFaulted = true;
+        capture.RecordingStopped += (_, e) => { if (e.Exception != null) IsFaulted = true; };
         capture.DataAvailable += OnDataAvailable;
 
         _capture = capture;
         _buffer = buffer;
         _volumeProvider = volumeProvider;
         _limiter = limiter;
-        _counter = counter;
         _requestedOutputId = string.IsNullOrEmpty(outputId) ? null : outputId;
         RenderFellBack = fellBack;
         RenderDeviceName = renderDevice.FriendlyName;
-        _lastPacketTick = 0; _packetMs = 10; _latencyEma = 0; Volatile.Write(ref _latencyTick, 0);
+        _lastPacketTick = 0; _packetMs = 10; _latencyEma = 0; _backlogEma = 0; _gotData = false; Volatile.Write(ref _latencyTick, 0);
         _output = output;
         _captureDevice = captureDevice;
         _renderDevice = renderDevice;
@@ -343,13 +361,11 @@ public sealed class AudioEngine : IDisposable
         CurrentDeviceId = info.Id;
 
         capture.StartRecording();
-        output.Play();
+        output.Start(limiter);
     }
 
-    /// <summary>Smallest buffer target that WASAPI shared mode can realistically
-    /// sustain: the audio engine period and the capture packet size are both
-    /// ~10ms, so anything under a handful of periods just underruns.</summary>
-    public const int MinBufferMs = 50;
+    /// <summary>Smallest safety margin offered. Below this the card's packet timing alone cuts the sound off.</summary>
+    public const int MinBufferMs = 20;
 
     private byte[]? _dropScratch;
 
@@ -364,21 +380,10 @@ public sealed class AudioEngine : IDisposable
         }
         _lastPacketTick = now;
 
-        double queued = 0;
-        var counter = _counter;
-        var output = _output;
-        if (counter != null && output != null)
-        {
-            try
-            {
-                WaveFormat of = output.OutputWaveFormat;
-                double played = output.GetPosition() * 1000.0 / of.AverageBytesPerSecond;
-                double given = counter.Frames * 1000.0 / counter.WaveFormat.SampleRate;
-                queued = Math.Max(0, given - played);
-            }
-            catch { queued = 0; }
-        }
-        double total = _packetMs + buffer.BufferedDuration.TotalMilliseconds + queued;
+        double queued = _output == null ? 0 : _output.PaddingMs + _output.StreamLatencyMs;
+        double backlog = buffer.BufferedDuration.TotalMilliseconds;
+        _backlogEma = Volatile.Read(ref _latencyTick) == 0 ? backlog : _backlogEma * 0.9 + backlog * 0.1;
+        double total = _packetMs + backlog + queued;
         double prev = _latencyEma;
         _latencyEma = Volatile.Read(ref _latencyTick) == 0 ? total : prev * 0.9 + total * 0.1;
         Volatile.Write(ref _latencyTick, now);
@@ -416,20 +421,18 @@ public sealed class AudioEngine : IDisposable
             }
         }
 
-        // The deliberate delay is queued audio, and an under-run (render clock a touch
-        // faster than capture, or the very first packet) eats into it. Top it back up with
-        // silence once it has really been lost; a small hysteresis avoids a click every packet.
-        if (extra > 0)
+        // The cushion (margin + A/V-sync delay) is queued audio, and an under-run (render clock a touch
+        // faster than capture, or the very first packet) eats into it. Top it back up with silence once
+        // it has really been lost; a hysteresis avoids a gap every packet. The silence is the cushion.
+        double lost = target - buffered;
+        if (!_gotData || lost > Math.Max(10.0, target * 0.3))
         {
-            double lost = extra - buffered;
-            if (lost > Math.Min(30.0, extra * 0.5))
-            {
-                WaveFormat wf = buffer.WaveFormat;
-                int pad = (int)(lost * wf.AverageBytesPerSecond / 1000.0);
-                pad -= pad % wf.BlockAlign;
-                if (pad > 0) buffer.AddSamples(new byte[pad], 0, pad);
-            }
+            WaveFormat wf = buffer.WaveFormat;
+            int pad = (int)(lost * wf.AverageBytesPerSecond / 1000.0);
+            pad -= pad % wf.BlockAlign;
+            if (pad > 0) buffer.AddSamples(new byte[pad], 0, pad);
         }
+        _gotData = true;
 
         buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
     }
@@ -490,7 +493,6 @@ public sealed class AudioEngine : IDisposable
         if (_capture != null)
             _capture.DataAvailable -= OnDataAvailable;
 
-        try { _output?.Stop(); } catch { /* ignore */ }
         try { _capture?.StopRecording(); } catch { /* ignore */ }
 
         try { _output?.Dispose(); } catch { /* ignore */ }
@@ -504,7 +506,6 @@ public sealed class AudioEngine : IDisposable
         _buffer = null;
         _volumeProvider = null;
         _limiter = null;
-        _counter = null;
         RenderDeviceName = null;
         RenderFellBack = false;
         _requestedOutputId = null;

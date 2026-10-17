@@ -283,13 +283,13 @@ internal static class L
 
         // ---- Dialogs ----
         ["音声バッファ設定"] = "Audio buffer settings",
-        ["バッファ長 (ms):"] = "Buffer (ms):",
+        ["安全のための余裕 (ms):"] = "Safety margin (ms):",
         ["プリセット:"] = "Presets:",
-        ["低遅延 60"] = "Low 60",
-        ["標準 120"] = "Normal 120",
-        ["安定 250"] = "Stable 250",
-        ["この値が実際の音声遅延の目安になります。\n小さいほど低遅延ですが、音切れが出たら上げてください。\n実測値はステータスバーの「遅延」に表示されます。"] =
-            "This value is the audio delay the app now holds.\nLower is snappier; raise it if you hear dropouts.\nThe measured value is shown in the status bar.",
+        ["低遅延 20"] = "Low 20",
+        ["標準 40"] = "Normal 40",
+        ["安定 100"] = "Stable 100",
+        ["音を出す前に YuCap がためておく量です。\n小さいほど音の遅れが減りますが、小さすぎると音が途切れます。\n途切れるときは大きくしてください（既定は 40）。\n実際の遅れは、ステータスバーの「遅延」や情報表示で確かめられます。"] =
+            "How much audio YuCap holds back before playing it.\nSmaller means less delay, but too small makes the sound break up.\nIf it breaks up, raise it (default 40).\nThe actual delay shows in the status bar and the info overlay.",
         ["キャンセル"] = "Cancel",
         ["スナップショット設定"] = "Snapshot settings",
         ["保存先:"] = "Folder:",

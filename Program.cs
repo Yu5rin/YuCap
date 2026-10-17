@@ -208,6 +208,11 @@ internal static partial class Program
             RunVBlankProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_vblank_probe.txt"));
             return;
         }
+        if (args.Length > 0 && args[0] == "--audio-probe")
+        {
+            RunAudioProbe(args);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--hdr-probe")
         {
             RunHdrProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_hdr_probe.txt"));
