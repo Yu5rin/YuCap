@@ -77,7 +77,7 @@ public abstract class OverlayControl : Control
     {
         int w = Width, h = Height;
         if (w <= 0 || h <= 0 || (long)w * h > 16_000_000) return null;
-        byte[] onBlack = Capture(Color.Black, w, h), onWhite = Capture(Color.White, w, h);
+        byte[] onBlack = PaintOnto(Color.Black, w, h), onWhite = PaintOnto(Color.White, w, h);
         var px = new byte[w * h * 4];
         for (int i = 0; i < px.Length; i += 4)
         {
@@ -91,7 +91,7 @@ public abstract class OverlayControl : Control
         return (px, w, h);
     }
 
-    private byte[] Capture(Color back, int w, int h)
+    private byte[] PaintOnto(Color back, int w, int h)
     {
         using var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
         using (Graphics g = Graphics.FromImage(bmp))
