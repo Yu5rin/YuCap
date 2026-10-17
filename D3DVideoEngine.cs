@@ -49,6 +49,8 @@ public sealed class D3DVideoEngine : IVideoEngine
     private Padding _crop = Padding.Empty;                     // five ints: read/written under _cropLock
     private volatile bool _lowLatency;
     private volatile bool _interpolation;
+    private volatile int _nrMode;                              // 0 off, -1 auto, >0 a fixed height
+    private string _nrModeStr = "off";
 
     private readonly object _dstLock = new();
     private Rectangle _dst;
@@ -115,6 +117,51 @@ public sealed class D3DVideoEngine : IVideoEngine
         get => _pixelPerfect;
         set { _pixelPerfect = value; _s?.Poke(); }
     }
+    public bool SupportsNativeRes => true;
+    public string NativeResScale
+    {
+        get => _nrModeStr;
+        set
+        {
+            string v = AppSettings.NormalizeNativeRes(value);
+            _nrModeStr = v;
+            _nrMode = v == "off" ? 0 : v == "auto" ? -1 : int.Parse(v);
+            _s?.Poke();
+        }
+    }
+    public NativeResStatus? NativeResState => _s?.NativeRes(_nrModeStr, _nrMode);
+
+    public Bitmap? RenderOffscreen(Size output, ScalingQuality quality, int nativeH, int filter)
+    {
+        Session? s = _s;
+        if (s == null || !s.Alive) return null;
+        float sharp = _sharpness;
+        return s.Run(r => r.RenderOffscreen(output, quality, sharp, nativeH, filter), 8000, needFrame: true, out _);
+    }
+
+    public Bitmap? RenderBitmap(Bitmap source, Size output, ScalingQuality quality, int nativeH, int filter)
+    {
+        Session? s = _s;
+        if (s == null || !s.Alive) return null;
+        float sharp = _sharpness;
+        Bitmap? bmp = s.Run(r => r.RenderFromBitmap(source, output, quality, sharp, nativeH, filter), 15000, needFrame: false, out _);
+        s.PokeConvert();   // the live picture was replaced: convert the next frame again
+        return bmp;
+    }
+
+    public bool BenchPrescale(Bitmap? source, Size output, ScalingQuality quality, int nativeH, int filter, int frames,
+        out double[] plain, out double[] withPre, out double[] passOnly)
+    {
+        double[] a = Array.Empty<double>(), b = a, c = a;
+        bool ok = false;
+        Session? s = _s;
+        float sharp = _sharpness;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.PrescaleBench(source, output, quality, sharp, nativeH, filter, frames, out a, out b, out c); return null; }, 90000, needFrame: source == null, out _);
+        plain = a; withPre = b; passOnly = c;
+        return ok;
+    }
+
     public RenderStats? Stats => _s?.Stats;
     public long FramesReceived => _s?.FramesReceived ?? 0;
     public long FramesPresented => _s?.FramesPresented ?? 0;
@@ -287,7 +334,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         GpuBenchResult? result = null;
         s.Run(r =>
         {
-            result = r.GpuBench(output, quality, sharp, frames, _rotation, _mirror, CurrentAdjustments(), Crop);
+            result = r.GpuBench(output, quality, sharp, frames, _rotation, _mirror, CurrentAdjustments(), Crop, _nrMode > 0 ? _nrMode : 0);
             return null;
         }, 60000, needFrame: true, out _);
         return result;
@@ -405,6 +452,101 @@ public sealed class D3DVideoEngine : IVideoEngine
         public long FramesPresented => Interlocked.Read(ref _presented);
         public long FramesDropped => Interlocked.Read(ref _dropped);
         public string? ColorInfo;     // set once by OpenReader, for --hdr-probe
+
+        // ---- "元の細かさに合わせて拡大" (auto mode: judged on a background thread) ----
+        private int _nrTarget;                 // auto: the height decided (0 = none / native)
+        private volatile bool _nrDecided;
+        private volatile int _nrSourceH;
+        private Thread? _nrThread;
+
+        public NativeResStatus NativeRes(string modeStr, int mode)
+        {
+            int target = mode > 0 ? mode : mode < 0 ? Volatile.Read(ref _nrTarget) : 0;
+            int active = _r?.PrescaleActiveHeight ?? 0;
+            return new NativeResStatus(modeStr, target, active, mode < 0 && !_nrDecided, _nrSourceH);
+        }
+
+        /// <summary>The height the render loop shrinks the picture to this frame (0 = no prescale).</summary>
+        private int NativeTargetHeight()
+        {
+            int m = _e._nrMode;
+            if (m == 0 || _e._rotation is 90 or 270) return 0;   // a rotated picture's rows are the source's columns: not judged
+            return m > 0 ? m : Volatile.Read(ref _nrTarget);
+        }
+
+        private void StartNativeResThread()
+        {
+            _nrThread = new Thread(NativeResLoop) { IsBackground = true, Name = "YuCap.D3D.NativeRes", Priority = ThreadPriority.BelowNormal };
+            _nrThread.Start();
+        }
+
+        /// <summary>Every ~3 s (every 1.5 s until the first decision) read one full-size oriented frame back through the render
+        /// thread's request queue and estimate its real vertical detail. A decision (or a change) needs the same estimate three
+        /// samples in a row; black, flat and capture-card message pictures are skipped.</summary>
+        private void NativeResLoop()
+        {
+            const int Need = 3;
+            bool wasAuto = false;
+            int lastEst = -1, count = 0, decidedEst = -1;
+            Size lastSize = Size.Empty;
+            long nextAt = 0;
+            while (!_stopping)
+            {
+                Thread.Sleep(100);
+                long now = Environment.TickCount64;
+                if (_e._nrMode != -1)
+                {
+                    if (wasAuto) { wasAuto = false; Volatile.Write(ref _nrTarget, 0); _nrDecided = false; Poke(); }
+                    continue;
+                }
+                if (!wasAuto)
+                {
+                    wasAuto = true;
+                    lastEst = -1; count = 0; decidedEst = -1; lastSize = Size.Empty;
+                    Volatile.Write(ref _nrTarget, 0); _nrDecided = false;
+                    nextAt = now + 800;
+                }
+                if (now < nextAt) continue;
+                nextAt = now + (_nrDecided ? 3000 : 1500);
+                D3DRenderer? r = _r;
+                if (r == null || !r.HasFrame || _e._rotation is 90 or 270) continue;
+
+                Bitmap? bmp = null;
+                try
+                {
+                    bmp = Run(rr => rr.ReadOrientedForAnalysis(), 1500, needFrame: true, out _);
+                    if (bmp == null) continue;
+                    float[] y = ResEstimate.LumaOf(bmp, out int w, out int h);
+                    bmp.Dispose(); bmp = null;
+                    var size = new Size(w, h);
+                    if (size != lastSize)
+                    {
+                        // a new picture size (mode, crop, device): everything judged so far is about something else
+                        lastSize = size; lastEst = -1; count = 0; decidedEst = -1;
+                        Volatile.Write(ref _nrTarget, 0); _nrDecided = false; Poke();
+                    }
+                    _nrSourceH = h;
+                    if (ResEstimate.LooksLikeCardMessage(y, w, h) || ResEstimate.MeanGradient(y, w, h) < ResEstimate.MinDetail) continue;
+                    ResEstimate.FrameResult fr = ResEstimate.Analyze(y, w, h);
+                    if (_stopping || _e._nrMode != -1) continue;
+                    int est = Math.Min(fr.Vertical.EstimateHeight, h);
+                    if (est == lastEst) count++; else { lastEst = est; count = 1; }
+                    if (!_nrDecided || est != decidedEst)
+                        Log.Info($"D3D: native-res sample {w}x{h}: {est}p ({Math.Min(count, Need)}/{Need}); H {fr.Horizontal.EstimateHeight}p");
+                    if (count >= Need && (!_nrDecided || est != decidedEst))
+                    {
+                        decidedEst = est;
+                        Volatile.Write(ref _nrTarget, est < h ? est : 0);
+                        _nrDecided = true;
+                        Log.Info(est < h ? $"D3D: native-res auto: detail {est}p - shrinking {w}x{h} to {(int)Math.Round((double)w * est / h)}x{est} before scaling"
+                                         : $"D3D: native-res auto: detail is the full {h}p - no shrinking");
+                        Poke();
+                    }
+                }
+                catch (Exception ex) { Log.Info("D3D: native-res analysis failed: " + ex.Message.Split('\n')[0]); }
+                finally { bmp?.Dispose(); }
+            }
+        }
 
         // Video delay bookkeeping (render thread writes, anyone reads).
         private double _delayActual;
@@ -664,6 +806,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
                 Log.Info($"D3D: initialised in {sw.ElapsedMilliseconds}ms");
                 Started.Set();
+                StartNativeResThread();
                 RenderLoop(r);
             }
             catch (Exception ex)
@@ -943,7 +1086,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     Rectangle dst = _e.CurrentDst();
                     if (dst.Width <= 0 || dst.Height <= 0)
                         dst = new Rectangle(0, 0, client.Width, client.Height);
-                    Result hr = r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness);
+                    Result hr = r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness, NativeTargetHeight());
                     if (hr.Failure)
                     {
                         HandlePresentFailure(r, hr);

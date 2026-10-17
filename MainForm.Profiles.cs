@@ -36,6 +36,7 @@ public sealed partial class MainForm
             Renderer = _settings.Renderer,
             ScalingQuality = _settings.ScalingQuality,
             FsrSharpness = _settings.FsrSharpness,
+            NativeResScale = _settings.NativeResScale,
             DisplayMode = (int)_displayMode,
             AdjBrightness = _settings.AdjBrightness,
             AdjContrast = _settings.AdjContrast,
@@ -142,6 +143,7 @@ public sealed partial class MainForm
     {
         _settings.ScalingQuality = p.ScalingQuality;
         _settings.FsrSharpness = p.FsrSharpness;
+        _settings.NativeResScale = p.NativeResScale;
         _displayMode = (VideoDisplayMode)Math.Clamp(p.DisplayMode, 0, 3);
         _settings.DisplayMode = (int)_displayMode;
         _settings.AdjBrightness = p.AdjBrightness;

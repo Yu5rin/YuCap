@@ -6,6 +6,11 @@ using System.Windows.Forms;
 namespace YuCap;
 
 /// <summary>How the picture is resampled when the window is larger than the source.</summary>
+/// <summary>What "元の細かさに合わせて拡大" is doing now. <c>Active</c> is the height the last drawn frame was shrunk to
+/// (0 = not shrunk: off, native detail, or not applicable to the current window); <c>Judging</c> is auto mode before the
+/// first decision; <c>Target</c> is the height decided or chosen (0 = none); <c>SourceHeight</c> the oriented picture's height.</summary>
+public sealed record NativeResStatus(string Mode, int Target, int Active, bool Judging, int SourceHeight);
+
 public enum ScalingQuality
 {
     /// <summary>GPU bilinear — what the Media Foundation preview has always done.</summary>
@@ -165,6 +170,22 @@ public interface IVideoEngine : IDisposable
     bool SupportsInterpolation => false;
     bool Interpolation { get => false; set { } }
     InterpolationStatus? InterpolationState => null;
+    /// <summary>"元の細かさに合わせて拡大" (Direct3D only): shrink the picture to the resolution its detail really has
+    /// (a game drawn at 720p and enlarged to 1080p by the console) before scaling, so FSR enlarges from the true size.
+    /// "off", "auto" (judged from the picture) or a fixed height such as "720".</summary>
+    bool SupportsNativeRes => false;
+    string NativeResScale { get => "off"; set { } }
+    NativeResStatus? NativeResState => null;
+    /// <summary>Test mode: <see cref="RenderOffscreen(Size, ScalingQuality)"/> with the prescale pass (<paramref name="nativeH"/> lines;
+    /// <paramref name="filter"/> -1 = the default filter).</summary>
+    Bitmap? RenderOffscreen(Size output, ScalingQuality quality, int nativeH, int filter) => null;
+    /// <summary>Test mode: render <paramref name="source"/> (instead of the live frame) through the real GPU pipeline at
+    /// <paramref name="output"/>. The live picture is replaced until the next frame arrives.</summary>
+    Bitmap? RenderBitmap(Bitmap source, Size output, ScalingQuality quality, int nativeH, int filter) => null;
+    /// <summary>Test mode: GPU milliseconds per frame without / with the prescale and of the prescale pass alone.</summary>
+    bool BenchPrescale(Bitmap? source, Size output, ScalingQuality quality, int nativeH, int filter, int frames,
+        out double[] plain, out double[] withPre, out double[] passOnly)
+    { plain = withPre = passOnly = Array.Empty<double>(); return false; }
     /// <summary>Render the current frame at <paramref name="output"/> size off-screen and
     /// read it back — lets the scaler be checked at 4K on a smaller monitor.</summary>
     Bitmap? RenderOffscreen(Size output, ScalingQuality quality) => null;

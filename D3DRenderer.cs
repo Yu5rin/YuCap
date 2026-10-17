@@ -80,6 +80,13 @@ internal sealed class D3DRenderer : IDisposable
     // ---- shaders / states / constant buffers ----
     private ID3D11VertexShader? _vs;
     private ID3D11PixelShader? _psConvert, _psScale, _psEasu, _psRcas;
+    private ID3D11PixelShader? _psPre;       // "match the original detail" downscale (null = unavailable)
+    private ID3D11Buffer? _cbPre;
+    private ID3D11PixelShader? _psIbp;           // back-projection refinement of the shrunk picture
+    private ID3D11Texture2D?[] _pf = new ID3D11Texture2D?[2];   // float16 ping-pong textures of the refinement
+    private ID3D11ShaderResourceView?[] _pfSrv = new ID3D11ShaderResourceView?[2];
+    private ID3D11RenderTargetView?[] _pfRtv = new ID3D11RenderTargetView?[2];
+    private Size _pfSize;
     private ID3D11PixelShader? _psPyr1, _psPyrD, _psMe, _psMed, _psSynth;   // frame interpolation (null = unavailable)
     private ID3D11SamplerState? _linear, _point;
     private ID3D11RasterizerState? _raster;
@@ -102,6 +109,10 @@ internal sealed class D3DRenderer : IDisposable
     private ID3D11ShaderResourceView? _orientedSrv;
     private ID3D11RenderTargetView? _orientedRtv;
     private Size _orientedSize;
+    private ID3D11Texture2D? _pre;                // oriented picture shrunk to its real detail (render thread)
+    private ID3D11ShaderResourceView? _preSrv;
+    private ID3D11RenderTargetView? _preRtv;
+    private Size _preSize;
     private ID3D11Texture2D? _inter;              // FSR intermediate, client sized
     private ID3D11ShaderResourceView? _interSrv;
     private ID3D11RenderTargetView? _interRtv;
@@ -186,6 +197,20 @@ internal sealed class D3DRenderer : IDisposable
         _cbScale = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
+        if (b.PrescaleOk)
+        {
+            try
+            {
+                _psPre = Device.CreatePixelShader(b.Prescale);
+                _psIbp = Device.CreatePixelShader(b.PrescaleIbp);
+                _cbPre = Device.CreateBuffer(new BufferDescription(32, BindFlags.ConstantBuffer, ResourceUsage.Default));
+            }
+            catch (Exception ex)
+            {
+                Log.Info("D3D: prescale shader could not be created: " + ex.Message.Split('\n')[0]);
+                _psPre?.Dispose(); _psPre = null; _psIbp?.Dispose(); _psIbp = null; _cbPre?.Dispose(); _cbPre = null;
+            }
+        }
 
         if (b.InterpOk)
         {
@@ -761,8 +786,9 @@ internal sealed class D3DRenderer : IDisposable
     /// (same size as the target).</summary>
     private void Compose(ID3D11RenderTargetView target, Size targetSize, Rectangle dst,
         ScalingQuality quality, bool pixelPerfect, float sharpness,
-        ID3D11RenderTargetView? interRtv, ID3D11ShaderResourceView? interSrv)
+        ID3D11RenderTargetView? interRtv, ID3D11ShaderResourceView? interSrv, int nativeH = 0, int filter = -1)
     {
+        _prescaleActiveH = 0;
         Ctx.PSSetShaderResource(0, null!);
         Ctx.OMSetRenderTargets(target);
         Ctx.ClearRenderTargetView(target, new Color4(0f, 0f, 0f, 1f));
@@ -771,6 +797,22 @@ internal sealed class D3DRenderer : IDisposable
         if (clip.Width <= 0 || clip.Height <= 0 || dst.Width <= 0 || dst.Height <= 0 || _orientedSrv == null) return;
 
         Size src = _orientedSize;
+        ID3D11ShaderResourceView srcSrv = _orientedSrv!;
+
+        // "元の細かさに合わせて拡大": shrink to the real detail first, then scale from there. Only when the
+        // picture is drawn larger than that detail (a window at or below it gains nothing) and not for integer scaling.
+        if (nativeH > 0 && !pixelPerfect && _psPre != null && nativeH < src.Height && dst.Height > nativeH)
+        {
+            int nw = Math.Max(2, (int)Math.Round((double)src.Width * nativeH / src.Height));
+            if (nw < src.Width && dst.Width > nw)
+            {
+                DrawPrescale(src, new Size(nw, nativeH), filter);
+                src = new Size(nw, nativeH);
+                srcSrv = _preSrv!;
+                _prescaleActiveH = nativeH;
+            }
+        }
+
         bool fsr = quality == ScalingQuality.Fsr && !pixelPerfect && interRtv != null && interSrv != null
                    && dst.Width > src.Width && dst.Height > src.Height;
 
@@ -781,7 +823,7 @@ internal sealed class D3DRenderer : IDisposable
             Ctx.PSSetShader(_psScale);
             Ctx.PSSetConstantBuffer(0, _cbScale);
             Ctx.PSSetSampler(0, pixelPerfect ? _point : _linear);
-            Ctx.PSSetShaderResource(0, _orientedSrv);
+            Ctx.PSSetShaderResource(0, srcSrv);
             Ctx.Draw(3, 0);
             Ctx.PSSetShaderResource(0, null!);
             return;
@@ -799,7 +841,7 @@ internal sealed class D3DRenderer : IDisposable
         Ctx.PSSetShader(_psEasu);
         Ctx.PSSetConstantBuffer(0, _cbEasu);
         Ctx.PSSetSampler(0, _linear);
-        Ctx.PSSetShaderResource(0, _orientedSrv);
+        Ctx.PSSetShaderResource(0, srcSrv);
         Ctx.Draw(3, 0);
         Ctx.PSSetShaderResource(0, null!);
 
@@ -818,6 +860,103 @@ internal sealed class D3DRenderer : IDisposable
         Ctx.PSSetShaderResource(0, interSrv!);
         Ctx.Draw(3, 0);
         Ctx.PSSetShaderResource(0, null!);
+    }
+
+    /// <summary>Detail height of the last composed frame's prescale pass (0 = none). Render thread writes.</summary>
+    private volatile int _prescaleActiveH;
+    public int PrescaleActiveHeight => _prescaleActiveH;
+    public bool PrescaleAvailable => _psPre != null;
+    /// <summary>Filter of the prescale pass: 0 box, 1 tent, 2 Catmull-Rom, 3 Lanczos3, 4 back-projection (the default: it undoes
+    /// the enlargement instead of just resampling its blur - see NativeResTest).</summary>
+    public static int PrescaleFilter = FilterBackProjection;
+
+    private void WriteCb(ID3D11Buffer cb, Vector4[] v)
+    {
+        for (int i = 0; i < v.Length; i++) Marshal.StructureToPtr(v[i], _scratch + i * 16, false);
+        Ctx.UpdateSubresource(cb, 0, null, _scratch, 0, 0);
+    }
+
+    /// <summary>The prescale draw: _oriented (<paramref name="src"/>) shrunk into the _pre texture of size <paramref name="to"/>.</summary>
+    private void DrawPrescale(Size src, Size to, int filter)
+    {
+        EnsurePre(to);
+        if (filter < 0) filter = PrescaleFilter;
+        Vector4 sizes = new(src.Width, src.Height, to.Width, to.Height);
+        if (filter == FilterBackProjection && _psIbp != null)
+        {
+            EnsurePf(to);
+            int n = Math.Max(1, BackProjectionIterations);
+            // start: Lanczos shrink into pf0, then n refinements ping-ponging pf0/pf1; the last one lands in _pre (8 bit)
+            WriteCb(_cbPre!, new Vector4[] { sizes, new(3, 0, 0, 0) });
+            SetupTriangle(_pfRtv[0]!, new Rectangle(0, 0, to.Width, to.Height));
+            Ctx.PSSetShader(_psPre);
+            Ctx.PSSetConstantBuffer(0, _cbPre);
+            Ctx.PSSetShaderResource(0, _orientedSrv!);
+            Ctx.Draw(3, 0);
+            Ctx.PSSetShaderResource(0, null!);
+            WriteCb(_cbPre!, new Vector4[] { sizes, new(filter, BackProjectionClamp, 0, 0) });
+            for (int k = 0; k < n; k++)
+            {
+                int from = k % 2, toIdx = 1 - from;
+                bool last = k == n - 1;
+                Ctx.PSSetShaderResource(1, null!);
+                SetupTriangle(last ? _preRtv! : _pfRtv[toIdx]!, new Rectangle(0, 0, to.Width, to.Height));
+                Ctx.PSSetShader(_psIbp);
+                Ctx.PSSetConstantBuffer(0, _cbPre);
+                Ctx.PSSetSampler(0, _linear);
+                Ctx.PSSetShaderResource(0, _orientedSrv!);
+                Ctx.PSSetShaderResource(1, _pfSrv[from]!);
+                Ctx.Draw(3, 0);
+            }
+            Ctx.PSSetShaderResource(0, null!);
+            Ctx.PSSetShaderResource(1, null!);
+            return;
+        }
+        WriteCb(_cbPre!, new Vector4[] { sizes, new(Math.Min(filter, 3), 0, 0, 0) });
+        SetupTriangle(_preRtv!, new Rectangle(0, 0, to.Width, to.Height));
+        Ctx.PSSetShader(_psPre);
+        Ctx.PSSetConstantBuffer(0, _cbPre);
+        Ctx.PSSetShaderResource(0, _orientedSrv!);
+        Ctx.Draw(3, 0);
+        Ctx.PSSetShaderResource(0, null!);
+    }
+
+    public const int FilterBackProjection = 4;
+    public static int BackProjectionIterations = 3;
+    /// <summary>How far (as a share of the local range of the captured picture) a refined value may leave that range; negative = no limit.</summary>
+    public static float BackProjectionClamp = 0.0f;
+
+    private void EnsurePf(Size sz)
+    {
+        if (_pf[0] != null && _pfSize == sz) return;
+        for (int i = 0; i < 2; i++)
+        {
+            _pfRtv[i]?.Dispose(); _pfSrv[i]?.Dispose(); _pf[i]?.Dispose();
+            _pf[i] = Device.CreateTexture2D(new Texture2DDescription
+            {
+                Width = (uint)sz.Width, Height = (uint)sz.Height, MipLevels = 1, ArraySize = 1,
+                Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default, BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+            });
+            _pfSrv[i] = Device.CreateShaderResourceView(_pf[i]!);
+            _pfRtv[i] = Device.CreateRenderTargetView(_pf[i]!);
+        }
+        _pfSize = sz;
+    }
+
+    private void EnsurePre(Size sz)
+    {
+        if (_pre != null && _preSize == sz) return;
+        _preRtv?.Dispose(); _preSrv?.Dispose(); _pre?.Dispose();
+        _pre = Device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)sz.Width, Height = (uint)sz.Height, MipLevels = 1, ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        });
+        _preSrv = Device.CreateShaderResourceView(_pre);
+        _preRtv = Device.CreateRenderTargetView(_pre);
+        _preSize = sz;
     }
 
     private void EnsureClientTextures(Size client)
@@ -858,7 +997,7 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>Compose into the back buffer and present. Returns the Present result.</summary>
-    public Result PresentFrame(Rectangle dst, ScalingQuality quality, bool pixelPerfect, float sharpness)
+    public Result PresentFrame(Rectangle dst, ScalingQuality quality, bool pixelPerfect, float sharpness, int nativeH = 0)
     {
         if (_swap == null) { _gpu?.Cancel(); return Result.Fail; }
         EnsureClientTextures(_swapSize);
@@ -866,7 +1005,7 @@ internal sealed class D3DRenderer : IDisposable
         using (ID3D11Texture2D bb = _swap.GetBuffer<ID3D11Texture2D>(0))
         using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))
         {
-            Compose(rtv, _swapSize, dst, quality, pixelPerfect, sharpness, _interRtv, _interSrv);
+            Compose(rtv, _swapSize, dst, quality, pixelPerfect, sharpness, _interRtv, _interSrv, nativeH);
             // Flip-model back buffers are undefined after Present, so keep our own copy
             // for Snapshot().
             Ctx.CopyResource(_lastComposed!, bb);
@@ -1530,6 +1669,89 @@ internal sealed class D3DRenderer : IDisposable
         return ReadBack(_oriented, new Rectangle(Point.Empty, _orientedSize));
     }
 
+    /// <summary>The picture for judging its real detail: the oriented frame, or while interpolating the unmixed
+    /// frame A (an in-between picture is softer than any real one and would read as a lower resolution).</summary>
+    public Bitmap? ReadOrientedForAnalysis()
+    {
+        lock (FrameLock)
+        {
+            if (_interpHold && _oriA is { Seq: not 0 } a && a.Size == _orientedSize)
+                return ReadBack(a.Tex, new Rectangle(Point.Empty, a.Size));
+            return ReadOriented();
+        }
+    }
+
+    /// <summary>Test hook: make <paramref name="src"/> the oriented picture (replacing what the live pipeline left there; the
+    /// caller pokes a re-convert afterwards) and render it at <paramref name="output"/>. Needs no capture and no swap chain.</summary>
+    internal Bitmap? RenderFromBitmap(Bitmap src, Size output, ScalingQuality quality, float sharpness, int nativeH, int filter)
+    {
+        lock (FrameLock)
+        {
+            EnsureOriented(src.Size);
+            BitmapData bd = src.LockBits(new Rectangle(Point.Empty, src.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+            finally { src.UnlockBits(bd); }
+            _lastAlpha = -1; _curA = _curB = _meA = _meB = 0;
+            return RenderOffscreen(output, quality, sharpness, nativeH, filter);
+        }
+    }
+
+    /// <summary>Test hook: only the prescale pass of <paramref name="src"/> to <paramref name="to"/> with <paramref name="filter"/>, read back.</summary>
+    internal Bitmap? ReadPrescaleOnly(Bitmap src, Size to, int filter)
+    {
+        if (_psPre == null) return null;
+        lock (FrameLock)
+        {
+            EnsureOriented(src.Size);
+            BitmapData bd = src.LockBits(new Rectangle(Point.Empty, src.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+            finally { src.UnlockBits(bd); }
+            DrawPrescale(src.Size, to, filter);
+            Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+            return ReadBack(_pre!, new Rectangle(Point.Empty, to));
+        }
+    }
+
+    /// <summary>Test hook: GPU milliseconds per frame (compose at <paramref name="output"/>) without and with the prescale, and of
+    /// the prescale pass alone, for the picture last given to <see cref="RenderFromBitmap"/> / the live frame.</summary>
+    internal bool PrescaleBench(Bitmap? source, Size output, ScalingQuality quality, float sharpness, int nativeH, int filter, int frames,
+        out double[] plain, out double[] withPre, out double[] passOnly)
+    {
+        plain = withPre = passOnly = Array.Empty<double>();
+        if (source != null)
+        {
+            EnsureOriented(source.Size);
+            BitmapData bd = source.LockBits(new Rectangle(Point.Empty, source.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+            finally { source.UnlockBits(bd); }
+            _lastAlpha = -1; _curA = _curB = _meA = _meB = 0;
+        }
+        if (_oriented == null || _psPre == null) return false;
+        Size src = _orientedSize;
+        double scale = Math.Min((double)output.Width / src.Width, (double)output.Height / src.Height);
+        var dst = new Rectangle(0, 0, Math.Max(1, (int)Math.Round(src.Width * scale)), Math.Max(1, (int)Math.Round(src.Height * scale)));
+        Texture2DDescription d = new()
+        {
+            Width = (uint)output.Width, Height = (uint)output.Height, MipLevels = 1, ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        };
+        using ID3D11Texture2D target = Device.CreateTexture2D(d);
+        using ID3D11RenderTargetView targetRtv = Device.CreateRenderTargetView(target);
+        using ID3D11Texture2D inter = Device.CreateTexture2D(d);
+        using ID3D11RenderTargetView interRtv = Device.CreateRenderTargetView(inter);
+        using ID3D11ShaderResourceView interSrv = Device.CreateShaderResourceView(inter);
+        try
+        {
+            plain = TimeGpu(() => Compose(targetRtv, output, dst, quality, false, sharpness, interRtv, interSrv, 0), frames);
+            withPre = TimeGpu(() => Compose(targetRtv, output, dst, quality, false, sharpness, interRtv, interSrv, nativeH, filter), frames);
+            int nw = Math.Max(2, (int)Math.Round((double)src.Width * nativeH / src.Height));
+            passOnly = TimeGpu(() => DrawPrescale(src, new Size(nw, nativeH), filter), frames);
+        }
+        finally { Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>()); }
+        return true;
+    }
+
     /// <summary>Read back what was last presented: dst∩client when cropping, else all of it.</summary>
     public Bitmap? ReadComposed(bool cropToVideo)
     {
@@ -1577,7 +1799,7 @@ internal sealed class D3DRenderer : IDisposable
 
     /// <summary>Render the current oriented frame at <paramref name="output"/> size into a
     /// temporary target (aspect fit) and read it back. Must be called after a Convert().</summary>
-    public Bitmap? RenderOffscreen(Size output, ScalingQuality quality, float sharpness)
+    public Bitmap? RenderOffscreen(Size output, ScalingQuality quality, float sharpness, int nativeH = 0, int filter = -1)
     {
         if (_oriented == null || output.Width <= 0 || output.Height <= 0) return null;
         Size src = _orientedSize;
@@ -1598,7 +1820,7 @@ internal sealed class D3DRenderer : IDisposable
         using ID3D11RenderTargetView interRtv = Device.CreateRenderTargetView(inter);
         using ID3D11ShaderResourceView interSrv = Device.CreateShaderResourceView(inter);
 
-        Compose(targetRtv, output, dst, quality, pixelPerfect: false, sharpness, interRtv, interSrv);
+        Compose(targetRtv, output, dst, quality, pixelPerfect: false, sharpness, interRtv, interSrv, nativeH, filter);
         Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
         return ReadBack(target, new Rectangle(Point.Empty, output));
     }
@@ -1610,7 +1832,7 @@ internal sealed class D3DRenderer : IDisposable
     /// real stream keeps them) and only the results are waited for. Must run on the render thread;
     /// null when there is no frame or no timestamp support.</summary>
     public GpuBenchResult? GpuBench(Size output, ScalingQuality quality, float sharpness, int frames,
-        int rotation, bool mirror, VideoAdjustments adj, System.Windows.Forms.Padding crop)
+        int rotation, bool mirror, VideoAdjustments adj, System.Windows.Forms.Padding crop, int nativeH = 0)
     {
         if (output.Width <= 0 || output.Height <= 0 || frames <= 0) return null;
         if (!Convert(rotation, mirror, adj, crop) || _orientedSrv == null) return null;
@@ -1643,7 +1865,7 @@ internal sealed class D3DRenderer : IDisposable
             void OneFrame()
             {
                 Convert(rotation, mirror, adj, crop);
-                Compose(targetRtv, output, dst, quality, pixelPerfect: false, sharpness, interRtv, interSrv);
+                Compose(targetRtv, output, dst, quality, pixelPerfect: false, sharpness, interRtv, interSrv, nativeH);
                 Ctx.CopyResource(copy, target);
             }
 
@@ -1696,6 +1918,7 @@ internal sealed class D3DRenderer : IDisposable
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
         _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
+        _preRtv?.Dispose(); _preSrv?.Dispose(); _pre?.Dispose(); _preRtv = null; _preSrv = null; _pre = null;
         _interRtv = null; _interSrv = null; _inter = null; _lastComposed = null;
         _orientedRtv = null; _orientedSrv = null; _oriented = null;
         _swap2?.Dispose(); _swap2 = null;
@@ -1706,6 +1929,8 @@ internal sealed class D3DRenderer : IDisposable
         lock (FrameLock) { FreeRing(); DisposeFrameTextures(); }
         _gpu?.Dispose(); _gpu = null;
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
+        _psPre?.Dispose(); _psIbp?.Dispose(); _cbPre?.Dispose();
+        for (int i = 0; i < 2; i++) { _pfRtv[i]?.Dispose(); _pfSrv[i]?.Dispose(); _pf[i]?.Dispose(); }
         _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
         _linear?.Dispose(); _point?.Dispose(); _raster?.Dispose();
         _cbConvert?.Dispose(); _cbScale?.Dispose(); _cbEasu?.Dispose(); _cbRcas?.Dispose(); _cbInterp?.Dispose();

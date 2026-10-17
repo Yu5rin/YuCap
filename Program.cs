@@ -158,6 +158,15 @@ internal static partial class Program
             File.WriteAllText(ltOut, InterpCheck.SelfCheckLiveFrames());
             return;
         }
+        if (args.Length > 0 && args[0] == "--native-res-check")
+        {
+            // Headless (GPU only, no capture card): the prescale filters and the whole 720p-in-1080p chain against a 4K truth.
+            string nrOut = args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_native_res_check");
+            Directory.CreateDirectory(nrOut);
+            string nrText = NativeResTest.HeadlessCheck(nrOut);
+            File.WriteAllText(Path.Combine(nrOut, "report.txt"), nrText, new System.Text.UTF8Encoding(true));
+            return;
+        }
         // Calibration of the picture-detail estimator on synthetic enlarged pictures (no device, no window).
         if (args.Length > 0 && args[0] == "--res-estimate-check")
         {

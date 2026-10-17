@@ -91,6 +91,8 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly List<ToolStripMenuItem> _qualityItems = new();
     private readonly List<ToolStripMenuItem> _interpItems = new();
     private readonly List<ToolStripMenuItem> _sharpnessItems = new();
+    private readonly List<ToolStripMenuItem> _nativeResItems = new();
+    private int _nativeResOsdTarget = -1;      // the auto decision last announced by the OSD (-1 = none yet)
 
     private ToolStripMenuItem _miAdjust = null!;       // 表示 → 映像の調整...
     private ToolStripMenuItem _miLockAspect = null!;
@@ -325,7 +327,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _osd.Click += (_, _) => OsdClick();
 
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); if (_info.Visible) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); CheckNativeResChange(); if (_info.Visible) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
         _devTimer.Interval = 900;
@@ -935,6 +937,17 @@ public sealed partial class MainForm : Form, IMessageFilter
             sharp.DropDownItems.Add(item);
         }
         m.DropDownItems.Add(sharp);
+        m.DropDownItems.Add(new ToolStripSeparator());
+        var native = new ToolStripMenuItem(L.T("元の細かさに合わせて拡大"));
+        foreach (string key in AppSettings.NativeResValues)
+        {
+            string k = key;
+            string label = k == "off" ? L.T("オフ") : k == "auto" ? L.T("自動") : k + "p";
+            var item = new ToolStripMenuItem(label, null, (_, _) => SetNativeRes(k)) { Tag = k };
+            _nativeResItems.Add(item);
+            native.DropDownItems.Add(item);
+        }
+        m.DropDownItems.Add(native);
         _qualityRoots.Add(m);
         return m;
     }
@@ -2399,6 +2412,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             _video.Quality = _settings.ScalingQuality == "fsr" ? ScalingQuality.Fsr : ScalingQuality.Standard;
             _video.Sharpness = _settings.FsrSharpness / 100f;
+            _video.NativeResScale = _settings.NativeResScale;
             _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
             _video.Adjustments = CurrentAdjustments();   // ignored by engines without the capability
             _video.Crop = new Padding(_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
@@ -2625,6 +2639,45 @@ public sealed partial class MainForm : Form, IMessageFilter
         ShowOsd(L.F("拡大の画質: {0}", quality == "fsr" ? L.T("高画質（FSR）") : L.T("標準")));
     }
 
+    private void SetNativeRes(string key)
+    {
+        _settings.NativeResScale = AppSettings.NormalizeNativeRes(key);
+        _nativeResOsdTarget = -1;
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        string label = key == "off" ? L.T("オフ") : key == "auto" ? L.T("自動") : key + "p";
+        ShowOsd(L.F("元の細かさに合わせて拡大: {0}", label));
+    }
+
+    /// <summary>Tell the user, once per decision, what 自動 settled on (called from the UI timer).</summary>
+    private void CheckNativeResChange()
+    {
+        if (_settings.NativeResScale != "auto" || !_video.IsRunning || !_video.SupportsNativeRes || _testRunning)
+        {
+            _nativeResOsdTarget = -1;
+            return;
+        }
+        NativeResStatus? st = _video.NativeResState;
+        if (st == null || st.Judging) { _nativeResOsdTarget = -1; return; }
+        if (st.Target == _nativeResOsdTarget) return;
+        _nativeResOsdTarget = st.Target;
+        ShowOsd(st.Target > 0 ? L.F("元の細かさ: {0}p 相当に合わせて拡大", st.Target) : L.F("元の細かさ: {0}p のまま", st.SourceHeight));
+    }
+
+    /// <summary>The info overlay's 元の細かさ line.</summary>
+    private string NativeResInfoText()
+    {
+        if (!_video.SupportsNativeRes) return "—";
+        if (_settings.NativeResScale == "off") return L.T("オフ");
+        NativeResStatus? st = _video.NativeResState;
+        if (st == null) return "—";
+        if (st.Active > 0) return L.F("{0}p 相当（{0}p から拡大）", st.Active);
+        if (st.Judging) return L.T("判定中");
+        if (st.Target <= 0) return L.F("{0}p のまま（縮めません）", st.SourceHeight);
+        return L.F("{0}p 相当（今は使っていません）", st.Target);
+    }
+
     private void ToggleInterpolation()
     {
         if (!_video.SupportsInterpolation) return;
@@ -2759,6 +2812,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             root.ToolTipText = tip;
         }
         foreach (var item in _qualityItems) item.Checked = (string)item.Tag! == quality;
+        foreach (var item in _nativeResItems) item.Checked = (string)item.Tag! == _settings.NativeResScale;
         foreach (var item in _sharpnessItems)
         {
             item.Checked = (int)item.Tag! == _settings.FsrSharpness;
@@ -3889,6 +3943,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 LatencyText(_audio.IsRunning ? _audio.LatencyMs : 0, false)),
             L.T("色調整") + ": " + color,
             L.T("補間") + ": " + InterpolationInfoText(),
+            L.T("元の細かさ") + ": " + NativeResInfoText(),
             L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
         }));
         PositionInfo();

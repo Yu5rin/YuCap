@@ -41,6 +41,7 @@ public sealed class AppSettings
     public string Renderer { get; set; } = "mf";            // "mf" | "d3d"
     public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" (d3d only)
     public int FsrSharpness { get; set; } = 50;              // 0..100 (d3d + fsr only)
+    public string NativeResScale { get; set; } = "off";      // "off" | "auto" | "480".."1440" (d3d only): shrink to the picture's real detail before scaling
 
     // Picture adjustments (Direct3D renderer only), in slider units; the defaults are neutral.
     public int AdjBrightness { get; set; }                   // -100..100 (0 = unchanged)
@@ -194,6 +195,7 @@ public sealed class AppSettings
         Renderer = NormalizeRenderer(Renderer);
         ScalingQuality = NormalizeQuality(ScalingQuality);
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
+        NativeResScale = NormalizeNativeRes(NativeResScale);
 
         // Out-of-range picture adjustments (hand edit, newer build) are clamped, never reset:
         // a clamped value is still close to what was meant, and every range ends at a safe
@@ -236,6 +238,14 @@ public sealed class AppSettings
     {
         v = (v ?? "mf").Trim().ToLowerInvariant();
         return v is "mf" or "d3d" ? v : "mf";
+    }
+
+    public static readonly string[] NativeResValues = { "off", "auto", "480", "576", "720", "900", "1080", "1440" };
+
+    internal static string NormalizeNativeRes(string? v)
+    {
+        string t = (v ?? "").Trim().ToLowerInvariant();
+        return Array.IndexOf(NativeResValues, t) >= 0 ? t : "off";
     }
 
     internal static string NormalizeQuality(string? v)
@@ -345,6 +355,7 @@ public sealed class VideoProfile
     public string Renderer { get; set; } = "mf";
     public string ScalingQuality { get; set; } = "fsr";
     public int FsrSharpness { get; set; } = 50;
+    public string NativeResScale { get; set; } = "off";
     public int DisplayMode { get; set; }
     public int AdjBrightness { get; set; }
     public int AdjContrast { get; set; } = 100;
@@ -383,6 +394,7 @@ public sealed class VideoProfile
         Renderer = AppSettings.NormalizeRenderer(Renderer);
         ScalingQuality = AppSettings.NormalizeQuality(ScalingQuality);
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
+        NativeResScale = AppSettings.NormalizeNativeRes(NativeResScale);
         AdjBrightness = Math.Clamp(AdjBrightness, -100, 100);
         AdjContrast = Math.Clamp(AdjContrast, 0, 200);
         AdjSaturation = Math.Clamp(AdjSaturation, 0, 200);
@@ -397,7 +409,7 @@ public sealed class VideoProfile
     /// <summary>True when every value (the name excluded) is the same.</summary>
     public bool SameValues(VideoProfile o) =>
         ToMode() == o.ToMode() && Renderer == o.Renderer && ScalingQuality == o.ScalingQuality
-        && FsrSharpness == o.FsrSharpness && DisplayMode == o.DisplayMode
+        && FsrSharpness == o.FsrSharpness && NativeResScale == o.NativeResScale && DisplayMode == o.DisplayMode
         && AdjBrightness == o.AdjBrightness && AdjContrast == o.AdjContrast
         && AdjSaturation == o.AdjSaturation && AdjGamma == o.AdjGamma && AvOffsetMs == o.AvOffsetMs
         && CropLeft == o.CropLeft && CropTop == o.CropTop && CropRight == o.CropRight && CropBottom == o.CropBottom

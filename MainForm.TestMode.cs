@@ -457,6 +457,8 @@ public sealed partial class MainForm
                 steps.Add((L.F("FSR の見え方: {0}", lb), secFsr, () => FsrStep(secFsr, lb, PickMode(modes, hh * 16 / 9, hh, 0))));
             }
 
+            steps.Add((L.F("FSR の見え方: {0}", L.T("元の細かさに合わせた拡大")), secFsr, () => NativeResStep(secFsr, modes)));
+
             // 6. HDR
             steps.Add((L.T("HDR の確認"), secHdr, () => HdrStep(secHdr, modes)));
 
@@ -561,6 +563,7 @@ public sealed partial class MainForm
         _settings.LowLatency = false;
         _settings.Interpolation = false;   // only the 補間 cases of section 3 turn it on
         _settings.ScalingQuality = "fsr";
+        _settings.NativeResScale = "off";   // only the 元の細かさ step turns it on (it renders with explicit heights)
         _settings.FsrSharpness = 50;
         _settings.Rotation = 0; _settings.Mirror = false;
         _settings.DisplayMode = (int)VideoDisplayMode.AspectFit;

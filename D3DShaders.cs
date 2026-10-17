@@ -25,6 +25,9 @@ internal static class D3DShaders
         public byte[] Rcas = Array.Empty<byte>();
         // Frame interpolation (Shaders/interp.hlsl). Compiled separately: a failure here only
         // disables interpolation (InterpOk stays false) and never breaks the renderer.
+        public bool PrescaleOk;
+        public byte[] Prescale = Array.Empty<byte>();
+        public byte[] PrescaleIbp = Array.Empty<byte>();
         public bool InterpOk;
         public byte[] PyrLuma = Array.Empty<byte>();
         public byte[] PyrDown = Array.Empty<byte>();
@@ -56,6 +59,16 @@ internal static class D3DShaders
                 Easu = Compile(fsr, "easu", "fsr.hlsl", "ps_5_0"),
                 Rcas = Compile(fsr, "rcas", "fsr.hlsl", "ps_5_0"),
             };
+            try
+            {
+                b.Prescale = Compile(Resource("prescale.hlsl"), "main", "prescale.hlsl", "ps_5_0");
+                b.PrescaleIbp = Compile(Resource("prescale.hlsl"), "ibp", "prescale.hlsl", "ps_5_0");
+                b.PrescaleOk = true;
+            }
+            catch (Exception ex)
+            {
+                Log.Info("D3D: prescale shader unavailable - 'match the original detail' is disabled: " + ex.Message.Split((char)10)[0]);
+            }
             try
             {
                 string interp = Resource("interp.hlsl");
