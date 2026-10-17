@@ -109,8 +109,6 @@ internal static class L
         ["元の細かさに合わせた拡大"] = "Match-original-detail upscaling",
         ["自動"] = "Auto",
         ["元の細かさに合わせて拡大: {0}"] = "Match original detail: {0}",
-        ["元の細かさ: {0}p 相当に合わせて拡大"] = "Original detail: {0}p equivalent, scaling from there",
-        ["元の細かさ: {0}p のまま"] = "Original detail: full {0}p",
         ["元の細かさ"] = "Original detail",
         ["{0}p 相当（{0}p から拡大）"] = "{0}p equivalent (upscaled from {0}p)",
         ["判定中"] = "Analysing",
@@ -172,7 +170,6 @@ internal static class L
         ["保存しました: {0}（クリックで開く）"] = "Saved: {0} (click to open)",
         ["連写を停止 ({0}/{1})"] = "Stop burst ({0}/{1})",
         ["既に起動しています"] = "Already running",
-        ["バージョン {0} に更新しました"] = "Updated to version {0}",
         ["{0} をスキップします"] = "Skipping {0}",
         ["ホットキー使用中のため無効: {0}（オプションで変更できます）"] =
             "Hotkey in use by another app: {0} (change it in Options)",
@@ -258,8 +255,6 @@ internal static class L
         ["解像度が未確定です"] = "Resolution not ready",
         ["画面に収まるサイズに調整しました"] = "Adjusted to fit the screen",
         ["映像デバイスが切断されました"] = "Video device disconnected",
-        ["映像を再接続しました: {0}"] = "Video reconnected: {0}",
-        ["音声を再接続しました: {0}"] = "Audio reconnected: {0}",
         ["回転 {0}°"] = "Rotated {0}°",
         ["この環境では回転に対応していません"] = "Rotation not supported here",
         ["この環境では反転に対応していません"] = "Flip not supported here",
@@ -286,7 +281,6 @@ internal static class L
         ["クリックでミュート切替 ／ 映像の上でホイールまたは ↑↓ で音量"] =
             "Click to toggle mute / wheel or ↑↓ over the video for volume",
         ["PiP"] = "PiP",
-        ["右クリックでメニュー、F1 で操作一覧を表示できます"] = "Right-click for the menu, F1 for the controls list",
 
         // ---- Dialogs ----
         ["音声バッファ設定"] = "Audio buffer settings",
@@ -371,8 +365,6 @@ internal static class L
         ["Windows の既定（{0}）"] = "Windows default ({0})",
         ["（Windows の既定）"] = "(Windows default)",
         ["（選んだ出力先は接続されていません）"] = "(the chosen output is not connected)",
-        ["音声の出力先が見つからないため、Windows の既定で再生します: {0}"] = "The chosen audio output was not found; playing on the Windows default: {0}",
-        ["音声の出力先に戻しました: {0}"] = "Back on the chosen audio output: {0}",
         ["出力先: {0}"] = "Output: {0}",
         ["音量を上げる"] = "Volume up",
         ["音量を下げる"] = "Volume down",

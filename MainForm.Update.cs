@@ -34,7 +34,7 @@ public sealed partial class MainForm
             // A brand new install has no prior version to compare against —
             // point the user at the menu and hotkey list instead of the
             // "updated to" notice, which would be meaningless here.
-            ShowOsd(L.T("右クリックでメニュー、F1 で操作一覧を表示できます"), 6000);
+            Log.Info("first run: menu on right-click, hotkey list on F1");   // no OSD: only manual actions show one
             return;
         }
 
@@ -42,7 +42,7 @@ public sealed partial class MainForm
         // Long duration: this is the one confirmation that the restart the
         // user just experienced was an update, not a crash — it must survive
         // long enough to actually be read.
-        ShowOsd(L.F("バージョン {0} に更新しました", current), OsdLongMilliseconds);
+        // (Log only: nothing automatic pops an OSD. The version is in the 情報 overlay / About.)
     }
 
     /// <summary>

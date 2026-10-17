@@ -103,6 +103,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miMenuBar = null!;
     private ToolStripMenuItem _miMute = null!;
     private ToolStripMenuItem _cmiMute = null!;
+    private ToolStripMenuItem _cmiLowLatency = null!;
     private ToolStripMenuItem _miMirror = null!;
     private ToolStripMenuItem _miFreeze = null!;
     private ToolStripMenuItem _cmiFreeze = null!;
@@ -149,6 +150,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private FormWindowState _restoreWindowState = FormWindowState.Normal;
     private bool _savedMenuVisible = true;
     private bool _savedStatusVisible = true;
+    private bool _fsMenuVisible, _fsStatusVisible;   // the user's bar choices while fullscreen
 
     private AudioDeviceInfo? _currentAudioInfo;
     private VideoDeviceInfo? _currentVideoInfo;
@@ -1101,6 +1103,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _ctx.Items.Add(BuildAspectSubmenu());
         _ctx.Items.Add(BuildQualitySubmenu());
         _ctx.Items.Add(BuildInterpolationItem());
+        _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
+        _ctx.Items.Add(_cmiLowLatency);
         _ctx.Items.Add(BuildSizeSubmenu());
         _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
         _cmiVideoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_cmiVideoModeRoot);
@@ -1245,6 +1249,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Restore how the last session was being viewed. Both can be set: a PiP
         // entered FROM fullscreen — EnterPip records the fullscreen state so
         // exiting PiP returns there.
+        if (_settings.InfoVisible && !_info.Showing) ToggleInfo();
         if (_settings.Fullscreen && !_isFullscreen) EnterFullscreen(userAction: false);
         if (_settings.Pip && !_isPip) EnterPip();
 
@@ -1335,6 +1340,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         TopMost = _alwaysOnTop;
         _menu.Visible = _settings.MenuVisible;
         _status.Visible = _settings.StatusVisible;
+        _fsMenuVisible = _settings.FullscreenMenuVisible;
+        _fsStatusVisible = _settings.FullscreenStatusVisible;
         if (_settings.WindowMaximized) WindowState = FormWindowState.Maximized;
     }
 
@@ -1362,6 +1369,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         _settings.AlwaysOnTop = _topmostOverridden ? _persistTopmost : (_isPip ? _prePipTopmost : _alwaysOnTop);
         _settings.MenuVisible = _isFullscreen ? _savedMenuVisible : (_isPip ? _prePipMenu : _menu.Visible);
         _settings.StatusVisible = _isFullscreen ? _savedStatusVisible : (_isPip ? _prePipStatus : _status.Visible);
+        _settings.FullscreenMenuVisible = _fsMenuVisible;
+        _settings.FullscreenStatusVisible = _fsStatusVisible;
+        _settings.InfoVisible = _info.Showing;
         _settings.Volume = _volumeOverridden ? _persistVolume : _audio.VolumePercent;
         _settings.AudioBufferMs = _audio.BufferMilliseconds;
         _settings.Rotation = _video.Rotation;
@@ -1502,7 +1512,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                         _currentVideoInfo = pick;
                         _videoError = null;
                         LayoutCanvas();
-                        ShowOsd(L.F("映像を再接続しました: {0}", pick.Name), OsdLongMilliseconds);
+                        Log.Info($"video reconnected: {pick.Name}");
                     }
                     catch { /* device still settling — the next change event retries */ }
                 }
@@ -1536,11 +1546,11 @@ public sealed partial class MainForm : Form, IMessageFilter
                         _audio.Start(pick, wantOut);
                         _currentAudioInfo = pick;
                         if (outVanished && _audio.RenderFellBack)
-                            ShowOsd(L.F("音声の出力先が見つからないため、Windows の既定で再生します: {0}", _audio.RenderDeviceName ?? "?"), OsdLongMilliseconds);
+                            Log.Info($"audio output not found - playing on the Windows default: {_audio.RenderDeviceName ?? "?"}");
                         else if (outReturned && !_audio.RenderFellBack)
-                            ShowOsd(L.F("音声の出力先に戻しました: {0}", _audio.RenderDeviceName ?? "?"), OsdLongMilliseconds);
+                            Log.Info($"audio output restored: {_audio.RenderDeviceName ?? "?"}");
                         else
-                            ShowOsd(L.F("音声を再接続しました: {0}", pick.Name), OsdLongMilliseconds);
+                            Log.Info($"audio reconnected: {pick.Name}");
                     }
                     catch { /* retried on the next change event */ }
                 }
@@ -2813,7 +2823,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (st == null || st.Judging) { _nativeResOsdTarget = -1; return; }
         if (st.Target == _nativeResOsdTarget) return;
         _nativeResOsdTarget = st.Target;
-        ShowOsd(st.Target > 0 ? L.F("元の細かさ: {0}p 相当に合わせて拡大", st.Target) : L.F("元の細かさ: {0}p のまま", st.SourceHeight));
+        // Automatic decision: logged only. It stays visible in the info overlay (元の細かさ line).
+        Log.Info(st.Target > 0 ? $"native-res auto: {st.Target}p equivalent" : $"native-res auto: {st.SourceHeight}p as is");
     }
 
     /// <summary>The info overlay's 元の細かさ line.</summary>
@@ -3173,8 +3184,8 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         WindowState = FormWindowState.Normal;
         FormBorderStyle = FormBorderStyle.None;
-        _menu.Visible = false;
-        _status.Visible = false;
+        _menu.Visible = _fsMenuVisible;
+        _status.Visible = _fsStatusVisible;
         Log.Info("EnterFullscreen: style set, applying bounds");
         Watchdog.Mark("EnterFullscreen/Bounds");
         Rectangle fsBounds = FullscreenScreen().Bounds;
@@ -3279,12 +3290,12 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             int h = _menu.Height;                 // read while visible
             _menu.Visible = false;
-            if (_isFullscreen) _savedMenuVisible = false; else GrowClientHeight(-h);
+            if (_isFullscreen) _fsMenuVisible = false; else GrowClientHeight(-h);
         }
         else
         {
             _menu.Visible = true;
-            if (_isFullscreen) _savedMenuVisible = true; else GrowClientHeight(_menu.Height);
+            if (_isFullscreen) _fsMenuVisible = true; else GrowClientHeight(_menu.Height);
         }
         UpdateChecks();
         LayoutCanvas();
@@ -3296,12 +3307,12 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             int h = _status.Height;
             _status.Visible = false;
-            if (_isFullscreen) _savedStatusVisible = false; else GrowClientHeight(-h);
+            if (_isFullscreen) _fsStatusVisible = false; else GrowClientHeight(-h);
         }
         else
         {
             _status.Visible = true;
-            if (_isFullscreen) _savedStatusVisible = true; else GrowClientHeight(_status.Height);
+            if (_isFullscreen) _fsStatusVisible = true; else GrowClientHeight(_status.Height);
         }
         UpdateChecks();
         LayoutCanvas();
@@ -3900,6 +3911,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         _miLowLatency.Checked = _video.SupportsLowLatency && _settings.LowLatency;
         _miLowLatency.ToolTipText = _video.SupportsLowLatency
             ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+        _cmiLowLatency.Enabled = _miLowLatency.Enabled;
+        _cmiLowLatency.Checked = _miLowLatency.Checked;
+        _cmiLowLatency.ToolTipText = _miLowLatency.ToolTipText;
         _miLockAspect.Checked = _lockAspect;
         _miBorderless.Checked = _isBorderless;
         _cmiBorderless.Checked = _isBorderless;

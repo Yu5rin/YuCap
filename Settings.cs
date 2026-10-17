@@ -24,6 +24,11 @@ public sealed class AppSettings
     public bool AlwaysOnTop { get; set; }
     public bool MenuVisible { get; set; } = true;
     public bool StatusVisible { get; set; } = true;
+    /// <summary>The same two bars while fullscreen (kept apart from the windowed choice). Both are hidden by default, as before.</summary>
+    public bool FullscreenMenuVisible { get; set; }
+    public bool FullscreenStatusVisible { get; set; }
+    /// <summary>The info overlay (Ctrl+Shift+I), shared by windowed and fullscreen as it always was. Off by default.</summary>
+    public bool InfoVisible { get; set; }
     public int Volume { get; set; } = 100;
     public int AudioBufferMs { get; set; } = AudioEngine.DefaultBufferMs;
     /// <summary>0 = written before the audio path was rebuilt (v1.9); the old defaults of the buffer (120 / 200 ms) then mean "never changed" and move to the new default once.</summary>
