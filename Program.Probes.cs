@@ -19,12 +19,16 @@ namespace YuCap;
 // Both run the Direct3D engine in a real (small) window on the live capture device.
 internal static partial class Program
 {
+    /// <summary>--display for the probes that need a fast monitor (--interp-probe): the part of the monitor's name to open the window on.</summary>
+    private static string? _probeDisplay;
+
     private static Form NewProbeWindow(string title, out VideoBox canvas)
     {
+        DisplayInfo? di = string.IsNullOrEmpty(_probeDisplay) ? null : Displays.List().FirstOrDefault(d => d.FriendlyName.Contains(_probeDisplay, StringComparison.OrdinalIgnoreCase));
         var form = new Form
         {
             StartPosition = FormStartPosition.Manual,
-            Location = new Point(80, 80),
+            Location = di == null ? new Point(80, 80) : new Point(di.Bounds.Left + 80, di.Bounds.Top + 80),
             Size = new Size(960, 540),
             ShowInTaskbar = false,
             Text = title,

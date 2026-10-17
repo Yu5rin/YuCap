@@ -2,6 +2,7 @@
 // Entry points, all pixel shaders drawn with the fullscreen triangle of vs.hlsl:
 //   pyr1   RGB frame -> luma at 1/F size            (FxF box average; F = 2, or 4 for sources wider than 2560)
 //   pyrd   luma level -> luma level at 1/2 size     (2x2 box average)
+//   mecost matching costs of all integer vectors of the coarsest level (parallel)
 //   me     block matching of one pyramid level      (symmetric: A(x - v/2) against B(x + v/2))
 //   med    3x3 component-wise median of a vector field (and unit conversion on the last level)
 //   synth  in-between frame from A, B and the final field
@@ -11,12 +12,13 @@ cbuffer Cb : register(b0)
     float4 P0;   // pyr*: source size (xy), box size F (z, pyr1 only) | me: level size (xy), 1/size (zw) | synth: oriented size (xy)
     float4 P1;   // me: field size (xy), parent field size (zw) | med: field size (xy) | synth: field size (xy)
     float4 P2;   // me: lambda (x), coarsest (y), finest (z) | med: output scale (y: source pixels per finest-level pixel) | synth: alpha (z), source pixels per field texel (w)
-    float4 P3;
+    float4 P3;   // mecost, me (coarsest level): search range R in level pixels (x), 2R+1 (y)
 };
 
 Texture2D<float4> T0 : register(t0);
 Texture2D<float4> T1 : register(t1);
 Texture2D<float4> T2 : register(t2);
+Texture2D<float>  T3 : register(t3);
 SamplerState      lin : register(s0);
 
 // ---------------------------------------------------------------- pyramid
@@ -68,8 +70,19 @@ float BlockCost(float2 c, float2 v)
     return s * (1.0 / 64.0);
 }
 
+// Coarsest level, step 1: the cost of every integer vector -R..R of every block, one pixel per (block, vector):
+// block f, vector d is the pixel f*N + d + R (N = 2R+1). Spread over many pixels so the GPU is kept busy.
+float4 mecost(float4 pos : SV_Position) : SV_Target
+{
+    int R = (int)P3.x, N = (int)P3.y;
+    int2 p = int2(pos.xy);
+    int2 f = p / N;
+    int2 d = p - f * N - R;
+    return float4(BlockCost(float2(f) * 4.0 + 2.0, float2(d)), 0, 0, 1);
+}
+
 // A block whose best match is already this good (mean absolute luma difference) is not searched further.
-static const float EarlyOut = 0.006;
+static const float EarlyOut = 0.001;
 static const int Order[10] = { 4, 0, 1, 2, 3, 5, 6, 7, 8, 9 };
 
 float4 me(float4 pos : SV_Position) : SV_Target
@@ -85,11 +98,13 @@ float4 me(float4 pos : SV_Position) : SV_Target
     if (P2.y > 0.5)
     {
         // coarsest level: exhaustive integer search
-        [loop] for (int dy = -6; dy <= 6; dy++)
-        [loop] for (int dx = -6; dx <= 6; dx++)
+        // (the matching costs were computed in parallel by mecost into T3, N x N per block)
+        int R = (int)P3.x, N = (int)P3.y;
+        [loop] for (int dy = -R; dy <= R; dy++)
+        [loop] for (int dx = -R; dx <= R; dx++)
         {
             float2 v = float2(dx, dy);
-            float cost = BlockCost(c, v) + lambda * length(v);
+            float cost = T3.Load(int3(f * N + int2(dx + R, dy + R), 0)) + lambda * length(v);
             if (cost < bestC) { bestC = cost; best = v; }
         }
     }
@@ -186,12 +201,13 @@ float4 synth(float4 pos : SV_Position) : SV_Target
     float3 cb = T1.SampleLevel(lin, (pos.xy + (1.0 - alpha) * v) * isz, 0).rgb;
     float3 mc = lerp(ca, cb, alpha);
 
+    // where the two motion-compensated samples disagree the vector is not to be trusted. The picture then goes
+    // smoothly over to the plain blend of the two frames at this pixel (not to the nearer frame: a hard switch
+    // between two different pictures scores worse than the blend on real footage).
     float d = abs(Luma(ca) - Luma(cb));
-    float w = saturate((d - 0.06) / 0.10);
+    float w = saturate((d - 0.08) / 0.25);
 
-    // where the two motion-compensated samples disagree the vector is not to be trusted:
-    // fall back to the nearer frame as it is
     int3 p = int3(int2(pos.xy), 0);
-    float3 fb = alpha < 0.5 ? T0.Load(p).rgb : T1.Load(p).rgb;
+    float3 fb = lerp(T0.Load(p).rgb, T1.Load(p).rgb, alpha);
     return float4(lerp(mc, fb, w), 1.0);
 }

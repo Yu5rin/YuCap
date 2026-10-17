@@ -32,7 +32,7 @@ internal static class D3DShaders
         public bool InterpOk;
         public byte[] PyrLuma = Array.Empty<byte>();
         public byte[] PyrDown = Array.Empty<byte>();
-        public byte[] Me = Array.Empty<byte>();
+        public byte[] Me = Array.Empty<byte>(), MeCost = Array.Empty<byte>();
         public byte[] Med = Array.Empty<byte>();
         public byte[] Synth = Array.Empty<byte>();
     }
@@ -77,6 +77,7 @@ internal static class D3DShaders
                 b.PyrLuma = Compile(interp, "pyr1", "interp.hlsl", "ps_5_0");
                 b.PyrDown = Compile(interp, "pyrd", "interp.hlsl", "ps_5_0");
                 b.Me = Compile(interp, "me", "interp.hlsl", "ps_5_0");
+                b.MeCost = Compile(interp, "mecost", "interp.hlsl", "ps_5_0");
                 b.Med = Compile(interp, "med", "interp.hlsl", "ps_5_0");
                 b.Synth = Compile(interp, "synth", "interp.hlsl", "ps_5_0");
                 b.InterpOk = true;
@@ -93,6 +94,9 @@ internal static class D3DShaders
 
     private static string Resource(string name)
     {
+        // development aid: YUCAP_SHADER_DIR=<Shaders folder> compiles the .hlsl files from disk (no rebuild between edits)
+        string? dir = Environment.GetEnvironmentVariable("YUCAP_SHADER_DIR");
+        if (!string.IsNullOrEmpty(dir) && File.Exists(Path.Combine(dir, name))) return File.ReadAllText(Path.Combine(dir, name), Encoding.UTF8);
         Assembly asm = typeof(D3DShaders).Assembly;
         using Stream? s = asm.GetManifestResourceStream("Shaders." + name)
             ?? throw new InvalidOperationException("missing embedded shader resource " + name);

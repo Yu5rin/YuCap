@@ -88,7 +88,7 @@ internal sealed class D3DRenderer : IDisposable
     private ID3D11ShaderResourceView?[] _pfSrv = new ID3D11ShaderResourceView?[2];
     private ID3D11RenderTargetView?[] _pfRtv = new ID3D11RenderTargetView?[2];
     private Size _pfSize;
-    private ID3D11PixelShader? _psPyr1, _psPyrD, _psMe, _psMed, _psSynth;   // frame interpolation (null = unavailable)
+    private ID3D11PixelShader? _psPyr1, _psPyrD, _psMe, _psMeCost, _psMed, _psSynth;   // frame interpolation (null = unavailable)
     private ID3D11SamplerState? _linear, _point;
     private ID3D11RasterizerState? _raster;
     private ID3D11Buffer? _cbConvert, _cbScale, _cbEasu, _cbRcas, _cbInterp;
@@ -222,6 +222,7 @@ internal sealed class D3DRenderer : IDisposable
                 _psPyr1 = Device.CreatePixelShader(b.PyrLuma);
                 _psPyrD = Device.CreatePixelShader(b.PyrDown);
                 _psMe = Device.CreatePixelShader(b.Me);
+                _psMeCost = Device.CreatePixelShader(b.MeCost);
                 _psMed = Device.CreatePixelShader(b.Med);
                 _psSynth = Device.CreatePixelShader(b.Synth);
                 _cbInterp = Device.CreateBuffer(new BufferDescription(64, BindFlags.ConstantBuffer, ResourceUsage.Default));
@@ -229,8 +230,8 @@ internal sealed class D3DRenderer : IDisposable
             catch (Exception ex)
             {
                 Log.Info("D3D: interpolation shaders could not be created - frame interpolation is disabled: " + ex.Message.Split('\n')[0]);
-                _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
-                _psPyr1 = _psPyrD = _psMe = _psMed = _psSynth = null;
+                _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMeCost?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
+                _psPyr1 = _psPyrD = _psMe = _psMeCost = _psMed = _psSynth = null;
                 _cbInterp?.Dispose(); _cbInterp = null;
             }
         }
@@ -1271,11 +1272,19 @@ internal sealed class D3DRenderer : IDisposable
     private readonly record struct InterpKey(int Rotation, bool Mirror, VideoAdjustments Adj,
         System.Windows.Forms.Padding Crop, int W, int H);
 
-    private const float MeLambda = 0.002f;              // smoothness penalty per level pixel
+    // smoothness penalty per level pixel (measured on real footage: 0.005 and up pulls the vectors toward the parent's and loses real motion)
+    private const float MeLambda = 0.0005f;
+    // coarsest level: integer vectors -MeRange..MeRange level pixels, i.e. +-192 source pixels at 1080p (+-384 at 4K). A fast pan of a 30 fps game
+    // moves the picture by 100-200 px between the two source frames; the former +-6 (+-96 px) matched wrongly there.
+    private const int MeRange = 12;
 
     private bool _interpHold;                           // interpolation active (guarded by FrameLock)
     private long _interpHoldTicks;
     private OriFrame? _oriA, _oriB;
+    private ID3D11Texture2D? _costVol;                 // matching costs of the coarsest level (see mecost)
+    private ID3D11ShaderResourceView? _costVolSrv;
+    private ID3D11RenderTargetView? _costVolRtv;
+    private Size _costVolSize;
     private FieldLevel[]? _fields;                      // index 0 = level 1 (1/2) ... 3 = level 4 (1/16)
     private InterpKey _interpKey;
     private bool _interpKeyValid;
@@ -1308,6 +1317,8 @@ internal sealed class D3DRenderer : IDisposable
         _oriB?.Dispose(); _oriB = null;
         if (_fields != null) foreach (FieldLevel f in _fields) f.Dispose();
         _fields = null;
+        _costVolRtv?.Dispose(); _costVolSrv?.Dispose(); _costVol?.Dispose();
+        _costVolRtv = null; _costVolSrv = null; _costVol = null; _costVolSize = Size.Empty;
         _curA = _curB = _meA = _meB = 0;
         _lastAlpha = -1;
         _interpKeyValid = false;
@@ -1360,6 +1371,14 @@ internal sealed class D3DRenderer : IDisposable
             f.Raw = MakeTarget(fs.Width, fs.Height, Format.R16G16B16A16_Float, out f.RawSrv, out f.RawRtv);
             f.Fin = MakeTarget(fs.Width, fs.Height, Format.R16G16B16A16_Float, out f.FinSrv, out f.FinRtv);
             _fields[i] = f;
+        }
+        // the cost volume of the coarsest level: (2R+1)^2 pixels per block
+        Size cs = new(_fields[3].Size.Width * (2 * MeRange + 1), _fields[3].Size.Height * (2 * MeRange + 1));
+        if (_costVol == null || _costVolSize != cs)
+        {
+            _costVolRtv?.Dispose(); _costVolSrv?.Dispose(); _costVol?.Dispose();
+            _costVol = MakeTarget(cs.Width, cs.Height, Format.R32_Float, out ID3D11ShaderResourceView srv, out ID3D11RenderTargetView rtv);
+            _costVolSrv = srv; _costVolRtv = rtv; _costVolSize = cs;
         }
     }
 
@@ -1417,11 +1436,29 @@ internal sealed class D3DRenderer : IDisposable
             Size ls = a.LumaSize[k];
             Size parent = k == 3 ? new Size(1, 1) : fields[k + 1].Size;
 
+            const int rng = MeRange;
+            if (k == 3)
+            {
+                WriteCb(_cbInterp!, new InterpCb
+                {
+                    P0 = new Vector4(ls.Width, ls.Height, 1f / ls.Width, 1f / ls.Height),
+                    P3 = new Vector4(rng, 2 * rng + 1, 0, 0),
+                });
+                SetupTriangle(_costVolRtv!, new Rectangle(0, 0, _costVolSize.Width, _costVolSize.Height));
+                Ctx.PSSetShader(_psMeCost);
+                Ctx.PSSetConstantBuffer(0, _cbInterp);
+                Ctx.PSSetSampler(0, _linear);
+                Ctx.PSSetShaderResource(0, a.LumaSrv[k]);
+                Ctx.PSSetShaderResource(1, b.LumaSrv[k]);
+                Ctx.Draw(3, 0);
+                Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!);
+            }
             WriteCb(_cbInterp!, new InterpCb
             {
                 P0 = new Vector4(ls.Width, ls.Height, 1f / ls.Width, 1f / ls.Height),
                 P1 = new Vector4(fl.Size.Width, fl.Size.Height, parent.Width, parent.Height),
                 P2 = new Vector4(MeLambda, k == 3 ? 1f : 0f, k == 0 ? 1f : 0f, 0),
+                P3 = new Vector4(k == 3 ? rng : 0, k == 3 ? 2 * rng + 1 : 0, 0, 0),
             });
             SetupTriangle(fl.RawRtv, new Rectangle(0, 0, fl.Size.Width, fl.Size.Height));
             Ctx.PSSetShader(_psMe);
@@ -1430,8 +1467,9 @@ internal sealed class D3DRenderer : IDisposable
             Ctx.PSSetShaderResource(0, a.LumaSrv[k]);
             Ctx.PSSetShaderResource(1, b.LumaSrv[k]);
             Ctx.PSSetShaderResource(2, k == 3 ? null! : fields[k + 1].FinSrv);
+            Ctx.PSSetShaderResource(3, k == 3 ? _costVolSrv! : null!);
             Ctx.Draw(3, 0);
-            Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!); Ctx.PSSetShaderResource(2, null!);
+            Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!); Ctx.PSSetShaderResource(2, null!); Ctx.PSSetShaderResource(3, null!);
 
             // 3x3 median; the finest level also converts the vectors to oriented-source pixels (x2)
             WriteCb(_cbInterp!, new InterpCb
@@ -2082,7 +2120,7 @@ internal sealed class D3DRenderer : IDisposable
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psOverlay?.Dispose(); _blendOver?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
         _psPre?.Dispose(); _psIbp?.Dispose(); _cbPre?.Dispose();
         for (int i = 0; i < 2; i++) { _pfRtv[i]?.Dispose(); _pfSrv[i]?.Dispose(); _pf[i]?.Dispose(); }
-        _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
+        _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMeCost?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
         _linear?.Dispose(); _point?.Dispose(); _raster?.Dispose();
         _cbConvert?.Dispose(); _cbScale?.Dispose(); _cbEasu?.Dispose(); _cbRcas?.Dispose(); _cbInterp?.Dispose();
         Ctx?.Dispose();

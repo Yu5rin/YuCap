@@ -189,6 +189,26 @@ internal static partial class Program
             RunInterpSynth(synOut, synIn, synStills.Length > 0 ? synStills : null, synScale > 0 ? synScale : 1);
             return;
         }
+        if (args.Length > 0 && args[0] == "--interp-capture")
+        {
+            int capCount = 20, capSec = 150; string capDisp = "HISENSE"; double capMax = 1;
+            string capDir = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_triples");
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--count" && i + 1 < args.Length) int.TryParse(args[++i], out capCount);
+                else if (args[i] == "--seconds" && i + 1 < args.Length) int.TryParse(args[++i], out capSec);
+                else if (args[i] == "--display" && i + 1 < args.Length) capDisp = args[++i];
+                else if (args[i] == "--max-moving" && i + 1 < args.Length) double.TryParse(args[++i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out capMax);
+            }
+            RunInterpCapture(capDir, capCount, capSec, capDisp, capMax);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--interp-eval")
+        {
+            ParseInterpEvalArgs(args, out string evDir, out string evOut, out var evVariants, out bool evQuick, out string[] evShow);
+            RunInterpEval(evDir, evOut, evVariants, evQuick, evShow);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--interp-probe")
         {
             string interpOut = Path.Combine(Path.GetTempPath(), "yucap_interp_probe.txt");
@@ -198,6 +218,7 @@ internal static partial class Program
             {
                 if (args[i].Equals("--mode", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) interpMode = ParseMode(args[++i]);
                 else if (args[i].Equals("--stills", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) interpStills = args[++i];
+                else if (args[i].Equals("--display", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) _probeDisplay = args[++i];
                 else if (!args[i].StartsWith("--", StringComparison.Ordinal)) interpOut = args[i];
             }
             RunInterpProbe(interpOut, interpMode, interpStills);
