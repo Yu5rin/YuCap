@@ -46,7 +46,7 @@ public sealed class AppSettings
     // "d3d" is our own Direct3D 11 swap chain, which is what makes FSR upscaling
     // possible. It is opt-in (オプション → 描画方式) until verified on a 4K monitor.
     public string Renderer { get; set; } = "mf";            // "mf" | "d3d"
-    public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" (d3d only)
+    public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" | "anime4k" (d3d only)
     public int FsrSharpness { get; set; } = 50;              // 0..100 (d3d + fsr only)
     public string NativeResScale { get; set; } = "off";      // "off" | "auto" | "480".."1440" (d3d only): shrink to the picture's real detail before scaling
 
@@ -268,7 +268,7 @@ public sealed class AppSettings
     internal static string NormalizeQuality(string? v)
     {
         v = (v ?? "fsr").Trim().ToLowerInvariant();
-        return v is "standard" or "fsr" ? v : "fsr";
+        return v is "standard" or "fsr" or "anime4k" ? v : "fsr";
     }
 
     internal static int SnapAvOffset(int ms) => (int)Math.Round(Math.Clamp(ms, -300, 300) / 10.0) * 10;

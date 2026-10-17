@@ -167,6 +167,21 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(nrOut, "report.txt"), nrText, new System.Text.UTF8Encoding(true));
             return;
         }
+        if (args.Length > 0 && args[0] == "--a4k-check")
+        {
+            // Headless (GPU only, no capture card): Anime4K port equivalence against a CPU reference of the original GLSL,
+            // synthetic-truth and real-picture comparisons, GPU time. --frames <dir> = saved real frames (tNN_f0.png ...).
+            string akOut = Path.Combine(Path.GetTempPath(), "yucap_a4k_check"), akFrames = "";
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("--frames", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) akFrames = args[++i];
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal)) akOut = args[i];
+            }
+            Directory.CreateDirectory(akOut);
+            string akText = A4kTest.HeadlessCheck(akOut, akFrames.Length > 0 ? akFrames : null);
+            File.WriteAllText(Path.Combine(akOut, "report.txt"), akText, new System.Text.UTF8Encoding(true));
+            return;
+        }
         // Calibration of the picture-detail estimator on synthetic enlarged pictures (no device, no window).
         if (args.Length > 0 && args[0] == "--res-estimate-check")
         {

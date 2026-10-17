@@ -38,7 +38,8 @@ NV12/P010 をネイティブに扱えるため、DirectShow では届かなか�
 - **抜き差し検出と自動再接続** — ケーブルを挿し直すと映像・音声が自動復帰。既定の再生デバイス変更にも追従
 - **表示モード** — アスペクト比保持／引き伸ばし／原寸／**整数倍**（ドット絵がボケない）
 - **高画質拡大（試験版）** — オプション → 描画方式で「Direct3D」を選ぶと、ウィンドウや全画面が入力より大きいときに
-  AMD FidelityFX FSR 1 で拡大します（表示 → 拡大の画質、シャープさも調整可能）。1440p 入力を 4K で見るときなどに効果があります
+  AMD FidelityFX FSR 1 で拡大します（表示 → 拡大の画質、シャープさも調整可能）。1440p 入力を 4K で見るときなどに効果があります。
+  拡大の画質を「くっきり（アニメ・イラスト向け）」にすると、Anime4K のニューラルネット（CNN）で線や文字を細くくっきり描き直します（GPU を多く使います。新しい絵ごとに 1 回だけ実行します）
 - **フレーム補間（試験版）** — 表示 → フレーム補間をオンにすると、モニターの更新が映像のコマ数より十分速いとき
   （例: 30 fps の映像を 60 Hz で、60 fps を 144 Hz で、120 fps を 144 Hz で見るとき）に、前後のコマの動きを調べて間のコマを作り、
   更新のたびに新しい絵を出して動きをなめらかにします。モニターの更新が映像のコマ数の 1.1 倍に届かないとき（60 fps の映像と 60 Hz など）や
@@ -134,6 +135,8 @@ YuCap が外部と通信するのは**更新確認のときだけ**です。そ�
 --list-formats [出力先]   対応フォーマットを書き出して終了
 --selftest [出力先]       自己診断を実行して終了
 --gpu-bench [出力先]      4K 拡大（FSR）の GPU 負荷を計測して終了（Direct3D）
+--a4k-check [出力先] [--frames 画像フォルダ]
+                        くっきり（Anime4K）の移植が元の GLSL と一致するかの検証・各拡大の比較・GPU 時間を出して終了（GPU のみ）
 --interp-probe [出力先] [--mode <指定>] [--stills <フォルダ>]
                     フレーム補間を実機の映像で動かし、補間なしと比べたコマ数・GPU 時間・コマの出方を書き出して終了（Direct3D）
 --interp-synth [出力先] --in <画像> [--scale <倍率>] [--stills <フォルダ>]
@@ -262,3 +265,4 @@ MIT License — [LICENSE](LICENSE) を参照
 | [Vortice.MediaFoundation](https://github.com/amerkoleci/Vortice.Windows) | MIT | Media Foundation バインディング |
 | [Vortice.Direct3D11 / DXGI / D3DCompiler / DirectComposition](https://github.com/amerkoleci/Vortice.Windows) | MIT | Direct3D 描画 |
 | [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | MIT | 高画質拡大（`third_party/FidelityFX-FSR1` に同梱） |
+| [Anime4K](https://github.com/bloc97/Anime4K) | MIT | くっきり拡大（`third_party/Anime4K` に同梱。v4.0.1 の CNN の重みを HLSL に移植） |

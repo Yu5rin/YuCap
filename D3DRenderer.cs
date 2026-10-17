@@ -53,7 +53,7 @@ internal readonly record struct YuvInfo(int Matrix, bool FullRange);
 /// thread and are serialised with the convert pass by <see cref="FrameLock"/> (the device is
 /// multithread-protected, so the immediate context tolerates the cross-thread calls).
 /// </summary>
-internal sealed class D3DRenderer : IDisposable
+internal sealed partial class D3DRenderer : IDisposable
 {
     public readonly object FrameLock = new();
 
@@ -727,6 +727,7 @@ internal sealed class D3DRenderer : IDisposable
             Size o = Oriented(keep.Size, rotation);
             EnsureOriented(o);
             ConvertInto(_orientedRtv!, src, keep, o, rotation, mirror, adj);
+            _orientedVer++;
             return true;
         }
     }
@@ -745,6 +746,7 @@ internal sealed class D3DRenderer : IDisposable
         _orientedSrv = Device.CreateShaderResourceView(_oriented);
         _orientedRtv = Device.CreateRenderTargetView(_oriented);
         _orientedSize = o;
+        _orientedVer++;
     }
 
     /// <summary>The convert draw: the frame textures (<c>_nv12</c> / <c>_texY,_texUV</c>) into <paramref name="rtv"/>,
@@ -806,22 +808,57 @@ internal sealed class D3DRenderer : IDisposable
 
         // "元の細かさに合わせて拡大": shrink to the real detail first, then scale from there. Only when the
         // picture is drawn larger than that detail (a window at or below it gains nothing) and not for integer scaling.
+        bool preDo = false; Size preTo = default;
         if (nativeH > 0 && !pixelPerfect && _psPre != null && nativeH < src.Height && dst.Height > nativeH)
         {
             int nw = Math.Max(2, (int)Math.Round((double)src.Width * nativeH / src.Height));
-            if (nw < src.Width && dst.Width > nw)
+            if (nw < src.Width && dst.Width > nw) { preDo = true; preTo = new Size(nw, nativeH); }
+        }
+        Size effSrc = preDo ? preTo : src;
+
+        // Anime4K: the CNN doubles the (prescaled) picture once, twice when the destination is 3x larger or more; a result
+        // that is still current (same picture, same settings) is reused, which also spares the prescale pass.
+        int a4kStages = quality == ScalingQuality.Anime4K && !pixelPerfect && interRtv != null && interSrv != null
+            ? A4kPlan(effSrc, dst.Size) : 0;
+        bool a4kHit = false;
+        A4kKey a4kKey = default;
+        if (a4kStages > 0)
+        {
+            a4kKey = new A4kKey(_orientedVer, preDo ? nativeH : 0, preDo ? (filter < 0 ? PrescaleFilter : filter) : 0,
+                preDo ? BackProjectionIterations : 0, preDo ? BackProjectionClamp : 0f, A4kVariantLetter, a4kStages, A4kHalf);
+            a4kHit = !A4kNoCache && _a4kResult != null && _a4kHaveKey && _a4kKey == a4kKey;
+        }
+        if (preDo)
+        {
+            if (!a4kHit) DrawPrescale(src, preTo, filter);
+            src = preTo;
+            srcSrv = _preSrv!;
+            _prescaleActiveH = nativeH;
+        }
+        if (a4kStages > 0)
+        {
+            if (!a4kHit)
             {
-                DrawPrescale(src, new Size(nw, nativeH), filter);
-                src = new Size(nw, nativeH);
-                srcSrv = _preSrv!;
-                _prescaleActiveH = nativeH;
+                if (A4kRun(srcSrv, src, a4kStages, a4kKey)) a4kHit = true;
+                else a4kStages = 0;     // could not run (shader / memory): behave like FSR
+            }
+            if (a4kHit)
+            {
+                src = _a4kResult!.Size;
+                srcSrv = _a4kResult.Srv;
             }
         }
 
-        bool fsr = quality == ScalingQuality.Fsr && !pixelPerfect && interRtv != null && interSrv != null
+        bool a4k = a4kStages > 0 && a4kHit;
+        bool fsr = (quality == ScalingQuality.Fsr || (quality == ScalingQuality.Anime4K && !a4k && A4kFallbackFsr))
+                   && !pixelPerfect && interRtv != null && interSrv != null
                    && dst.Width > src.Width && dst.Height > src.Height;
+        // after the CNN: EASU only for a (still) larger destination and only when asked for; the exact size needs no resampling
+        bool a4kExact = a4k && src == dst.Size;
+        bool a4kEasu = a4k && !a4kExact && A4kUseEasu && dst.Width > src.Width && dst.Height > src.Height;
+        if (a4kEasu) fsr = true;
 
-        if (!fsr)
+        if (!fsr && !a4k)
         {
             WriteCb(_cbScale!, new Vector4(dst.X, dst.Y, dst.Width, dst.Height));
             SetupTriangle(target, clip);
@@ -834,27 +871,50 @@ internal sealed class D3DRenderer : IDisposable
             return;
         }
 
-        // EASU: oriented picture -> intermediate (target-sized), only inside the clip.
-        var c0 = new uint[4]; var c1 = new uint[4]; var c2 = new uint[4]; var c3 = new uint[4];
-        Fsr1.EasuCon(c0, c1, c2, c3, src.Width, src.Height, src.Width, src.Height, dst.Width, dst.Height);
-        var easu = new uint[24];
-        Array.Copy(c0, 0, easu, 0, 4); Array.Copy(c1, 0, easu, 4, 4);
-        Array.Copy(c2, 0, easu, 8, 4); Array.Copy(c3, 0, easu, 12, 4);
-        easu[16] = unchecked((uint)dst.X); easu[17] = unchecked((uint)dst.Y);
-        WriteCb(_cbEasu!, easu);
-        SetupTriangle(interRtv!, clip);
-        Ctx.PSSetShader(_psEasu);
-        Ctx.PSSetConstantBuffer(0, _cbEasu);
-        Ctx.PSSetSampler(0, _linear);
-        Ctx.PSSetShaderResource(0, srcSrv);
-        Ctx.Draw(3, 0);
-        Ctx.PSSetShaderResource(0, null!);
+        ID3D11ShaderResourceView rcasIn = interSrv!;
+        int rcasOrgX = 0, rcasOrgY = 0;
+        if (a4kExact)
+        {
+            // the CNN output already has the destination size: sharpen it straight from there
+            rcasIn = srcSrv; rcasOrgX = dst.X; rcasOrgY = dst.Y;
+        }
+        else if (fsr)
+        {
+            // EASU: oriented picture -> intermediate (target-sized), only inside the clip.
+            var c0 = new uint[4]; var c1 = new uint[4]; var c2 = new uint[4]; var c3 = new uint[4];
+            Fsr1.EasuCon(c0, c1, c2, c3, src.Width, src.Height, src.Width, src.Height, dst.Width, dst.Height);
+            var easu = new uint[24];
+            Array.Copy(c0, 0, easu, 0, 4); Array.Copy(c1, 0, easu, 4, 4);
+            Array.Copy(c2, 0, easu, 8, 4); Array.Copy(c3, 0, easu, 12, 4);
+            easu[16] = unchecked((uint)dst.X); easu[17] = unchecked((uint)dst.Y);
+            WriteCb(_cbEasu!, easu);
+            SetupTriangle(interRtv!, clip);
+            Ctx.PSSetShader(_psEasu);
+            Ctx.PSSetConstantBuffer(0, _cbEasu);
+            Ctx.PSSetSampler(0, _linear);
+            Ctx.PSSetShaderResource(0, srcSrv);
+            Ctx.Draw(3, 0);
+            Ctx.PSSetShaderResource(0, null!);
+        }
+        else
+        {
+            // bilinear from the CNN output to the destination size (into the intermediate), then RCAS
+            WriteCb(_cbScale!, new Vector4(dst.X, dst.Y, dst.Width, dst.Height));
+            SetupTriangle(interRtv!, clip);
+            Ctx.PSSetShader(_psScale);
+            Ctx.PSSetConstantBuffer(0, _cbScale);
+            Ctx.PSSetSampler(0, _linear);
+            Ctx.PSSetShaderResource(0, srcSrv);
+            Ctx.Draw(3, 0);
+            Ctx.PSSetShaderResource(0, null!);
+        }
 
-        // RCAS: intermediate -> target.
+        // RCAS: intermediate (or the CNN output) -> target.
         var rc = new uint[4];
         Fsr1.RcasCon(rc, (1f - Math.Clamp(sharpness, 0f, 1f)) * 2.0f);
         var rcas = new uint[24];
         Array.Copy(rc, 0, rcas, 0, 4);
+        rcas[16] = unchecked((uint)rcasOrgX); rcas[17] = unchecked((uint)rcasOrgY);
         rcas[20] = unchecked((uint)clip.Left); rcas[21] = unchecked((uint)clip.Top);
         rcas[22] = unchecked((uint)clip.Right); rcas[23] = unchecked((uint)clip.Bottom);
         WriteCb(_cbRcas!, rcas);
@@ -862,7 +922,7 @@ internal sealed class D3DRenderer : IDisposable
         Ctx.PSSetShader(_psRcas);
         Ctx.PSSetConstantBuffer(0, _cbRcas);
         Ctx.PSSetSampler(0, _linear);
-        Ctx.PSSetShaderResource(0, interSrv!);
+        Ctx.PSSetShaderResource(0, rcasIn);
         Ctx.Draw(3, 0);
         Ctx.PSSetShaderResource(0, null!);
     }
@@ -1514,6 +1574,7 @@ internal sealed class D3DRenderer : IDisposable
             P1 = new Vector4(f1.Size.Width, f1.Size.Height, 0, 0),
             P2 = new Vector4(0, 0, alpha, InterpBlockPx(a.Size)),
         });
+        _orientedVer++;
         SetupTriangle(_orientedRtv!, new Rectangle(0, 0, o.Width, o.Height));
         Ctx.PSSetShader(_psSynth);
         Ctx.PSSetConstantBuffer(0, _cbInterp);
@@ -1877,6 +1938,7 @@ internal sealed class D3DRenderer : IDisposable
                 else Synthesize(_oriA!, _oriB!, (float)eff);
                 _curA = a.Seq; _curB = bSeq;
                 _lastAlpha = eff;
+                _orientedVer++;
                 changed = true;
             }
             return true;
@@ -1914,7 +1976,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             EnsureOriented(src.Size);
             BitmapData bd = src.LockBits(new Rectangle(Point.Empty, src.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); _orientedVer++; }
             finally { src.UnlockBits(bd); }
             _lastAlpha = -1; _curA = _curB = _meA = _meB = 0;
             return RenderOffscreen(output, quality, sharpness, nativeH, filter);
@@ -1929,7 +1991,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             EnsureOriented(src.Size);
             BitmapData bd = src.LockBits(new Rectangle(Point.Empty, src.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); _orientedVer++; }
             finally { src.UnlockBits(bd); }
             DrawPrescale(src.Size, to, filter);
             Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
@@ -1947,7 +2009,7 @@ internal sealed class D3DRenderer : IDisposable
         {
             EnsureOriented(source.Size);
             BitmapData bd = source.LockBits(new Rectangle(Point.Empty, source.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); }
+            try { Ctx.UpdateSubresource(_oriented!, 0, null, bd.Scan0, (uint)bd.Stride, 0); _orientedVer++; }
             finally { source.UnlockBits(bd); }
             _lastAlpha = -1; _curA = _curB = _meA = _meB = 0;
         }
@@ -2140,6 +2202,7 @@ internal sealed class D3DRenderer : IDisposable
         try { Ctx?.ClearState(); Ctx?.Flush(); } catch { }
         Beat.Dispose();
         InterpFree();
+        A4kFree();
         FreeOverlays(); FreeCrisp();
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();

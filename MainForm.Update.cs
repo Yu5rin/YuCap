@@ -42,7 +42,8 @@ public sealed partial class MainForm
         // Long duration: this is the one confirmation that the restart the
         // user just experienced was an update, not a crash — it must survive
         // long enough to actually be read.
-        // (Log only: nothing automatic pops an OSD. The version is in the 情報 overlay / About.)
+        // Kept on purpose (the user asked for it): the one automatic OSD that is not an error.
+        ShowOsd(L.F("バージョン {0} に更新しました", current), OsdLongMilliseconds);
     }
 
     /// <summary>

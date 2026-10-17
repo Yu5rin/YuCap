@@ -938,10 +938,17 @@ public sealed partial class MainForm : Form, IMessageFilter
         var m = new ToolStripMenuItem(L.T("拡大の画質"));
         var std = new ToolStripMenuItem(L.T("標準"), null, (_, _) => SetScalingQuality("standard")) { Tag = "standard" };
         var fsr = new ToolStripMenuItem(L.T("高画質（FSR）"), null, (_, _) => SetScalingQuality("fsr")) { Tag = "fsr" };
+        var a4k = new ToolStripMenuItem(L.T("くっきり（アニメ・イラスト向け）"), null, (_, _) => SetScalingQuality("anime4k"))
+        {
+            Tag = "anime4k",
+            ToolTipText = L.T("ニューラルネット（Anime4K）で線や文字を細くくっきり描き直します。ゲーム機の絵やイラスト向けで、GPU を多く使います。"),
+        };
         _qualityItems.Add(std);
         _qualityItems.Add(fsr);
+        _qualityItems.Add(a4k);
         m.DropDownItems.Add(std);
         m.DropDownItems.Add(fsr);
+        m.DropDownItems.Add(a4k);
         m.DropDownItems.Add(new ToolStripSeparator());
         var sharp = new ToolStripMenuItem(L.T("シャープさ"));
         foreach (int pct in new[] { 0, 25, 50, 75, 100 })
@@ -1173,7 +1180,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gHere, L.T("ウィンドウ枠を非表示"), "Ctrl+B");
         Row(gHere, L.T("メニューバーの表示"), "F10");
         Row(gHere, L.T("情報表示の切替"), "Ctrl+Shift+I");
-        Row(gHere, L.T("FSR と標準の拡大を見比べる"), L.T("Q（押している間）"));
+        Row(gHere, L.T("FSR・くっきりと標準の拡大を見比べる"), L.T("Q（押している間）"));
         Row(gHere, L.T("プロファイルを切り替える"), "Ctrl+1 – 9");
         Row(gHere, L.T("メニュー"), L.T("右クリック"));
         Row(gHere, L.T("操作一覧"), "F1");
@@ -2571,7 +2578,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Size displayBefore = _video.DisplayResolution;
         try
         {
-            _video.Quality = _settings.ScalingQuality == "fsr" ? ScalingQuality.Fsr : ScalingQuality.Standard;
+            _video.Quality = QualityOf(_settings.ScalingQuality);
             _video.Sharpness = _settings.FsrSharpness / 100f;
             _video.NativeResScale = _settings.NativeResScale;
             _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
@@ -2797,8 +2804,18 @@ public sealed partial class MainForm : Form, IMessageFilter
         ApplyRenderOptions();
         UpdateChecks();
         UpdateStatus();
-        ShowOsd(L.F("拡大の画質: {0}", quality == "fsr" ? L.T("高画質（FSR）") : L.T("標準")));
+        ShowOsd(L.F("拡大の画質: {0}", QualityLabel(quality)));
     }
+
+    private static ScalingQuality QualityOf(string setting) =>
+        setting == "fsr" ? ScalingQuality.Fsr : setting == "anime4k" ? ScalingQuality.Anime4K : ScalingQuality.Standard;
+
+    private static string QualityLabel(string setting) =>
+        setting == "fsr" ? L.T("高画質（FSR）") : setting == "anime4k" ? L.T("くっきり（アニメ・イラスト向け）") : L.T("標準");
+
+    /// <summary>The short name of the engine's scaling quality for the status bar / info panel (FSR, くっきり, 標準).</summary>
+    private string ScalerShortName() =>
+        _video.Quality == ScalingQuality.Fsr ? "FSR" : _video.Quality == ScalingQuality.Anime4K ? L.T("くっきり") : L.T("標準");
 
     private void SetNativeRes(string key)
     {
@@ -2911,7 +2928,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (d.Width > res.Width && d.Height > res.Height)
         {
             string name = _video.SupportsScalingQuality && _video.PixelPerfect ? L.T("整数倍")
-                : _video.SupportsScalingQuality && _video.Quality == ScalingQuality.Fsr ? "FSR" : L.T("標準");
+                : _video.SupportsScalingQuality ? ScalerShortName() : L.T("標準");
             if (_video.SupportsNativeRes && _video.NativeResState is { Active: > 0 }) name += "・" + L.T("元の細かさ");
             return name;
         }
@@ -3077,7 +3094,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         foreach (var item in _sharpnessItems)
         {
             item.Checked = (int)item.Tag! == _settings.FsrSharpness;
-            item.Enabled = quality == "fsr";
+            item.Enabled = quality is "fsr" or "anime4k";
         }
     }
 
@@ -3796,7 +3813,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private bool IsFsrUpscaling()
     {
         if (!_video.IsRunning || !_video.SupportsScalingQuality) return false;
-        if (_video.Quality != ScalingQuality.Fsr || _video.PixelPerfect) return false;
+        if (_video.Quality == ScalingQuality.Standard || _video.PixelPerfect) return false;
         Size res = _video.DisplayResolution;
         if (res.Width <= 0 || res.Height <= 0) return false;
         Rectangle dest = ComputeDest(_canvas.ClientSize);
@@ -3869,7 +3886,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_isPip) stateParts.Add(L.T("PiP"));
         if (_burstTimer.Enabled) stateParts.Add(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
         if (_zoom > 1.001) stateParts.Add(L.F("ズーム {0}%", (int)Math.Round(_zoom * 100)));
-        if (IsFsrUpscaling()) stateParts.Add(L.T("FSR"));
+        if (IsFsrUpscaling()) stateParts.Add(ScalerShortName());
         if (_video.SupportsAdjustments && !CurrentAdjustments().IsNeutral) stateParts.Add(L.T("色調整"));
         if (_video.SupportsCrop && HasCrop()) stateParts.Add(L.T("切り取り"));
         if (_video.SupportsLowLatency && _settings.LowLatency) stateParts.Add(L.T("低遅延"));
@@ -4092,22 +4109,22 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void BeginCompare()
     {
         if (_compareHeld) return;
-        if (!_video.SupportsScalingQuality || _video.Quality != ScalingQuality.Fsr || _video.PixelPerfect)
+        if (!_video.SupportsScalingQuality || _video.Quality == ScalingQuality.Standard || _video.PixelPerfect)
         {
-            ShowOsd(L.T("見比べは Direct3D 描画で高画質（FSR）のときに使えます"), OsdLongMilliseconds);
+            ShowOsd(L.T("見比べは Direct3D 描画で高画質（FSR）かくっきりのときに使えます"), OsdLongMilliseconds);
             return;
         }
         _compareHeld = true;
         _video.Quality = ScalingQuality.Standard;   // temporary: _settings is untouched
-        ShowOsd(L.T("標準の拡大で表示中（Q を離すと FSR）"), OsdLongMilliseconds);
+        ShowOsd(L.T("標準の拡大で表示中（Q を離すと元に戻ります）"), OsdLongMilliseconds);
     }
 
     private void EndCompare(bool silent = false)
     {
         if (!_compareHeld) return;
         _compareHeld = false;
-        try { if (_video.SupportsScalingQuality) _video.Quality = ScalingQuality.Fsr; } catch { }
-        if (!silent) ShowOsd(L.T("FSR"));
+        try { if (_video.SupportsScalingQuality) _video.Quality = QualityOf(_settings.ScalingQuality); } catch { }
+        if (!silent) ShowOsd(ScalerShortName());
     }
 
     // ---- Info overlay (Ctrl+Shift+I) ----------------------------------------
@@ -4157,11 +4174,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         double fx = (double)d.Width / res.Width, fy = (double)d.Height / res.Height;
         string f = Math.Abs(fx - fy) < 0.01 ? $"{fx:0.00}" : $"{fx:0.00}×{fy:0.00}";
         if (d.Width == res.Width && d.Height == res.Height) return L.T("等倍");
-        // D3DRenderer uses FSR only when upscaling in BOTH dimensions.
+        // D3DRenderer uses FSR / the CNN only when upscaling in BOTH dimensions.
         if (d.Width > res.Width && d.Height > res.Height)
         {
             if (_video.SupportsScalingQuality && _video.PixelPerfect) return L.T("整数倍") + $" ×{fx:0.##}";
-            if (_video.SupportsScalingQuality && _video.Quality == ScalingQuality.Fsr) return "FSR ×" + f;
+            if (_video.SupportsScalingQuality && _video.Quality != ScalingQuality.Standard) return ScalerShortName() + " ×" + f;
             return L.T("標準") + " ×" + f;
         }
         if (d.Width < res.Width && d.Height < res.Height) return L.T("縮小") + " ×" + f;

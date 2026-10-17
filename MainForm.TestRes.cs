@@ -129,7 +129,7 @@ public sealed partial class MainForm
             // YuCap's own enlargement to this monitor (data this run already has: capture size, monitor size, scaler)
             Size mon = _topt.Target.Bounds.Size;
             string scaler = _video.SupportsScalingQuality
-                ? ((_testSaved?.ScalingQuality ?? _settings.ScalingQuality) == "fsr" ? "FSR（高画質）" : "標準")
+                ? ((_testSaved?.ScalingQuality ?? _settings.ScalingQuality) switch { "fsr" => "FSR（高画質）", "anime4k" => "くっきり（Anime4K）", _ => "標準" })
                 : "標準";
             bool enlarged = mon.Width > cap.Width || mon.Height > cap.Height;
             string upText = enlarged

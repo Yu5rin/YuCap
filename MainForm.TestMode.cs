@@ -417,7 +417,7 @@ public sealed partial class MainForm
         TestSection secNotice = rep.AddSection("4. 通知の表示",
             "全画面のとき、通知・一時停止の画像・情報表示が映像の上に見えているかを、画面の色で確かめます。");
         TestSection secFsr = rep.AddSection("5. FSR の効き",
-            "標準の拡大と FSR（高画質）の拡大を、このモニターの大きさで比べます。");
+            "標準の拡大・FSR（高画質）・くっきり（Anime4K）を、このモニターの大きさで比べます。");
         TestSection secHdr = rep.AddSection("6. HDR");
         TestSection secFunc = rep.AddSection("7. 機能",
             "切り取り・色の調整・映像の遅延・表示どおりの保存・回転と反転が正しく働くかを調べます。");
@@ -476,6 +476,7 @@ public sealed partial class MainForm
             }
 
             steps.Add((L.F("FSR の見え方: {0}", L.T("元の細かさに合わせた拡大")), secFsr, () => NativeResStep(secFsr, modes)));
+            steps.Add((L.F("FSR の見え方: {0}", L.T("くっきり（Anime4K）")), secFsr, () => A4kStep(secFsr, modes)));
 
             // 6. HDR
             steps.Add((L.T("HDR の確認"), secHdr, () => HdrStep(secHdr, modes)));
@@ -937,17 +938,17 @@ public sealed partial class MainForm
                 CaptureMode? mode = PickMode(modes, d.W, d.H, 0);
                 if (mode == null) continue;
                 string lab = $"{d.Name}（{mode.Fps}fps）";
-                var qs = d.Four ? new[] { ScalingQuality.Standard } : new[] { ScalingQuality.Standard, ScalingQuality.Fsr };
+                var qs = d.Four ? new[] { ScalingQuality.Standard } : new[] { ScalingQuality.Standard, ScalingQuality.Fsr, ScalingQuality.Anime4K };
                 foreach (ScalingQuality q in qs)
                 {
                     if (quick)
                     {
                         // one mode per resolution; low latency and FSR only on the 1080p one
                         bool first = d.W == 1920;
-                        if (!first && (ll || q == ScalingQuality.Fsr)) continue;
-                        if (first && ll && q == ScalingQuality.Fsr) continue;
+                        if (!first && (ll || q != ScalingQuality.Standard)) continue;
+                        if (first && ll && q != ScalingQuality.Standard) continue;
                     }
-                    list.Add(new RenderCase($"{lab} / {(q == ScalingQuality.Fsr ? "FSR" : "標準")} / 低遅延{(ll ? "オン" : "オフ")}", mode, q, ll));
+                    list.Add(new RenderCase($"{lab} / {QualityName(q)} / 低遅延{(ll ? "オン" : "オフ")}", mode, q, ll));
                 }
             }
         }
@@ -955,6 +956,7 @@ public sealed partial class MainForm
         // Frame interpolation: every source frame rate the screen refreshes clearly faster than (the
         // setting only works from refresh >= 1.1 x fps). Per rate the best mode (NV12 first, then the
         // largest picture), plus the 1080p one when that is a different mode.
+        CaptureMode? m0Anime4K = null;
         if (refreshHz > 0)
         {
             foreach (int fps in modes.Select(m => m.Fps).Distinct().Where(f => f > 0 && f * 1.1 <= refreshHz).OrderBy(f => f))
@@ -968,10 +970,18 @@ public sealed partial class MainForm
                 if (hd != null) picks.Add(hd);
                 foreach (CaptureMode m in picks)
                     list.Add(new RenderCase($"{ResolutionName(m)}{fps}（{fps}fps） / 標準 / フレーム補間", m, ScalingQuality.Standard, false, true));
+                // the CNN on every refresh (the interpolated picture is new each time): the heaviest live combination
+                if (m0Anime4K == null && picks.Count > 0 && picks[picks.Count - 1].Height == 1080 && fps >= 60)
+                {
+                    m0Anime4K = picks[picks.Count - 1];
+                    list.Add(new RenderCase($"{ResolutionName(m0Anime4K)}{fps}（{fps}fps） / くっきり / フレーム補間", m0Anime4K, ScalingQuality.Anime4K, false, true));
+                }
             }
         }
         return list;
     }
+
+    private static string QualityName(ScalingQuality q) => q == ScalingQuality.Fsr ? "FSR" : q == ScalingQuality.Anime4K ? "くっきり" : "標準";
 
     private static string ResolutionName(CaptureMode m) => m.Height switch
     {
@@ -1004,7 +1014,7 @@ public sealed partial class MainForm
         if (_testCaption != null) _testCaption.Showing = false;
         try
         {
-            _settings.ScalingQuality = c.Quality == ScalingQuality.Fsr ? "fsr" : "standard";
+            _settings.ScalingQuality = c.Quality == ScalingQuality.Fsr ? "fsr" : c.Quality == ScalingQuality.Anime4K ? "anime4k" : "standard";
             _settings.Interpolation = c.Interp;
             EnsureEngine(c.LowLatency, c.Mode);
         }
@@ -1045,7 +1055,7 @@ public sealed partial class MainForm
         double budget = 1000.0 / Math.Max(1, interpOn ? panel : srcFps);
 
         item.Num("映像", $"{ModeLabel(c.Mode)}  → {_topt.Target.Bounds.Width}x{_topt.Target.Bounds.Height} に拡大")
-            .Num("拡大の画質", c.Quality == ScalingQuality.Fsr ? "FSR（高画質）" : "標準")
+            .Num("拡大の画質", c.Quality == ScalingQuality.Fsr ? "FSR（高画質）" : c.Quality == ScalingQuality.Anime4K ? "くっきり（Anime4K）" : "標準")
             .Num("表示方式", meas != null && meas.PresentMode.Length > 0 ? meas.PresentMode : "?");
         if (!rateStable)
             item.Num("取り込みの安定待ち", $"モード切り替えの後、約 3 秒待っても映像が指定の {nominalFps:0} fps に落ち着きませんでした（直前の 1 秒で {rateSeen:0.0} fps）。そのまま計測しています");
@@ -1701,6 +1711,18 @@ public sealed partial class MainForm
     private async Task FeatureOrientation(TestSection sec)
     {
         var item = new TestItem { Name = "回転と反転" };
+        // A black / one-colour / card-message picture has no orientation to compare: report that instead of a false NG.
+        using (Bitmap? probe = await WaitForDetailedPhoto())
+        {
+            if (probe == null)
+            {
+                item.Verdict = Verdict.Info;
+                item.Summary = "[情報] 映像が真っ黒（または一色）だったため判定できません";
+                item.Explanation = "向きを比べるには、絵の入った映像が必要です。映像（Wii U など）を映した状態で試験してください。";
+                sec.Items.Add(item);
+                return;
+            }
+        }
         Size src = _video.CurrentResolution;
         var lines = new List<string>();
         Verdict v = Verdict.Ok;

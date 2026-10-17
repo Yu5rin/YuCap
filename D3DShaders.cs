@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -90,6 +91,27 @@ internal static class D3DShaders
             Log.Info($"D3D: shaders compiled in {sw.ElapsedMilliseconds}ms");
             _cached = b;
             return b;
+        }
+    }
+
+    private static readonly Dictionary<char, byte[][]> A4kCode = new();
+
+    /// <summary>Bytecode of every pass of the Anime4K network <paramref name="variant"/> (S, M or L), in the order of
+    /// <c>A4kModels.Passes*</c>. Compiled on first use (about 0.3 s) and kept for the life of the process; throws if the compile fails.</summary>
+    public static byte[][] GetA4k(char variant)
+    {
+        lock (Gate)
+        {
+            if (A4kCode.TryGetValue(variant, out byte[][]? have)) return have;
+            var sw = Stopwatch.StartNew();
+            string file = $"a4k_{char.ToLowerInvariant(variant)}.hlsl";
+            string src = Resource(file);
+            A4kPassInfo[] passes = variant switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
+            var code = new byte[passes.Length][];
+            for (int i = 0; i < passes.Length; i++) code[i] = Compile(src, passes[i].Entry, file, "ps_5_0");
+            Log.Info($"D3D: Anime4K {variant} shaders compiled in {sw.ElapsedMilliseconds}ms");
+            A4kCode[variant] = code;
+            return code;
         }
     }
 

@@ -178,6 +178,18 @@ public sealed class D3DVideoEngine : IVideoEngine
         return ok;
     }
 
+    public bool BenchQuality(Bitmap a, Bitmap? b, Size output, ScalingQuality quality, int nativeH, int frames, bool cached, out double[] ms)
+    {
+        double[] r = Array.Empty<double>();
+        Session? s = _s;
+        float sharp = _sharpness;
+        if (s != null && s.Alive)
+            s.Run(rr => { r = rr.QualityBench(a, b, output, quality, sharp, nativeH, frames, cached); return null; }, 120000, needFrame: false, out _, allowNull: true);
+        s?.PokeConvert();   // the live picture was replaced: convert the next frame again
+        ms = r;
+        return r.Length > 0;
+    }
+
     public RenderStats? Stats => _s?.Stats;
     public long FramesReceived => _s?.FramesReceived ?? 0;
     public long FramesPresented => _s?.FramesPresented ?? 0;

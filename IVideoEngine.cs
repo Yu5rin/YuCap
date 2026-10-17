@@ -17,6 +17,8 @@ public enum ScalingQuality
     Standard,
     /// <summary>AMD FidelityFX FSR 1: edge-adaptive upscale (EASU) + sharpening (RCAS).</summary>
     Fsr,
+    /// <summary>Anime4K CNN upscaler (x2 per stage), then RCAS / bilinear to the exact size: 「くっきり（アニメ・イラスト向け）」.</summary>
+    Anime4K,
 }
 
 /// <summary>
@@ -196,6 +198,11 @@ public interface IVideoEngine : IDisposable
     bool BenchPrescale(Bitmap? source, Size output, ScalingQuality quality, int nativeH, int filter, int frames,
         out double[] plain, out double[] withPre, out double[] passOnly)
     { plain = withPre = passOnly = Array.Empty<double>(); return false; }
+    /// <summary>Test mode: GPU milliseconds per presented frame at <paramref name="output"/> for <paramref name="quality"/>.
+    /// With <paramref name="b"/> the in-between picture of the pair is synthesised each time (frame interpolation on); otherwise
+    /// <paramref name="cached"/> says whether a repeated frame (the Anime4K result reused) or a new one is timed.</summary>
+    bool BenchQuality(Bitmap a, Bitmap? b, Size output, ScalingQuality quality, int nativeH, int frames, bool cached, out double[] ms)
+    { ms = Array.Empty<double>(); return false; }
     /// <summary>Render the current frame at <paramref name="output"/> size off-screen and
     /// read it back — lets the scaler be checked at 4K on a smaller monitor.</summary>
     Bitmap? RenderOffscreen(Size output, ScalingQuality quality) => null;
