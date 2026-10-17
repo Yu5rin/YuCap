@@ -106,9 +106,10 @@ internal sealed class TestOptions
 /// <summary>The caption bar shown over the video while the test runs (a child control like InfoOverlay).</summary>
 internal sealed class TestCaption : Control
 {
-    private readonly Font _font = new("Segoe UI", 12f, FontStyle.Bold);
-    private readonly Font _small = new("Segoe UI", 10f, FontStyle.Regular);
+    private Font _font = TextScale.MakeFont("Segoe UI", 16f, 1f, FontStyle.Bold);
+    private Font _small = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, 1f, FontStyle.Regular);
     private string _hint = string.Empty;
+    private float _scale = 1f;
 
     public TestCaption()
     {
@@ -116,6 +117,21 @@ internal sealed class TestCaption : Control
         Visible = false;
         TabStop = false;
         Height = 40;
+    }
+
+    internal int Margin16 => TextScale.Px(16, _scale);
+
+    /// <summary>Follow the monitor DPI / video size (see <see cref="TextScale"/>).</summary>
+    internal void ApplyScale(float scale)
+    {
+        if (Math.Abs(scale - _scale) < 0.001f) return;
+        _scale = scale;
+        Font f = _font, s = _small;
+        _font = TextScale.MakeFont("Segoe UI", 16f, scale, FontStyle.Bold);
+        _small = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, scale, FontStyle.Regular);
+        f.Dispose(); s.Dispose();
+        Height = TextScale.Px(40, scale);
+        Invalidate();
     }
 
     public void Set(string text, string hint)
@@ -130,11 +146,11 @@ internal sealed class TestCaption : Control
         using var back = new SolidBrush(Color.FromArgb(225, 16, 16, 16));
         e.Graphics.FillRectangle(back, ClientRectangle);
         using var accent = new SolidBrush(Ui.Colors.Accent);
-        e.Graphics.FillRectangle(accent, 0, 0, 5, Height);
+        e.Graphics.FillRectangle(accent, 0, 0, TextScale.Px(5, _scale), Height);
         Size hs = TextRenderer.MeasureText(_hint, _small, Size.Empty, TextFormatFlags.NoPadding);
-        TextRenderer.DrawText(e.Graphics, _hint, _small, new Point(Width - hs.Width - 14, (Height - hs.Height) / 2),
+        TextRenderer.DrawText(e.Graphics, _hint, _small, new Point(Width - hs.Width - TextScale.Px(14, _scale), (Height - hs.Height) / 2),
             Color.FromArgb(200, 200, 200), TextFormatFlags.NoPadding);
-        var textRect = new Rectangle(16, 0, Math.Max(10, Width - hs.Width - 48), Height);
+        var textRect = new Rectangle(TextScale.Px(16, _scale), 0, Math.Max(10, Width - hs.Width - TextScale.Px(48, _scale)), Height);
         TextRenderer.DrawText(e.Graphics, Text, _font, textRect, Color.White,
             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
     }
@@ -450,6 +466,8 @@ public sealed partial class MainForm
                 steps.Add((L.F("通知の表示: {0}", tag + " / " + L.T("情報表示")), secNotice, () => NoticeStep(secNotice, l2, m1080, 2)));
             }
 
+            steps.Add((L.F("通知の表示: {0}", L.T("通知と情報表示の文字の大きさ")), secNotice, () => TextSizeStep(secNotice, m1080)));
+
             // 5. FSR
             foreach ((string label, int h) in new[] { ("1080p", 1080), ("1440p", 1440) })
             {
@@ -549,6 +567,7 @@ public sealed partial class MainForm
     private void PrepareTestUi(UiBefore before)
     {
         _testCaption = new TestCaption();
+        _testCaption.ApplyScale(OverlayScale(TextScale.KCaption));
         Controls.Add(_testCaption);
         if (!_testCtxBlocked)
         {
@@ -595,8 +614,9 @@ public sealed partial class MainForm
     private void PositionTestCaption()
     {
         if (_testCaption is not { Visible: true }) return;
-        int w = Math.Min(Math.Max(200, _canvas.Width - 24), 1200);
-        _testCaption.Bounds = new Rectangle(_canvas.Left + (_canvas.Width - w) / 2, _canvas.Bottom - _testCaption.Height - 16, w, _testCaption.Height);
+        int mg = _testCaption.Margin16;
+        int w = Math.Min(Math.Max(200, _canvas.Width - mg * 3 / 2), (int)(1200 * _testCaption.Height / 40.0));
+        _testCaption.Bounds = new Rectangle(_canvas.Left + (_canvas.Width - w) / 2, _canvas.Bottom - _testCaption.Height - mg, w, _testCaption.Height);
     }
 
     // =============================================================================================
@@ -1323,6 +1343,76 @@ public sealed partial class MainForm
             }
         }
         finally { cleanup(); }
+        sec.Items.Add(item);
+    }
+
+    /// <summary>Is the text over the video big enough to read from where one sits? Measures the real fonts of the
+    /// notice and the info panel in fullscreen on the test monitor.
+    /// Assumptions: viewing distance = 1.5 x the screen height (TV / desktop monitor); capital-letter height
+    /// is what is judged; minimum comfortable visual angle about 0.25 deg for small info text and about
+    /// 0.35 deg for notices (0.4 deg rounded down, so the classic 12pt notice on a 1080p screen still passes);
+    /// more than 5% of the screen height is judged absurdly large.</summary>
+    private async Task TextSizeStep(TestSection sec, CaptureMode? mode)
+    {
+        var item = new TestItem { Name = "通知と情報表示の文字の大きさ" };
+        try { EnsureEngine(false, mode); }
+        catch (Exception ex)
+        {
+            item.Verdict = Verdict.Ng; item.Summary = "映像を開始できませんでした"; item.Explanation = ex.Message;
+            sec.Items.Add(item);
+            return;
+        }
+        await Wait(SettleMs);
+        bool infoWasVisible = _info.Visible;
+        ShowOsd(L.T("テスト表示"), OsdLongMilliseconds);
+        if (!infoWasVisible) ToggleInfo(); else UpdateInfo();
+        _info.BringToFront(); _osd.BringToFront(); _testCaption?.BringToFront();
+        await Wait(300);
+        try
+        {
+            int screenH = Math.Max(1, _topt.Target.Bounds.Height);
+            double dpiScale = DeviceDpi / 96.0;
+            int osdCap = TextScale.CapHeightPx(_osd.TextFont), infoCap = TextScale.CapHeightPx(_info.TextFont);
+            double osdFrac = (double)osdCap / screenH, infoFrac = (double)infoCap / screenH;
+            double Deg(double frac) => Math.Atan(frac / 1.5) * 180 / Math.PI;   // distance = 1.5 x screen height
+            double osdDeg = Deg(osdFrac), infoDeg = Deg(infoFrac);
+            const double osdMinDeg = 0.35, infoMinDeg = 0.25, maxFrac = 0.05;
+            string F(double f) => (f * 100).ToString("0.00") + "%";
+
+            item.Num("モニターの大きさ（高さ）", $"{screenH} ピクセル")
+                .Num("モニターの拡大率（Windows）", $"{dpiScale * 100:0}%")
+                .Num("YuCap が掛けた倍率（通知）", $"x{_osd.TextFactor:0.00}")
+                .Num("YuCap が掛けた倍率（情報表示）", $"x{_info.TextFactor:0.00}")
+                .Num("通知の文字（大文字の高さ）", $"{osdCap} ピクセル ／ 画面の高さの {F(osdFrac)} ／ 約 {osdDeg:0.00}°")
+                .Num("情報表示の文字（大文字の高さ）", $"{infoCap} ピクセル ／ 画面の高さの {F(infoFrac)} ／ 約 {infoDeg:0.00}°")
+                .Num("前提", "画面の高さの 1.5 倍の距離から見る。目安は通知 0.35° 以上・情報表示 0.25° 以上、画面の高さの 5% 以下");
+
+            var problems = new List<string>();
+            if (osdDeg < osdMinDeg) problems.Add("通知の文字が小さすぎます。");
+            if (infoDeg < infoMinDeg) problems.Add("情報表示の文字が小さすぎます。");
+            if (osdFrac > maxFrac || infoFrac > maxFrac) problems.Add("文字が大きすぎます。");
+            Rectangle cv = _canvas.Bounds;
+            if (_osd.Visible && !cv.Contains(_osd.Bounds)) problems.Add("通知が映像の枠からはみ出しています。");
+            if (_info.Visible && !cv.Contains(_info.Bounds)) problems.Add("情報表示が映像の枠からはみ出しています。");
+
+            if (problems.Count == 0)
+            {
+                item.Verdict = Verdict.Ok;
+                item.Summary = "読める大きさです";
+                item.Explanation = "通知も情報表示も、このモニターで離れて見ても読める大きさで、画面に収まっています。";
+            }
+            else
+            {
+                item.Verdict = Verdict.Warn;
+                item.Summary = "文字の大きさに注意";
+                item.Explanation = string.Join(" ", problems) + "「オプション」の「表示の文字の大きさ」で変えられます。";
+            }
+        }
+        finally
+        {
+            _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Visible = false;
+            if (!infoWasVisible && _info.Visible) ToggleInfo();
+        }
         sec.Items.Add(item);
     }
 

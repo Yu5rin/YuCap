@@ -15,12 +15,16 @@ public sealed class OsdOverlay : Control
     // 12pt bold normally; dropped to 9pt when the caller passes a small
     // maxWidth (a small PiP window), where the larger size would force
     // excessive wrapping or simply not fit.
-    private readonly Font _fontNormal = new("Segoe UI", 12f, FontStyle.Bold);
-    private readonly Font _fontSmall = new("Segoe UI", 9f, FontStyle.Bold);
+    // Sizes are in pixels (16px = 12pt, 12px = 9pt at 96 DPI) times a scale that follows the
+    // monitor's DPI and the size of the video area (see TextScale).
+    private Font _fontNormal = TextScale.MakeFont("Segoe UI", 16f, 1f, FontStyle.Bold);
+    private Font _fontSmall = TextScale.MakeFont("Segoe UI", 12f, 1f, FontStyle.Bold);
     private const int SmallMaxWidthThreshold = 360;
 
     private Font _font;
     private bool _clickable;
+    private float _scale = 1f;
+    private int _lastMaxWidth;
 
     /// <summary>Test mode: draw an opaque solid background of this colour, so a screen sample can tell
     /// whether the overlay really is on top of the video.</summary>
@@ -37,6 +41,26 @@ public sealed class OsdOverlay : Control
         Cursor = Cursors.Default;
     }
 
+    internal float TextFactor => _scale;
+    /// <summary>The large font in use (for the test mode's size measurement).</summary>
+    internal Font TextFont => _fontNormal;
+    /// <summary>Gap to the edge of the video area, in pixels at the current scale.</summary>
+    internal int EdgeGap => TextScale.Px(12, _scale);
+
+    /// <summary>Follow the monitor DPI / video size: new fonts, padding and corner radius; re-fit if showing.</summary>
+    internal void ApplyScale(float scale)
+    {
+        if (Math.Abs(scale - _scale) < 0.001f) return;
+        bool small = ReferenceEquals(_font, _fontSmall);
+        _scale = scale;
+        Font n = _fontNormal, s = _fontSmall;
+        _fontNormal = TextScale.MakeFont("Segoe UI", 16f, scale, FontStyle.Bold);
+        _fontSmall = TextScale.MakeFont("Segoe UI", 12f, scale, FontStyle.Bold);
+        _font = small ? _fontSmall : _fontNormal;
+        n.Dispose(); s.Dispose();
+        if (Visible && !string.IsNullOrEmpty(Text)) ShowText(Text, _lastMaxWidth, _clickable);
+    }
+
     /// <summary>Set the message, wrap it to <paramref name="maxWidth"/>, resize
     /// to fit and make visible (caller positions it). The hand cursor and the
     /// underline hint only appear when <paramref name="clickable"/> is true —
@@ -46,14 +70,16 @@ public sealed class OsdOverlay : Control
         Text = text;
         _clickable = clickable;
         Cursor = clickable ? Cursors.Hand : Cursors.Default;
-        _font = maxWidth < SmallMaxWidthThreshold ? _fontSmall : _fontNormal;
+        _lastMaxWidth = maxWidth;
+        _font = maxWidth < SmallMaxWidthThreshold * _scale ? _fontSmall : _fontNormal;
 
-        int innerMaxWidth = Math.Max(20, maxWidth - 28);
+        int padX = TextScale.Px(14, _scale), padY = TextScale.Px(8, _scale);
+        int innerMaxWidth = Math.Max(20, maxWidth - padX * 2);
         var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
         Size textSz = TextRenderer.MeasureText(text, _font, new Size(innerMaxWidth, int.MaxValue), flags);
-        Size = new Size(Math.Min(innerMaxWidth, textSz.Width) + 28, textSz.Height + 16);
+        Size = new Size(Math.Min(innerMaxWidth, textSz.Width) + padX * 2, textSz.Height + padY * 2);
 
-        using var path = Rounded(new Rectangle(0, 0, Width, Height), 10);
+        using var path = Rounded(new Rectangle(0, 0, Width, Height), TextScale.Px(10, _scale));
         Region?.Dispose();
         Region = new Region(path);
 
@@ -69,7 +95,8 @@ public sealed class OsdOverlay : Control
         using var back = new SolidBrush(TestBack ?? Color.FromArgb(215, 20, 20, 20));
         g.FillRectangle(back, ClientRectangle);
 
-        var textRect = new Rectangle(14, 8, Math.Max(1, Width - 28), Math.Max(1, Height - 16));
+        int padX = TextScale.Px(14, _scale), padY = TextScale.Px(8, _scale);
+        var textRect = new Rectangle(padX, padY, Math.Max(1, Width - padX * 2), Math.Max(1, Height - padY * 2));
         var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
         TextRenderer.DrawText(g, Text, _font, textRect, Color.White, flags);
 
@@ -78,9 +105,9 @@ public sealed class OsdOverlay : Control
             // Thin accent underline under the last line, so a clickable bubble
             // reads as a link rather than just another status flip.
             Size textSz = TextRenderer.MeasureText(g, Text, _font, textRect.Size, flags);
-            int lineY = 8 + textSz.Height;
-            using var pen = new Pen(Ui.Colors.Accent, 1.5f);
-            g.DrawLine(pen, 14, lineY, 14 + Math.Min(textSz.Width, textRect.Width), lineY);
+            int lineY = padY + textSz.Height;
+            using var pen = new Pen(Ui.Colors.Accent, 1.5f * _scale);
+            g.DrawLine(pen, padX, lineY, padX + Math.Min(textSz.Width, textRect.Width), lineY);
         }
     }
 

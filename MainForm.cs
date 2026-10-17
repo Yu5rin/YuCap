@@ -121,6 +121,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miBurst = null!;
     private ToolStripMenuItem _miRestoreLevel = null!;
     private readonly List<ToolStripMenuItem> _cursorSecItems = new();
+    private readonly List<ToolStripMenuItem> _textSizeItems = new();
     private readonly List<ToolStripMenuItem> _pipIdleItems = new();
     private readonly List<ToolStripMenuItem> _pipHoverItems = new();
     private readonly List<ToolStripMenuItem> _pipSizeItems = new();
@@ -417,7 +418,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         string main = _busyText ?? (_startingUp ? L.T("接続しています...") : L.T("映像が入力されていません"));
         // RGB(200,200,200) on black is ~10.6:1 — the old Brushes.Gray (128,128,128)
         // was only ~4.5:1, borderline for a large-ish message like this.
-        using var font = new Font("Segoe UI", 14f);
+        using var font = TextScale.MakeFont("Segoe UI", 14f * 96 / 72, _msgScale, FontStyle.Regular);
         using var mainBrush = new SolidBrush(Color.FromArgb(255, 200, 200, 200));
         var bounds = new Rectangle(0, 0, _canvas.ClientSize.Width, _canvas.ClientSize.Height);
         int wrapWidth = Math.Max(1, (int)(bounds.Width * 0.9));
@@ -431,20 +432,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         string? second = _busyText == null
             ? (_videoError ?? (_startingUp ? null : L.T("キャプチャデバイスを接続すると自動的に表示されます")))
             : null;
-        using var secondFont = new Font("Segoe UI", 10f);
+        using var secondFont = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, _msgScale, FontStyle.Regular);
         // RGB(150,150,150) on black is ~7.7:1 (≥7:1 target); the old (96,96,96) was ~3.3:1.
         using var secondBrush = new SolidBrush(Color.FromArgb(255, 150, 150, 150));
         Size secondSz = second != null
             ? TextRenderer.MeasureText(g, second, secondFont, new Size(wrapWidth, int.MaxValue), mainFlags)
             : Size.Empty;
 
-        int totalH = mainSz.Height + (second != null ? 4 + secondSz.Height : 0);
+        int totalH = mainSz.Height + (second != null ? TextScale.Px(4, _msgScale) + secondSz.Height : 0);
         int top = (bounds.Height - totalH) / 2;
         TextRenderer.DrawText(g, main, font, new Rectangle(wrapRect.X, top, wrapWidth, mainSz.Height),
             mainBrush.Color, mainFlags);
         if (second != null)
         {
-            int secondTop = top + mainSz.Height + 4;
+            int secondTop = top + mainSz.Height + TextScale.Px(4, _msgScale);
             TextRenderer.DrawText(g, second, secondFont, new Rectangle(wrapRect.X, secondTop, wrapWidth, secondSz.Height),
                 secondBrush.Color, mainFlags);
         }
@@ -792,6 +793,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         options.DropDownItems.Add(hotkeyCfg);
         options.DropDownItems.Add(BuildPipSettingsSubmenu());
         options.DropDownItems.Add(BuildRendererSubmenu());
+        options.DropDownItems.Add(BuildTextSizeSubmenu());
         _miLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
         options.DropDownItems.Add(_miLowLatency);
         options.DropDownItems.Add(new ToolStripSeparator());
@@ -1624,9 +1626,58 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (_freezeView.Bounds != _canvas.Bounds) _freezeView.Bounds = _canvas.Bounds;
             _freezeView.ImageRect = FreezeImageRect();
         }
+        ApplyOverlayScale();
         PositionOsd();
         PositionInfo();
         PositionTestCaption();
+    }
+
+    // ---- Text size over the video ------------------------------------------
+    // The notices / info panel / caption / "no video" message follow the DPI of the monitor the
+    // window is on and the height of the video area (TextScale), times the user's 表示の文字の大きさ.
+
+    private float _msgScale = 1f;
+
+    private float OverlayScale(double k) => TextScale.For(DeviceDpi, Math.Max(1, _canvas.Height), k, _settings.OverlayTextPct);
+
+    private void ApplyOverlayScale()
+    {
+        _osd.ApplyScale(OverlayScale(TextScale.KOsd));
+        _info.ApplyScale(OverlayScale(TextScale.KInfo));
+        _testCaption?.ApplyScale(OverlayScale(TextScale.KCaption));
+        float m = OverlayScale(TextScale.KMessage);
+        if (Math.Abs(m - _msgScale) > 0.001f) { _msgScale = m; _canvas.Invalidate(); }
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        ApplyOverlayScale();
+        PositionOsd();
+        PositionInfo();
+        PositionTestCaption();
+    }
+
+    private ToolStripMenuItem BuildTextSizeSubmenu()
+    {
+        var m = new ToolStripMenuItem(L.T("表示の文字の大きさ"));
+        foreach ((string label, int pct) in new[] { (L.T("自動"), 100), (L.T("小（75%）"), 75), (L.T("大（125%）"), 125), (L.T("特大（150%）"), 150) })
+        {
+            int p = pct;
+            var item = new ToolStripMenuItem(label, null, (_, _) => SetOverlayTextPct(p)) { Tag = p };
+            _textSizeItems.Add(item);
+            m.DropDownItems.Add(item);
+        }
+        return m;
+    }
+
+    private void SetOverlayTextPct(int pct)
+    {
+        _settings.OverlayTextPct = pct;
+        ApplyOverlayScale();
+        PositionInfo();
+        UpdateChecks();
+        ShowOsd(pct == 100 ? L.T("表示の文字の大きさ: 自動") : L.F("表示の文字の大きさ: {0}%", pct));
     }
 
     private Rectangle ComputeDest(Size client)
@@ -1692,7 +1743,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void PositionOsd()
     {
         if (_osd.Visible)
-            _osd.Location = new Point(_canvas.Left + 12, _canvas.Top + 12);
+            _osd.Location = new Point(_canvas.Left + _osd.EdgeGap, _canvas.Top + _osd.EdgeGap);
     }
 
     // ---- OSD queue --------------------------------------------------------
@@ -1741,7 +1792,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         _osdCurrent = item;
         _osdShownTick = Environment.TickCount;
-        int maxWidth = Math.Max(120, _canvas.Width - 24);
+        int maxWidth = Math.Max(120, _canvas.Width - _osd.EdgeGap * 2);
         _osd.ShowText(item.Text, maxWidth, clickable: item.OnClick != null);
         PositionOsd();
         _osdTimer.Stop();
@@ -2334,6 +2385,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _pipSizeItems.Clear();
         _pipPosItems.Clear();
         _cursorSecItems.Clear();
+        _textSizeItems.Clear();
 
         BuildMenu();
         BuildContextMenu();
@@ -3703,6 +3755,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         MarkSettingsDirty();
         foreach (var item in _cursorSecItems)
             item.Checked = _settings.CursorAutoHide && (int)item.Tag! == _settings.CursorHideSeconds;
+        foreach (var item in _textSizeItems)
+            item.Checked = (int)item.Tag! == _settings.OverlayTextPct;
         foreach (var item in _pipIdleItems)
             item.Checked = (int)item.Tag! == _settings.PipOpacity;
         foreach (var item in _pipHoverItems)
@@ -3874,7 +3928,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void PositionInfo()
     {
         if (_info.Visible)
-            _info.Location = new Point(_canvas.Right - _info.Width - 12, _canvas.Top + 12);
+            _info.Location = new Point(_canvas.Right - _info.Width - _info.EdgeGap, _canvas.Top + _info.EdgeGap);
     }
 
     private string DescribeScaling()

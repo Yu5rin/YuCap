@@ -115,6 +115,9 @@ public sealed class AppSettings
     public string? HotkeyConflictNotified { get; set; }
 
     // Behavior.
+    /// <summary>Size of the text drawn over the video (notices, info panel), as % of the automatic size
+    /// (which follows the monitor DPI and the video height). 100 = 自動.</summary>
+    public int OverlayTextPct { get; set; } = 100;
     public bool CursorAutoHide { get; set; } = true;
     public int CursorHideSeconds { get; set; } = 3;
     public bool GlobalHotkeys { get; set; } = true;
