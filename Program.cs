@@ -158,6 +158,13 @@ internal static partial class Program
             File.WriteAllText(ltOut, InterpCheck.SelfCheckLiveFrames());
             return;
         }
+        // Calibration of the picture-detail estimator on synthetic enlarged pictures (no device, no window).
+        if (args.Length > 0 && args[0] == "--res-estimate-check")
+        {
+            string reOut = args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_res_estimate_check.txt");
+            File.WriteAllText(reOut, ResEstimate.SelfCheck());
+            return;
+        }
         if (args.Length > 0 && args[0] == "--interp-synth")
         {
             string synOut = Path.Combine(Path.GetTempPath(), "yucap_interp_synth.txt"), synIn = "", synStills = "";

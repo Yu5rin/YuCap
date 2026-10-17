@@ -550,6 +550,7 @@ internal static class L
         ["フレーム補間の画質（既知の動き）"] = "Interpolation quality (known motion)",
         ["フレーム補間の画質（実際の映像）"] = "Interpolation quality (live frames)",
         ["重ねた表示による更新の低下"] = "Refresh drop caused by overlays",
+        ["映像の実際の細かさ"] = "Actual picture detail",
         ["低遅延オン"] = "low latency on",
         ["低遅延オフ"] = "low latency off",
         ["通知"] = "notice",

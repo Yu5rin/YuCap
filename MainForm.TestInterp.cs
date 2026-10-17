@@ -65,6 +65,7 @@ public sealed partial class MainForm
         CaptureMode? mode = PickMode(modes, 1920, 1080, 0) ?? modes.FirstOrDefault();
         if (_testCaption != null) _testCaption.Visible = false;
         Bitmap? still = null;
+        bool noDetail = false;
         try
         {
             if (mode != null)
@@ -72,9 +73,10 @@ public sealed partial class MainForm
                 _settings.Interpolation = false;
                 EnsureEngine(false, mode);
                 await Wait(SettleMs);
+                using (Bitmap? probe = await WaitForDetailedPhoto()) noDetail = probe == null;
                 Size res = _video.DisplayResolution;
                 Size outSize = res.Width >= 640 && res.Height >= 360 && res.Width <= 2560 ? res : new Size(1920, 1080);
-                still = await Task.Run(() => _video.RenderOffscreen(outSize, ScalingQuality.Standard));
+                if (!noDetail) still = await Task.Run(() => _video.RenderOffscreen(outSize, ScalingQuality.Standard));
             }
             // The verdict comes from a built-in picture (the same every time, with unambiguous detail everywhere), so it
             // does not depend on what the source happens to show; the picture taken from the video is a reference.
@@ -104,6 +106,7 @@ public sealed partial class MainForm
                 .Num("動きの向きが合っていた割合（四角）", $"{Pct(r.BlkN > 0 ? (double)r.BlkOk / r.BlkN : 0)}（{r.BlkOk}/{r.BlkN} ブロック、平均の誤差 {r.BlkErr:0.00} ピクセル）")
                 .Num("真っ黒になったブロック / 異常な値の動き", $"{r.BadBlocks} 個 / {r.BadVectors} 個");
             item.Images.Add(file);
+            if (noDetail) item.Num("（参考）映像から取った絵での結果", _probeCardMessage ? "映像がカード自身のメッセージ画面だったため、映像からは取りませんでした" : "映像が真っ黒（または一色）だったため、映像からは取りませんでした");
             if (rs is { Ok: true })
             {
                 bool tx = rs.BgTexN >= 50;
@@ -177,6 +180,16 @@ public sealed partial class MainForm
             await Wait(SettleMs + 500);
             InterpolationStatus? st = _video.InterpolationState;
             item.Num("映像", $"{ModeLabel(mode)}（モニターの更新 {panel:0} Hz）");
+            using (Bitmap? probe = await WaitForDetailedPhoto())
+            {
+                if (probe == null && st is { Active: true })
+                {
+                    item.Summary = NoDetailSummary;
+                    item.Explanation = NoDetailWhy;
+                    sec.Items.Add(item);
+                    return;
+                }
+            }
             if (st is not { Active: true })
             {
                 item.Summary = "フレーム補間が働かなかったため確認できませんでした";

@@ -422,6 +422,9 @@ public sealed partial class MainForm
                 steps.Add((L.F("取り込み: {0}", ModeLabel(mm)), secCap, () => CaptureStep(secCap, mm)));
             }
 
+            // 2b. how fine the picture really is (the card does not report the HDMI input's size)
+            steps.Add((L.F("取り込み: {0}", L.T("映像の実際の細かさ")), secCap, () => ResolutionStep(secCap, modes)));
+
             // 3. smoothness / load
             var cases = BuildRenderCases(modes, o.Quick, o.Target.RefreshHz);
             var vrrNotes = new List<(bool Ll, PacingQuality Q)>();
@@ -671,6 +674,55 @@ public sealed partial class MainForm
         double el = sw.Elapsed.TotalSeconds;
         long f1 = _video.FramesReceived;
         return (el > 0 ? (f1 - f0) / el : 0, per, el);
+    }
+
+    /// <summary>Waits until the capture rate (frames received over 1 s) is within 10% of <paramref name="nominal"/>,
+    /// for up to about 3 s. Returns whether it settled and the last rate seen.</summary>
+    /// <summary>Set by <see cref="WaitForDetailedPhoto"/>: the frames it rejected were the card's own message screen.</summary>
+    private bool _probeCardMessage;
+    private string NoDetailSummary => _probeCardMessage
+        ? "映像がカード自身のメッセージ画面（入力非対応など）だったため比べられません"
+        : "映像が真っ黒（または一色）だったため比べられません";
+    private string NoDetailWhy => _probeCardMessage
+        ? "約 5 秒の間、キャプチャカードが自分で出すメッセージ画面（黒地に白い文字）のままでした。入力側（ゲーム機など）の出力が、このモードで受け取れる解像度・コマ数と合っていない可能性があります。"
+        : "約 5 秒待っても、絵に細かい部分のある映像が来ませんでした。ゲーム機の画面が真っ黒（または一色）のままでは、比べられません。細かい絵や文字のある画面を映してから、もう一度試験してください。";
+
+    private async Task<(bool Stable, double Fps)> WaitStableRate(double nominal, int maxMs = 3000)
+    {
+        var total = Stopwatch.StartNew();
+        double fps;
+        while (true)
+        {
+            long f0 = _video.FramesReceived;
+            var sw = Stopwatch.StartNew();
+            await Wait(1000);
+            fps = sw.Elapsed.TotalSeconds > 0 ? (_video.FramesReceived - f0) / sw.Elapsed.TotalSeconds : 0;
+            if (nominal <= 0 || Math.Abs(fps - nominal) <= nominal * 0.10) return (true, fps);
+            if (total.ElapsedMilliseconds + 1000 > maxMs) return (false, fps);
+        }
+    }
+
+    /// <summary>A still of the source (no scaling) that has enough detail to analyse. Right after a mode switch the
+    /// picture is often black or one colour; this retries for up to <paramref name="maxMs"/> and returns null when it
+    /// never gets one. The caller disposes the bitmap.</summary>
+    private async Task<Bitmap?> WaitForDetailedPhoto(int maxMs = 5000, int pollMs = 250)
+    {
+        var sw = Stopwatch.StartNew();
+        _probeCardMessage = false;
+        do
+        {
+            Bitmap? b = await Task.Run(() => _video.PhotoSnapshot());
+            if (b != null)
+            {
+                bool msg = false;
+                bool ok = await Task.Run(() => ResEstimate.HasDetail(b, out msg));
+                if (ok) return b;
+                if (msg) _probeCardMessage = true;
+                b.Dispose();
+            }
+            await Wait(pollMs);
+        } while (sw.ElapsedMilliseconds < maxMs);
+        return null;
     }
 
     private static Verdict Worst(Verdict a, Verdict b) => (Verdict)Math.Max((int)a, (int)b);
@@ -937,6 +989,11 @@ public sealed partial class MainForm
             return;
         }
         await Wait(SettleMs);
+        // Right after a mode switch the card often runs below its rate for a second or two. Measure only once the
+        // capture rate has settled (within 10% of the named rate); if it never does, that is the card's doing and
+        // is reported as such below instead of as a display fault.
+        double nominalFps = _video.NegotiatedFps > 0 ? _video.NegotiatedFps : c.Mode.Fps;
+        var (rateStable, rateSeen) = await WaitStableRate(nominalFps);
 
         _video.BeginMeasure();
         List<RenderStats> st;
@@ -964,6 +1021,8 @@ public sealed partial class MainForm
         item.Num("映像", $"{ModeLabel(c.Mode)}  → {_topt.Target.Bounds.Width}x{_topt.Target.Bounds.Height} に拡大")
             .Num("拡大の画質", c.Quality == ScalingQuality.Fsr ? "FSR（高画質）" : "標準")
             .Num("表示方式", meas != null && meas.PresentMode.Length > 0 ? meas.PresentMode : "?");
+        if (!rateStable)
+            item.Num("取り込みの安定待ち", $"モード切り替えの後、約 3 秒待っても映像が指定の {nominalFps:0} fps に落ち着きませんでした（直前の 1 秒で {rateSeen:0.0} fps）。そのまま計測しています");
 
         Verdict v = Verdict.Ok;
         var why = new List<string>();
@@ -985,11 +1044,14 @@ public sealed partial class MainForm
                 ? $"{shown:0.0} fps（期待 {expect:0} fps＝モニターの更新と同じ数 → {Pct(shownRatio)}）"
                 : $"{shown:0.0} fps（期待 {expect:0} fps＝映像 {srcFps:0} fps とモニター {panel:0} Hz の小さい方 → {Pct(shownRatio)}）");
         if (shownRatio > 1.1) why.Add("モニターのリフレッシュより多くのコマを出しています（同期なしの表示のため、画面の途中で絵が切り替わるティアリングが出ることがあります。可変リフレッシュ対応のモニターでは出ません）。");
-        bool srcShort = c.Interp && srcFps > 0 && recvFps < srcFps * 0.9;   // the card itself delivers fewer frames than named
-        if (shownRatio < 0.90 && srcShort)
+        bool srcShort = srcFps > 0 && recvFps < srcFps * 0.9;   // the card itself delivers fewer frames than named
+        if (srcShort)
         {
+            // Not a display fault: at most "注意", whatever the shown rate or the pacing says (see also the judder below)
             v = Worst(v, Verdict.Warn);
-            why.Add($"キャプチャカードが指定の {srcFps:0} fps で届けられず（実際 {recvFps:0.0} fps）、映像が来ない間は補間する元がないため、表示されたコマ数が期待に届いていません。補間の不具合ではなく、このモードの取り込みの限界です。");
+            why.Add($"キャプチャカードが指定の {srcFps:0} fps で届けられず（実際 {recvFps:0.0} fps）、表示側ではどうにもならない分のコマが足りません。" +
+                (c.Interp ? "映像が来ない間は補間する元がないため、表示されたコマ数が期待に届いていません。補間の不具合ではなく、このモードの取り込みの限界です。"
+                          : "表示の不具合ではなく、このモードの取り込みの限界です（入力側の出力設定がこのモードのコマ数と合っていない場合や、USB の転送量が足りない場合に起きます）。"));
         }
         else if (shownRatio < 0.90) { v = Worst(v, Verdict.Ng); why.Add("表示されたコマ数が期待の 9 割に届いていません。"); }
         else if (shownRatio < 0.98) { v = Worst(v, Verdict.Warn); why.Add("表示されたコマ数がわずかに足りません。"); }
@@ -1044,7 +1106,12 @@ public sealed partial class MainForm
                     item.Num("同じ更新に複数のコマ", Pct(p.SameRefreshShare) + "（画面の途中で絵が切り替わる＝ティアリングの可能性）");
                 item.Num("可変リフレッシュ（VRR）", p.Vrr);
                 foreach (var b in p.Histogram) item.Bars.Add(b);
-                if (p.JudderShare > 0.30) { v = Worst(v, Verdict.Ng); why.Add($"コマの出方が不揃いで、{Pct(p.JudderShare)} のコマが長く出ています（カクつきとして見えます）。"); }
+                if (p.JudderShare > 0.30)
+                {
+                    v = Worst(v, srcShort ? Verdict.Warn : Verdict.Ng);
+                    why.Add($"コマの出方が不揃いで、{Pct(p.JudderShare)} のコマが長く出ています（カクつきとして見えます）。" +
+                        (srcShort ? "映像が指定のコマ数で届いていないため、届かなかった所で絵が止まっています。" : ""));
+                }
                 else if (p.JudderShare > 0.05) { v = Worst(v, Verdict.Warn); why.Add($"{Pct(p.JudderShare)} のコマが本来より長く出ています（軽いカクつき）。"); }
                 else why.Add("コマはほぼ一定の間隔で出ています。");
                 judderSeen = p.JudderShare > 0.05;
@@ -1292,6 +1359,19 @@ public sealed partial class MainForm
             item.Explanation = "このモニターは映像と同じか小さいため、FSR は使われず、標準と同じ表示になります。4K のモニターで試験すると比べられます。";
             sec.Items.Add(item);
             return;
+        }
+
+        // The source can be black for a moment after the mode switch; comparing two black pictures says nothing.
+        using (Bitmap? probe = await WaitForDetailedPhoto())
+        {
+            if (probe == null)
+            {
+                item.Verdict = Verdict.Info;
+                item.Summary = NoDetailSummary;
+                item.Explanation = NoDetailWhy;
+                sec.Items.Add(item);
+                return;
+            }
         }
 
         string safe = label.Replace(" ", "");
