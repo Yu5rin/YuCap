@@ -43,7 +43,7 @@ public sealed partial class MainForm
     {
         var item = new TestItem { Name = $"映像の実際の細かさ（入力の解像度の推定）: {ModeLabel(mode)}" };
         // A caption over the video makes Windows compose the monitor; keep it away like the other measuring steps.
-        if (_testCaption != null) _testCaption.Visible = false;
+        if (_testCaption != null) _testCaption.Showing = false;
         _settings.Interpolation = false;
         EnsureEngine(false, mode);
         await Wait(SettleMs);

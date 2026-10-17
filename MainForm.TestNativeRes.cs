@@ -28,7 +28,7 @@ public sealed partial class MainForm
             foreach (TestItem it in new[] { itemSynth, itemLive, itemGpu }) it.Summary = "映像のモードがありません";
             return;
         }
-        if (_testCaption != null) _testCaption.Visible = false;
+        if (_testCaption != null) _testCaption.Showing = false;
         EnsureEngine(false, mode);
         await Wait(SettleMs);
         if (!_video.SupportsNativeRes)

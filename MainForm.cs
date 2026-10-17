@@ -71,6 +71,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly ToolStripStatusLabel _lblAudio = new();
     private readonly ToolStripStatusLabel _lblVolume = new();
     private readonly ToolStripStatusLabel _lblState = new();
+    private readonly ToolStripStatusLabel _lblInterp = new(), _lblScale = new(), _lblCrisp = new();
     private readonly ContextMenuStrip _ctx = new();
     private readonly System.Windows.Forms.Timer _osdTimer = new();
     private readonly System.Windows.Forms.Timer _uiTimer = new();
@@ -319,6 +320,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         MainMenuStrip = _menu;
         _canvas.SendToBack();
         _osd.BringToFront();
+        _info.ContentChanged += () => OverlayChanged(OvInfo);
+        _osd.ContentChanged += () => OverlayChanged(OvOsd);
+        UpdateOverlayMode();
 
         _osdTimer.Interval = OsdMilliseconds;
         _osdTimer.Tick += (_, _) => OsdTimerTick();
@@ -328,7 +332,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _osd.Click += (_, _) => OsdClick();
 
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); CheckNativeResChange(); if (_info.Visible) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); CheckNativeResChange(); if (_info.Showing) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
         _devTimer.Interval = 900;
@@ -529,6 +533,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _lastCursorMoveTick = Environment.TickCount;
         ShowCursorIfHidden();
         _canvas.Focus();
+        if (e.Button == MouseButtons.Left && TryClickVirtualOsd(e.Location)) return;
         if (e.Button == MouseButtons.Middle)
         {
             ToggleMute();
@@ -558,6 +563,12 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void OnCanvasMouseMove(object? sender, MouseEventArgs e)
     {
+        if (!_dragging && !_panning && sender is Control hostCtl && ReferenceEquals(hostCtl, _canvas))
+        {
+            bool overOsd = _osd.Clickable && VirtualOsdRect() is { } osdR && osdR.Contains(e.Location);
+            Cursor want = overOsd ? Cursors.Hand : Cursors.Default;
+            if (!ReferenceEquals(_canvas.Cursor, want)) _canvas.Cursor = want;
+        }
         if (_panning)
         {
             Point cur = Cursor.Position;
@@ -1060,7 +1071,12 @@ public sealed partial class MainForm : Form, IMessageFilter
         _lblState.BorderSides = ToolStripStatusLabelBorderSides.Right;
         _lblState.ForeColor = Ui.Colors.Accent;
         var filler = new ToolStripStatusLabel { Spring = true, Text = string.Empty };
-        _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, _lblState, filler });
+        foreach (var l in new[] { _lblInterp, _lblScale, _lblCrisp })
+        {
+            l.BorderSides = ToolStripStatusLabelBorderSides.Right;
+            l.Visible = false;
+        }
+        _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, _lblInterp, _lblScale, _lblCrisp, _lblState, filler });
         _status.SizingGrip = true;
     }
 
@@ -1742,8 +1758,89 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void PositionOsd()
     {
-        if (_osd.Visible)
+        if (_osd.Showing)
+        {
             _osd.Location = new Point(_canvas.Left + _osd.EdgeGap, _canvas.Top + _osd.EdgeGap);
+            MarkOverlaysDirty();
+        }
+    }
+
+    // ---- Overlays drawn into the video (Direct3D renderer) ------------------
+    // A child window over the swap chain stops direct flip: DWM composes, and with mixed refresh rates it composes
+    // a secondary monitor at the primary's rate (a 144 Hz TV fell to ~60 fps while the info panel or a notice was up).
+    // So with the Direct3D renderer the notice / info panel / test caption controls are never shown as windows: they stay
+    // the layout, state and painting source, are rendered to premultiplied BGRA when they change, and the engine blends
+    // the images into the back buffer. Stills are copied before that blend, so they never contain them.
+    private const int OvInfo = 1, OvCaption = 2, OvOsd = 3;
+    private readonly Dictionary<int, (byte[] Px, int W, int H, long Ver)> _ovImg = new();
+    private readonly HashSet<int> _ovStale = new();
+    private long _ovVersion;
+    private bool _ovPushQueued;
+    internal long OverlayPushes;
+
+    private void OverlayChanged(int id)
+    {
+        _ovStale.Add(id);
+        MarkOverlaysDirty();
+    }
+
+    private void MarkOverlaysDirty()
+    {
+        if (_ovPushQueued || !IsHandleCreated) return;
+        _ovPushQueued = true;
+        BeginInvoke(new Action(PushOverlays));
+    }
+
+    /// <summary>Virtual (drawn into the video) when the engine can; windows while paused (the pause image is a window
+    /// above the video, so a layer inside the video would be hidden behind it) and with the Media Foundation renderer.</summary>
+    private void UpdateOverlayMode()
+    {
+        bool v = _video != null && _video.SupportsOverlays && !_frozen;
+        _osd.Virtual = v;
+        _info.Virtual = v;
+        if (_testCaption != null) _testCaption.Virtual = v;
+        if (!v) _video?.SetOverlays(null);
+        PositionOsd();
+        PositionInfo();
+        PositionTestCaption();
+        MarkOverlaysDirty();
+    }
+
+    private void PushOverlays()
+    {
+        _ovPushQueued = false;
+        if (_video == null || !_video.SupportsOverlays) return;
+        var list = new List<OverlayLayer>();
+        void Add(int id, OverlayControl? c)
+        {
+            if (c is not { Virtual: true, Showing: true }) { _ovImg.Remove(id); return; }
+            if (!_ovImg.ContainsKey(id) || _ovStale.Contains(id))
+            {
+                var img = c.RenderImage();
+                if (img == null) { _ovImg.Remove(id); return; }
+                _ovImg[id] = (img.Value.Pixels, img.Value.W, img.Value.H, ++_ovVersion);
+            }
+            _ovStale.Remove(id);
+            var o = _ovImg[id];
+            list.Add(new OverlayLayer(id, c.Left - _canvas.Left, c.Top - _canvas.Top, o.W, o.H, o.Px, o.Ver));
+        }
+        Add(OvInfo, _info);
+        Add(OvCaption, _testCaption);
+        Add(OvOsd, _osd);
+        OverlayPushes++;
+        _video.SetOverlays(list);
+    }
+
+    /// <summary>Rectangle of the notice in canvas client pixels, when it is a layer inside the video.</summary>
+    private Rectangle? VirtualOsdRect() =>
+        _osd is { Virtual: true, Showing: true } ? new Rectangle(_osd.Left - _canvas.Left, _osd.Top - _canvas.Top, _osd.Width, _osd.Height) : null;
+
+    /// <summary>A click on the notice while it is drawn into the video (no window to receive it). True when handled.</summary>
+    private bool TryClickVirtualOsd(Point canvasPoint)
+    {
+        if (VirtualOsdRect() is not { } r || !r.Contains(canvasPoint)) return false;
+        if (_osd.Clickable) OsdClick();
+        return _osd.Clickable;
     }
 
     // ---- OSD queue --------------------------------------------------------
@@ -1765,7 +1862,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         if (IsLongOsd(ms))
         {
-            if (_osd.Visible && _osdCurrent is { } cur && IsLongOsd(cur.Ms))
+            if (_osd.Showing && _osdCurrent is { } cur && IsLongOsd(cur.Ms))
             {
                 // A long item is already showing: queue behind it rather than
                 // stomping it, but never pile up duplicates of the same text.
@@ -1780,7 +1877,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Short item: always interrupts immediately. If it's cutting off a
         // long item that has barely had time to be read, put that item back
         // at the FRONT of the queue so it resumes once the short flip is done.
-        if (_osd.Visible && _osdCurrent is { } current && IsLongOsd(current.Ms)
+        if (_osd.Showing && _osdCurrent is { } current && IsLongOsd(current.Ms)
             && Environment.TickCount - _osdShownTick < 1500)
         {
             _osdQueue.Insert(0, current);
@@ -1817,7 +1914,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         else
         {
             _osdCurrent = null;
-            _osd.Visible = false;
+            _osd.Showing = false;
         }
     }
 
@@ -2125,6 +2222,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _frozen = false;
             _freezeIsPhoto = false;
             _freezeView.Visible = false;
+            UpdateOverlayMode();
             _freezeView.Image = null;
             _freezeImage?.Dispose();
             _freezeImage = null;
@@ -2154,9 +2252,10 @@ public sealed partial class MainForm : Form, IMessageFilter
             _freezeView.ImageRect = FreezeImageRect();
             _freezeView.Visible = true;
             _freezeView.BringToFront();
-            if (_info.Visible) _info.BringToFront();
+            if (_info.Showing) _info.BringToFront();
             _osd.BringToFront();
             _frozen = true;
+            UpdateOverlayMode();
             _mutedBeforeFreeze = _audio.Muted;
             if (_audio.IsRunning) _audio.Muted = true; // 仕様: 一時停止中は音声も停止
             ShowOsd(L.T("一時停止"));
@@ -2758,6 +2857,104 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     /// <summary>The info overlay's 補間 line.</summary>
+    // ---- 補間 / 拡大 / くっきり度: status bar (windowed) and info overlay (also in fullscreen) ----
+
+    /// <summary>"30→144 fps" while interpolating (measured source rate and the rate actually presented),
+    /// "待機（理由）" when it is on but idle, null when off or unsupported.</summary>
+    private string? InterpMetric(out string tip)
+    {
+        tip = string.Empty;
+        if (!_video.SupportsInterpolation || !_settings.Interpolation || !_video.IsRunning) return null;
+        InterpolationStatus? st = _video.InterpolationState;
+        if (st == null) return null;
+        if (st.Idle == InterpolationIdle.None && st.Active)
+        {
+            double shown = _video.Stats?.PresentedFps ?? st.RefreshHz;
+            tip = L.F("フレーム補間: 映像 {0:0.#} fps を、画面に実際に出ている {1:0.#} fps にしています（画面は {2:0.#} Hz）", st.SourceFps, shown, st.RefreshHz);
+            return $"{st.SourceFps:0}→{shown:0} fps";
+        }
+        string why = InterpolationInfoText();
+        tip = L.F("フレーム補間は今は働いていません: {0}", why);
+        return why;
+    }
+
+    /// <summary>The detail height the picture really has: the "元の細かさ" height when that is in use, else the
+    /// capture (display) height. Estimated is true for the former.</summary>
+    private int EffectiveDetailHeight(out bool estimated)
+    {
+        estimated = false;
+        Size res = _video.DisplayResolution;
+        if (_video.SupportsNativeRes && _settings.NativeResScale != "off" && _video.NativeResState is { } nr)
+        {
+            if (nr.Active > 0) { estimated = true; return nr.Active; }
+            if (nr.Target > 0 && nr.Target < res.Height) { estimated = true; return nr.Target; }
+        }
+        return res.Height;
+    }
+
+    private string ScalerName()
+    {
+        Size res = _video.DisplayResolution;
+        Rectangle d = ComputeDest(_canvas.ClientSize);
+        if (d.Width == res.Width && d.Height == res.Height) return L.T("等倍");
+        if (d.Width > res.Width && d.Height > res.Height)
+        {
+            string name = _video.SupportsScalingQuality && _video.PixelPerfect ? L.T("整数倍")
+                : _video.SupportsScalingQuality && _video.Quality == ScalingQuality.Fsr ? "FSR" : L.T("標準");
+            if (_video.SupportsNativeRes && _video.NativeResState is { Active: > 0 }) name += "・" + L.T("元の細かさ");
+            return name;
+        }
+        if (d.Width < res.Width && d.Height < res.Height) return L.T("縮小");
+        return L.T("標準");
+    }
+
+    /// <summary>"720p 相当 → 3840x2160（FSR）": detail of the source, size drawn, and the scaler. Null when nothing runs.</summary>
+    private string? ScaleMetric(out string tip)
+    {
+        tip = string.Empty;
+        Size res = _video.DisplayResolution;
+        if (!_video.IsRunning || res.Width <= 0 || res.Height <= 0) return null;
+        Rectangle d = ComputeDest(_canvas.ClientSize);
+        if (d.Width <= 0 || d.Height <= 0) return null;
+        int h = EffectiveDetailHeight(out bool est);
+        string detail = est ? L.F("{0}p 相当", h) : $"{h}p";
+        string text = $"{detail} → {d.Width}x{d.Height}（{ScalerName()}）";
+        tip = L.F("拡大: 元の絵の細かさ {0} から、画面に出す大きさ {1}x{2} へ（{3}）。キャプチャの大きさは {4}x{5} です。",
+            detail, d.Width, d.Height, ScalerName(), res.Width, res.Height);
+        return text;
+    }
+
+    /// <summary>"くっきり +28%" (YuCap's pipeline vs plain bilinear, measured every few seconds); "くっきり —" until measured;
+    /// null when it does not apply (not Direct3D, or the picture is not drawn larger than the source).</summary>
+    private string? CrispMetric(out string tip)
+    {
+        tip = string.Empty;
+        if (!_video.SupportsCrispness || !_video.IsRunning) return null;
+        Size res = _video.DisplayResolution;
+        Rectangle d = ComputeDest(_canvas.ClientSize);
+        if (res.Width <= 0 || d.Width <= res.Width || d.Height <= res.Height) return null;
+        tip = L.T("くっきり度: 今の拡大処理が、ふつうの拡大（バイリニア）より絵の輪郭をどれだけくっきりさせているか。数秒ごとに、画面の一部分を両方の方法で描いて比べています。");
+        if (_video.Crispness is not { } c || Environment.TickCount64 - c.TickMs > 30000) return "—";
+        return $"{(c.Ratio >= 0 ? "+" : "−")}{Math.Abs(c.Ratio) * 100:0}%";
+    }
+
+    private void UpdateMetricLabels()
+    {
+        // Sampling costs a little GPU time, so it runs only while someone can see the result.
+        bool want = _video.SupportsCrispness && _video.IsRunning && !_frozen && WindowState != FormWindowState.Minimized
+                    && ((_status.Visible && !_isPip) || _info.Showing);
+        if (_video.SupportsCrispness && _video.CrispnessSampling != want) _video.CrispnessSampling = want;
+
+        void Set(ToolStripStatusLabel l, string? text, string tip)
+        {
+            bool show = !string.IsNullOrEmpty(text);
+            if (l.Visible != show) l.Visible = show;
+            if (show) { if (l.Text != text) l.Text = text; l.ToolTipText = tip; }
+        }
+        string? i = InterpMetric(out string it), sc = ScaleMetric(out string st), cr = CrispMetric(out string ct);
+        Set(_lblInterp, i == null ? null : L.F("補間 {0}", i), it); Set(_lblScale, sc, st); Set(_lblCrisp, cr == null ? null : L.F("くっきり {0}", cr), ct);
+    }
+
     private string InterpolationInfoText()
     {
         if (!_video.SupportsInterpolation) return "—";
@@ -2803,6 +3000,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             try { _video.Dispose(); } catch { /* going away anyway */ }
             _canvas.ResetHandle();
             _video = VideoEngines.Create(renderer);
+            UpdateOverlayMode();
             _video.Attach(_canvas.Handle);
             _video.SetRotation(_settings.Rotation);
             _video.SetMirror(_settings.Mirror);
@@ -2938,6 +3136,8 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void OnCanvasDoubleClick(object? sender, EventArgs e)
     {
+        if (sender is Control dc && ReferenceEquals(dc, _canvas) && VirtualOsdRect() is { } osdRect
+            && osdRect.Contains(_canvas.PointToClient(Cursor.Position))) return;   // a click on the notice, not on the video
         Log.Info("double-click → toggle fullscreen");
         ToggleFullscreen();
     }
@@ -3595,6 +3795,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void UpdateStatus()
     {
         UpdatePowerState(); // display sleep inhibition follows the running state
+        UpdateMetricLabels();
 
         string vLabel = L.T("映像"), aLabel = L.T("音声"), volLabel = L.T("音量");
         if (_video.CurrentDeviceName != null)
@@ -3917,9 +4118,9 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleInfo()
     {
-        if (_info.Visible) { _info.Visible = false; return; }
+        if (_info.Showing) { _info.Showing = false; return; }
         UpdateInfo();
-        _info.Visible = true;
+        _info.Showing = true;
         _info.BringToFront();
         _osd.BringToFront();
         PositionInfo();
@@ -3927,8 +4128,11 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void PositionInfo()
     {
-        if (_info.Visible)
+        if (_info.Showing)
+        {
             _info.Location = new Point(_canvas.Right - _info.Width - _info.EdgeGap, _canvas.Top + _info.EdgeGap);
+            MarkOverlaysDirty();
+        }
     }
 
     private string DescribeScaling()
@@ -3989,13 +4193,14 @@ public sealed partial class MainForm : Form, IMessageFilter
             "fps: " + fps,
             "GPU: " + gpu,
             L.T("画面") + ": " + screen,
-            L.T("拡大") + ": " + DescribeScaling(),
+            L.T("拡大") + ": " + (ScaleMetric(out _) is { } scm ? scm + " " + DescribeScaling() : DescribeScaling()),
+            L.T("くっきり度") + ": " + (CrispMetric(out _) ?? "—"),
             L.T("遅延") + ": " + delay,
             L.T("遅延（YuCap 内）") + ": " + L.F("映像 {0} ／ 音 {1}",
                 LatencyText(_video.IsRunning ? _video.VideoLatencyMs : 0, _video.VideoLatencyEstimated),
                 LatencyText(_audio.IsRunning ? _audio.LatencyMs : 0, false)),
             L.T("色調整") + ": " + color,
-            L.T("補間") + ": " + InterpolationInfoText(),
+            L.T("補間") + ": " + (InterpMetric(out _) ?? InterpolationInfoText()),
             L.T("元の細かさ") + ": " + NativeResInfoText(),
             L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
         }));

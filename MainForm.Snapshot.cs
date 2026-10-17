@@ -30,10 +30,10 @@ public sealed partial class MainForm
     /// </summary>
     private Bitmap? GrabFrame()
     {
-        if (_osd.Visible)
+        if (_osd.Showing)
         {
             _osdTimer.Stop();
-            _osd.Visible = false;
+            _osd.Showing = false;
             _osd.Update();
         }
 

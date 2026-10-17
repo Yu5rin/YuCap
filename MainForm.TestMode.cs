@@ -104,7 +104,7 @@ internal sealed class TestOptions
 }
 
 /// <summary>The caption bar shown over the video while the test runs (a child control like InfoOverlay).</summary>
-internal sealed class TestCaption : Control
+internal sealed class TestCaption : OverlayControl
 {
     private Font _font = TextScale.MakeFont("Segoe UI", 16f, 1f, FontStyle.Bold);
     private Font _small = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, 1f, FontStyle.Regular);
@@ -131,27 +131,27 @@ internal sealed class TestCaption : Control
         _small = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, scale, FontStyle.Regular);
         f.Dispose(); s.Dispose();
         Height = TextScale.Px(40, scale);
-        Invalidate();
+        Changed();
     }
 
     public void Set(string text, string hint)
     {
         Text = text;
         _hint = hint;
-        Invalidate();
+        Changed();
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    internal override void PaintOverlay(Graphics g, bool offscreen)
     {
         using var back = new SolidBrush(Color.FromArgb(225, 16, 16, 16));
-        e.Graphics.FillRectangle(back, ClientRectangle);
+        g.FillRectangle(back, 0, 0, Width, Height);
         using var accent = new SolidBrush(Ui.Colors.Accent);
-        e.Graphics.FillRectangle(accent, 0, 0, TextScale.Px(5, _scale), Height);
+        g.FillRectangle(accent, 0, 0, TextScale.Px(5, _scale), Height);
         Size hs = TextRenderer.MeasureText(_hint, _small, Size.Empty, TextFormatFlags.NoPadding);
-        TextRenderer.DrawText(e.Graphics, _hint, _small, new Point(Width - hs.Width - TextScale.Px(14, _scale), (Height - hs.Height) / 2),
+        TextRenderer.DrawText(g, _hint, _small, new Point(Width - hs.Width - TextScale.Px(14, _scale), (Height - hs.Height) / 2),
             Color.FromArgb(200, 200, 200), TextFormatFlags.NoPadding);
         var textRect = new Rectangle(TextScale.Px(16, _scale), 0, Math.Max(10, Width - hs.Width - TextScale.Px(48, _scale)), Height);
-        TextRenderer.DrawText(e.Graphics, Text, _font, textRect, Color.White,
+        TextRenderer.DrawText(g, Text, _font, textRect, Color.White,
             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
     }
 
@@ -288,7 +288,7 @@ public sealed partial class MainForm
         string json = JsonSerializer.Serialize(_settings);
         _testSaved = JsonSerializer.Deserialize<AppSettings>(json)!;
         TestModeGuard.WriteMarker(JsonSerializer.Deserialize<AppSettings>(json)!);
-        var before = new UiBefore(_isFullscreen, _isPip, _zoom, _panX, _panY, _info.Visible);
+        var before = new UiBefore(_isFullscreen, _isPip, _zoom, _panX, _panY, _info.Showing);
         Log.Info($"test mode: start target={o.Target.DeviceName} quick={o.Quick} report={_rep.Folder}");
 
         try
@@ -349,12 +349,12 @@ public sealed partial class MainForm
     private void RestoreAfterTest(UiBefore before)
     {
         // test widgets away
-        if (_testCaption != null) { _testCaption.Visible = false; Controls.Remove(_testCaption); _testCaption.Dispose(); _testCaption = null; }
+        if (_testCaption != null) { _testCaption.Showing = false; Controls.Remove(_testCaption); _testCaption.Dispose(); _testCaption = null; }
         _osd.TestBack = null; _info.TestBack = null;
-        _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Visible = false;
+        _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Showing = false;
         Ui.DialogAudit = null;
         if (_frozen) ToggleFreeze();
-        if (_info.Visible != before.InfoVisible) ToggleInfo();
+        if (_info.Showing != before.InfoVisible) ToggleInfo();
 
         // settings back, then everything that was derived from them
         if (_testSaved != null) CopySettings(_testSaved, _settings);
@@ -567,6 +567,8 @@ public sealed partial class MainForm
     private void PrepareTestUi(UiBefore before)
     {
         _testCaption = new TestCaption();
+        _testCaption.ContentChanged += () => OverlayChanged(OvCaption);
+        _testCaption.Virtual = _video.SupportsOverlays && !_frozen;
         _testCaption.ApplyScale(OverlayScale(TextScale.KCaption));
         Controls.Add(_testCaption);
         if (!_testCtxBlocked)
@@ -591,7 +593,7 @@ public sealed partial class MainForm
         _settings.FullscreenDisplay = _topt.Target.Key;
 
         if (_frozen) ToggleFreeze();
-        if (_info.Visible) ToggleInfo();
+        if (_info.Showing) ToggleInfo();
         if (_isPip) ExitPip();
         if (_isFullscreen) PlaceFullscreen(); else EnterFullscreen(userAction: false);
         TopMost = true;
@@ -605,7 +607,7 @@ public sealed partial class MainForm
         if (_testCaption == null) return;
         _testCaption.Set(preparing ? L.T("テストモード：準備中") + " " + desc : L.F("テストモード {0}/{1}：{2}", step, _testTotal, desc),
             L.T("Esc で中止"));
-        _testCaption.Visible = true;
+        _testCaption.Showing = true;
         PositionTestCaption();
         _testCaption.BringToFront();
         _testCaption.Update();
@@ -613,10 +615,11 @@ public sealed partial class MainForm
 
     private void PositionTestCaption()
     {
-        if (_testCaption is not { Visible: true }) return;
+        if (_testCaption is not { Showing: true }) return;
         int mg = _testCaption.Margin16;
         int w = Math.Min(Math.Max(200, _canvas.Width - mg * 3 / 2), (int)(1200 * _testCaption.Height / 40.0));
         _testCaption.Bounds = new Rectangle(_canvas.Left + (_canvas.Width - w) / 2, _canvas.Bottom - _testCaption.Height - mg, w, _testCaption.Height);
+        MarkOverlaysDirty();
     }
 
     // =============================================================================================
@@ -849,7 +852,7 @@ public sealed partial class MainForm
         var item = new TestItem { Name = "取り込み " + ModeLabel(m) };
         // Same reason as in RenderStepCore: a caption over the video makes Windows compose the monitor, which on a
         // mixed-refresh setup holds the picture to the main monitor's rate and makes a 120 fps source drop frames.
-        if (_testCaption != null) _testCaption.Visible = false;
+        if (_testCaption != null) _testCaption.Showing = false;
         var sw = Stopwatch.StartNew();
         try { StartMode(m); }
         catch (Exception ex)
@@ -998,7 +1001,7 @@ public sealed partial class MainForm
         // straight to the screen, and a composed monitor runs at the refresh rate of the primary display: a
         // 144 Hz TV beside a 60 Hz main monitor then shows 60 fps whatever YuCap does. The caption is therefore
         // out of the way while a rate is measured (the next SetCaption shows it again).
-        if (_testCaption != null) _testCaption.Visible = false;
+        if (_testCaption != null) _testCaption.Showing = false;
         try
         {
             _settings.ScalingQuality = c.Quality == ScalingQuality.Fsr ? "fsr" : "standard";
@@ -1268,10 +1271,10 @@ public sealed partial class MainForm
                 _osd.TestBack = marker;
                 ShowOsd(L.T("テスト表示"), OsdLongMilliseconds);
                 await Wait(300);
-                area = _osd.RectangleToScreen(new Rectangle(3, Math.Max(0, _osd.Height / 2 - 4), 8, 8));
+                area = OverlayScreenRect(_osd, new Rectangle(3, Math.Max(0, _osd.Height / 2 - 4), 8, 8));
                 cleanup = () =>
                 {
-                    _osd.TestBack = null; _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Visible = false;
+                    _osd.TestBack = null; _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Showing = false;
                 };
                 break;
             case 1:
@@ -1301,13 +1304,13 @@ public sealed partial class MainForm
                 break;
             default:
                 marker = Color.FromArgb(0, 255, 0);
-                bool wasVisible = _info.Visible;
+                bool wasVisible = _info.Showing;
                 _info.TestBack = marker;
                 if (!wasVisible) ToggleInfo(); else _info.Invalidate();
                 _info.BringToFront(); _osd.BringToFront(); _testCaption?.BringToFront();
                 await Wait(300);
-                area = _info.RectangleToScreen(new Rectangle(2, Math.Max(0, _info.Height / 2 - 4), 6, 8));
-                cleanup = () => { _info.TestBack = null; if (!wasVisible && _info.Visible) ToggleInfo(); else _info.Invalidate(); };
+                area = OverlayScreenRect(_info, new Rectangle(2, Math.Max(0, _info.Height / 2 - 4), 6, 8));
+                cleanup = () => { _info.TestBack = null; if (!wasVisible && _info.Showing) ToggleInfo(); else _info.Invalidate(); };
                 break;
         }
 
@@ -1331,6 +1334,33 @@ public sealed partial class MainForm
                     item.Verdict = Verdict.Ok;
                     item.Summary = "映像の上に見えています";
                     item.Explanation = "この表示方式でも、重ねて出す表示は映像の上に出ています。";
+                    OverlayControl? ov = what == 0 ? _osd : what == 2 ? _info : null;
+                    if (ov is { Virtual: true })
+                    {
+                        item.Explanation = "この表示方式でも、重ねて出す表示は映像の上に出ています。表示は別のウィンドウではなく、映像の中に描いています（そのため、表示中も画面の更新は下がりません）。";
+                        // Stills are copied before the overlay is blended in, so they must not carry it.
+                        using Bitmap? still = _video.Snapshot(cropToVideo: false);
+                        Rectangle sr = new(ov.Left - _canvas.Left + (what == 0 ? 3 : 2), ov.Top - _canvas.Top + Math.Max(0, ov.Height / 2 - 4), 6, 8);
+                        if (still == null || sr.Right > still.Width || sr.Bottom > still.Height)
+                            item.Num("静止画への写り込み", "確認できませんでした");
+                        else
+                        {
+                            int hit = 0, total = 0;
+                            for (int y = sr.Top; y < sr.Bottom; y++)
+                                for (int x = sr.Left; x < sr.Right; x++)
+                                {
+                                    Color pc = still.GetPixel(x, y); total++;
+                                    if (Math.Abs(pc.R - marker.R) + Math.Abs(pc.G - marker.G) + Math.Abs(pc.B - marker.B) < 60) hit++;
+                                }
+                            item.Num("静止画への写り込み", $"{hit}/{total} ピクセルが表示の色（0 なら写っていません）");
+                            if (hit > total / 4)
+                            {
+                                item.Verdict = Verdict.Ng;
+                                item.Summary = "静止画に表示が写り込んでいます";
+                                item.Explanation = "スナップショット（表示どおり保存）に、通知や情報表示が写っています。保存した画像にこれらが入ってしまいます。";
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -1352,6 +1382,10 @@ public sealed partial class MainForm
     /// is what is judged; minimum comfortable visual angle about 0.25 deg for small info text and about
     /// 0.35 deg for notices (0.4 deg rounded down, so the classic 12pt notice on a 1080p screen still passes);
     /// more than 5% of the screen height is judged absurdly large.</summary>
+    /// <summary>Screen rectangle of a part of an overlay (it may be a layer drawn into the video, not a window).</summary>
+    private Rectangle OverlayScreenRect(OverlayControl c, Rectangle local) =>
+        new(PointToScreen(new Point(c.Left + local.X, c.Top + local.Y)), local.Size);
+
     private async Task TextSizeStep(TestSection sec, CaptureMode? mode)
     {
         var item = new TestItem { Name = "通知と情報表示の文字の大きさ" };
@@ -1363,7 +1397,7 @@ public sealed partial class MainForm
             return;
         }
         await Wait(SettleMs);
-        bool infoWasVisible = _info.Visible;
+        bool infoWasVisible = _info.Showing;
         ShowOsd(L.T("テスト表示"), OsdLongMilliseconds);
         if (!infoWasVisible) ToggleInfo(); else UpdateInfo();
         _info.BringToFront(); _osd.BringToFront(); _testCaption?.BringToFront();
@@ -1392,8 +1426,8 @@ public sealed partial class MainForm
             if (infoDeg < infoMinDeg) problems.Add("情報表示の文字が小さすぎます。");
             if (osdFrac > maxFrac || infoFrac > maxFrac) problems.Add("文字が大きすぎます。");
             Rectangle cv = _canvas.Bounds;
-            if (_osd.Visible && !cv.Contains(_osd.Bounds)) problems.Add("通知が映像の枠からはみ出しています。");
-            if (_info.Visible && !cv.Contains(_info.Bounds)) problems.Add("情報表示が映像の枠からはみ出しています。");
+            if (_osd.Showing && !cv.Contains(_osd.Bounds)) problems.Add("通知が映像の枠からはみ出しています。");
+            if (_info.Showing && !cv.Contains(_info.Bounds)) problems.Add("情報表示が映像の枠からはみ出しています。");
 
             if (problems.Count == 0)
             {
@@ -1410,8 +1444,8 @@ public sealed partial class MainForm
         }
         finally
         {
-            _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Visible = false;
-            if (!infoWasVisible && _info.Visible) ToggleInfo();
+            _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Showing = false;
+            if (!infoWasVisible && _info.Showing) ToggleInfo();
         }
         sec.Items.Add(item);
     }
@@ -1793,7 +1827,7 @@ public sealed partial class MainForm
                 // The test caption is drawn over the video; with something on top Windows composes the monitor and the
                 // screen time of a frame can no longer be read from the display, so the caption stays hidden while
                 // measuring (the next SetCaption shows it again). Everything else is the user's own setting.
-                if (_testCaption != null) _testCaption.Visible = false;
+                if (_testCaption != null) _testCaption.Showing = false;
                 _settings.Interpolation = _testSaved?.Interpolation ?? false;
                 EnsureEngine(_testSaved?.LowLatency ?? false, _savedMode);
                 ApplyAvSync();

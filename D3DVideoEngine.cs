@@ -52,6 +52,10 @@ public sealed class D3DVideoEngine : IVideoEngine
     private volatile int _nrMode;                              // 0 off, -1 auto, >0 a fixed height
     private string _nrModeStr = "off";
 
+    private volatile OverlayLayer[]? _overlays;
+    private volatile bool _crispOn;
+    private volatile int _crispMs = 5000;
+
     private readonly object _dstLock = new();
     private Rectangle _dst;
 
@@ -100,6 +104,18 @@ public sealed class D3DVideoEngine : IVideoEngine
         set => _lowLatency = value;
     }
     public string PresentMode => _s?.PresentMode ?? string.Empty;
+
+    public bool SupportsOverlays => true;
+    public void SetOverlays(IReadOnlyList<OverlayLayer>? layers)
+    {
+        _overlays = layers == null || layers.Count == 0 ? null : layers.ToArray();
+        _s?.Poke();   // the overlay changed but the video may not have: present again
+    }
+
+    public bool SupportsCrispness => true;
+    public bool CrispnessSampling { get => _crispOn; set => _crispOn = value; }
+    public int CrispnessIntervalMs { get => _crispMs; set => _crispMs = Math.Clamp(value, 200, 600000); }
+    public CrispnessReading? Crispness => _s?.Crisp;
 
     public bool SupportsScalingQuality => true;
     public ScalingQuality Quality
@@ -409,6 +425,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         public Bitmap? Result;
         public string? Error;
         public volatile bool Abandoned;
+        public bool AllowNull;     // the work reports through a closure, not a bitmap
     }
 
     private sealed class Session
@@ -703,6 +720,92 @@ public sealed class D3DVideoEngine : IVideoEngine
             _renderThread = new Thread(RenderMain) { IsBackground = true, Name = "YuCap.D3D.Render" };
             _renderThread.SetApartmentState(ApartmentState.MTA);
             _renderThread.Start();
+            _crispThread = new Thread(CrispLoop) { IsBackground = true, Name = "YuCap.D3D.Crisp", Priority = ThreadPriority.BelowNormal };
+            _crispThread.Start();
+        }
+
+        // ---- くっきり度: pipeline vs bilinear edge strength on one crop, every few seconds ----
+        private Thread? _crispThread;
+        private volatile CrispnessReading? _crisp;
+        public CrispnessReading? Crisp => _crisp;
+
+        private void CrispLoop()
+        {
+            const int CropMax = 512;
+            long lastSample = 0, lastRecv = -1;
+            int samples = 0, steadyCount = 0;
+            double maxMs = 0;
+            int searchIdx = 0;                                // 0..4: candidate being tried, 5 = search done
+            double[] candGrad = new double[5];
+            int bestCand = 0;
+            Size lastDstSize = Size.Empty;
+            double lastMs = 0;
+            while (!_stopping)
+            {
+                Thread.Sleep(100);
+                D3DRenderer? r = _r;
+                if (!_e._crispOn || r == null || !r.HasFrame) { if (_crisp != null && !_e._crispOn) _crisp = null; continue; }
+                Rectangle dst = _e.CurrentDst();
+                Size client = r.SwapSize;
+                Size src = r.OrientedSize;
+                Rectangle vis = Rectangle.Intersect(dst, new Rectangle(Point.Empty, client));
+                // Only meaningful when the picture is drawn larger than the source in both directions.
+                if (src.Width <= 0 || dst.Width <= src.Width || dst.Height <= src.Height || vis.Width < 64 || vis.Height < 64)
+                {
+                    _crisp = null; searchIdx = 0; continue;
+                }
+                if (dst.Size != lastDstSize) { lastDstSize = dst.Size; searchIdx = 0; steadyCount = 0; _crisp = null; }
+                long now = Environment.TickCount64;
+                int interval = searchIdx < 5 ? Math.Min(1000, _e._crispMs) : _e._crispMs;
+                if (now - lastSample < interval) continue;
+                long recv = FramesReceived;
+                if (recv == lastRecv) continue;               // paused / no signal: no new picture
+                lastRecv = recv;
+                lastSample = now;
+
+                int cw = Math.Min(CropMax, vis.Width) & ~1, ch = Math.Min(CropMax, vis.Height) & ~1;
+                int cand = searchIdx < 5 ? searchIdx : bestCand;
+                (double fx, double fy)[] spots = { (0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75) };
+                int cx = vis.X + (int)(vis.Width * spots[cand].fx) - cw / 2, cy = vis.Y + (int)(vis.Height * spots[cand].fy) - ch / 2;
+                cx = Math.Clamp(cx, vis.X, vis.Right - cw); cy = Math.Clamp(cy, vis.Y, vis.Bottom - ch);
+                var crop = new Rectangle(cx, cy, cw, ch);
+                ScalingQuality q = _e._quality; bool pp = _e._pixelPerfect; float sh = _e._sharpness; int nh = NativeTargetHeight();
+
+                double ms1 = 0, ms2 = 0; bool ok = false;
+                try
+                {
+                    Run(rr => { var sw = Stopwatch.StartNew(); ok = rr.CrispSubmit(dst, crop, q, pp, sh, nh); ms1 = sw.Elapsed.TotalMilliseconds; return null; },
+                        1000, needFrame: false, out _, allowNull: true);
+                    if (!ok) continue;
+                    Thread.Sleep(40);                         // the GPU finishes these two small renders long before this
+                    byte[] a = Array.Empty<byte>(), b = Array.Empty<byte>(); Size sz = Size.Empty; bool got = false;
+                    Run(rr => { var sw = Stopwatch.StartNew(); got = rr.CrispRead(out a, out b, out sz); ms2 = sw.Elapsed.TotalMilliseconds; return null; },
+                        1000, needFrame: false, out _, allowNull: true);
+                    if (!got) continue;
+                    double gp = TestProbes.MeanGradient(a, sz.Width, sz.Height), gb = TestProbes.MeanGradient(b, sz.Width, sz.Height);
+                    lastMs = ms1 + ms2; maxMs = Math.Max(maxMs, lastMs);
+                    samples++;
+                    if (searchIdx < 5)
+                    {
+                        candGrad[searchIdx] = gb;
+                        searchIdx++;
+                        if (searchIdx == 5)
+                        {
+                            for (int i = 1; i < 5; i++) if (candGrad[i] > candGrad[bestCand]) bestCand = i;
+                            steadyCount = 0;
+                        }
+                    }
+                    else if (++steadyCount % 12 == 0) searchIdx = 0;   // look for the most detailed spot again now and then
+                    if (gb >= 0.5)                            // a flat picture says nothing about sharpness
+                    {
+                        double ratio = gp / gb - 1;
+                        _crisp = new CrispnessReading(ratio, Environment.TickCount64, samples, lastMs, maxMs);
+                    }
+                    if (samples <= 3 || samples % 20 == 0)
+                        Log.Info($"D3D: crispness sample #{samples} pipeline/bilinear = {(gb > 0 ? gp / gb : 0):0.000} (spot {cand}, {cw}x{ch}); render thread {ms1:0.00}+{ms2:0.00}ms (max {maxMs:0.00}ms)");
+                }
+                catch (Exception ex) { Log.Info("D3D: crispness sample failed - " + ex.Message.Split('\n')[0]); Thread.Sleep(1000); }
+            }
         }
 
         public void Poke() { Volatile.Write(ref _dirtyCompose, 1); TryWake(); }
@@ -735,10 +838,10 @@ public sealed class D3DVideoEngine : IVideoEngine
         }
 
         /// <summary>Run <paramref name="work"/> on the render thread and wait for it.</summary>
-        public Bitmap? Run(Func<D3DRenderer, Bitmap?> work, int timeoutMs, bool needFrame, out string? error)
+        public Bitmap? Run(Func<D3DRenderer, Bitmap?> work, int timeoutMs, bool needFrame, out string? error, bool allowNull = false)
         {
             error = null;
-            var req = new SnapRequest { Work = work, NeedFrame = needFrame };
+            var req = new SnapRequest { Work = work, NeedFrame = needFrame, AllowNull = allowNull };
             _requests.Enqueue(req);
             TryWake();
             if (!req.Done.Wait(timeoutMs))
@@ -1086,7 +1189,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     Rectangle dst = _e.CurrentDst();
                     if (dst.Width <= 0 || dst.Height <= 0)
                         dst = new Rectangle(0, 0, client.Width, client.Height);
-                    Result hr = r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness, NativeTargetHeight());
+                    Result hr = r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness, NativeTargetHeight(), _e._overlays);
                     if (hr.Failure)
                     {
                         HandlePresentFailure(r, hr);
@@ -1172,7 +1275,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                         r.Convert(_e._rotation, _e._mirror, _e.CurrentAdjustments(), _e.Crop);   // make sure the oriented texture is current
                     }
                     q.Result = q.Work(r);
-                    if (q.Result == null && q.Error == null) q.Error = L.T("映像がありません");
+                    if (q.Result == null && q.Error == null && !q.AllowNull) q.Error = L.T("映像がありません");
                 }
                 catch (Exception ex)
                 {

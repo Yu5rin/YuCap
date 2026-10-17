@@ -8,7 +8,7 @@ namespace YuCap;
 /// Persistent multi-line information panel (testing aid, Ctrl+Shift+I). A child control over
 /// the video area like <see cref="OsdOverlay"/>; it only draws text and resizes to fit it.
 /// </summary>
-public sealed class InfoOverlay : Control
+public sealed class InfoOverlay : OverlayControl
 {
     // 12px = 9pt at 96 DPI, times a scale that follows the monitor DPI and the video size (see TextScale).
     private Font _font = TextScale.MakeFont("Consolas", 12f, 1f, FontStyle.Regular);
@@ -16,7 +16,8 @@ public sealed class InfoOverlay : Control
     private static readonly Color Fore = Color.FromArgb(220, 220, 220);
 
     /// <summary>Test mode: opaque solid background of this colour (see <see cref="OsdOverlay.TestBack"/>).</summary>
-    internal Color? TestBack { get; set; }
+    internal Color? TestBack { get => _testBack; set { _testBack = value; Changed(); } }
+    private Color? _testBack;
 
     public InfoOverlay()
     {
@@ -55,18 +56,18 @@ public sealed class InfoOverlay : Control
 
     private void Fit()
     {
-        if (string.IsNullOrEmpty(Text)) { Invalidate(); return; }
+        if (string.IsNullOrEmpty(Text)) { Changed(); return; }
         Size sz = TextRenderer.MeasureText(Text, _font, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding);
         int px = TextScale.Px(10, _scale), py = TextScale.Px(7, _scale);
         Size = new Size(sz.Width + px * 2, sz.Height + py * 2);
-        Invalidate();
+        Changed();
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    internal override void PaintOverlay(Graphics g, bool offscreen)
     {
         using var back = new SolidBrush(TestBack ?? Color.FromArgb(200, 12, 12, 12));
-        e.Graphics.FillRectangle(back, ClientRectangle);
-        TextRenderer.DrawText(e.Graphics, Text, _font,
+        g.FillRectangle(back, new Rectangle(0, 0, Width, Height));
+        TextRenderer.DrawText(g, Text, _font,
             new Point(TextScale.Px(10, _scale), TextScale.Px(7, _scale)), Fore, TextFormatFlags.NoPadding);
     }
 

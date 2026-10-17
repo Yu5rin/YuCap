@@ -60,6 +60,16 @@ public sealed record InterpolationStatus(bool Active, double SourceFps, double R
 public sealed record RenderStats(double InputFps, double PresentedFps, long DroppedFrames,
     double GpuMsAvg = 0, double GpuMsMax = 0);
 
+/// <summary>One overlay image (notice, info panel, test caption) for <see cref="IVideoEngine.SetOverlays"/>:
+/// premultiplied BGRA <paramref name="Pixels"/> of W x H, drawn with its top-left at (X, Y) in canvas client pixels.
+/// <paramref name="Version"/> changes whenever the pixels do, so the engine uploads only on change.</summary>
+public sealed record OverlayLayer(int Id, int X, int Y, int W, int H, byte[] Pixels, long Version);
+
+/// <summary>"Crispness" reading (くっきり度): edge strength of YuCap's current pipeline divided by plain bilinear
+/// on the same crop of the current frame, minus 1 (0.28 = 28% crisper). RenderMsMax is the longest time one sample
+/// kept the render thread busy.</summary>
+public sealed record CrispnessReading(double Ratio, long TickMs, int Samples, double RenderMsLast, double RenderMsMax);
+
 /// <summary>Per-frame GPU milliseconds from <see cref="IVideoEngine.GpuBench"/>.</summary>
 public sealed record GpuBenchResult(string Adapter, double[] FrameMs);
 
@@ -206,4 +216,15 @@ public interface IVideoEngine : IDisposable
     /// <see cref="EndMeasure"/> returns null when nothing was recorded.</summary>
     void BeginMeasure() { }
     RenderMeasurement? EndMeasure() => null;
+
+    /// <summary>Direct3D only: overlays are blended into the swap chain's back buffer (after the copy stills are made
+    /// from), so nothing has to be a window over the video. Null/empty removes them.</summary>
+    bool SupportsOverlays => false;
+    void SetOverlays(IReadOnlyList<OverlayLayer>? layers) { }
+    /// <summary>Direct3D only: sample the crispness every <see cref="CrispnessIntervalMs"/> while this is on.</summary>
+    bool SupportsCrispness => false;
+    bool CrispnessSampling { get => false; set { } }
+    int CrispnessIntervalMs { get => 5000; set { } }
+    /// <summary>Latest reading, or null when none is valid (output not larger than the source, paused, flat picture...).</summary>
+    CrispnessReading? Crispness => null;
 }

@@ -21,6 +21,7 @@ internal static class D3DShaders
         public byte[] Vs = Array.Empty<byte>();
         public byte[] Convert = Array.Empty<byte>();
         public byte[] Scale = Array.Empty<byte>();
+        public byte[] Overlay = Array.Empty<byte>();
         public byte[] Easu = Array.Empty<byte>();
         public byte[] Rcas = Array.Empty<byte>();
         // Frame interpolation (Shaders/interp.hlsl). Compiled separately: a failure here only
@@ -56,6 +57,7 @@ internal static class D3DShaders
                 Vs = Compile(Resource("vs.hlsl"), "main", "vs.hlsl", "vs_5_0"),
                 Convert = Compile(Resource("convert.hlsl"), "main", "convert.hlsl", "ps_5_0"),
                 Scale = Compile(Resource("scale.hlsl"), "main", "scale.hlsl", "ps_5_0"),
+                Overlay = Compile(Resource("overlay.hlsl"), "main", "overlay.hlsl", "ps_5_0"),
                 Easu = Compile(fsr, "easu", "fsr.hlsl", "ps_5_0"),
                 Rcas = Compile(fsr, "rcas", "fsr.hlsl", "ps_5_0"),
             };

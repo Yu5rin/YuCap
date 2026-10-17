@@ -63,7 +63,7 @@ public sealed partial class MainForm
             return;
         }
         CaptureMode? mode = PickMode(modes, 1920, 1080, 0) ?? modes.FirstOrDefault();
-        if (_testCaption != null) _testCaption.Visible = false;
+        if (_testCaption != null) _testCaption.Showing = false;
         Bitmap? still = null;
         bool noDetail = false;
         try
@@ -171,7 +171,7 @@ public sealed partial class MainForm
         }
 
         // Anything over the video would make Windows compose the monitor; keep the caption away while frames are taken.
-        if (_testCaption != null) _testCaption.Visible = false;
+        if (_testCaption != null) _testCaption.Showing = false;
         Bitmap? strip = null;
         try
         {
@@ -331,7 +331,7 @@ public sealed partial class MainForm
     //  B. Updates lowered by something drawn over the video
     // =============================================================================================
 
-    private async Task<(double Rate, double ObservedHz)> PresentRate(int ms, double srcFps, double panel)
+    private async Task<(double Rate, double ObservedHz, double Judder)> PresentRate(int ms, double srcFps, double panel)
     {
         _video.BeginMeasure();
         long p0 = _video.FramesPresented;
@@ -345,9 +345,9 @@ public sealed partial class MainForm
             rate = el > 0 ? (_video.FramesPresented - p0) / el : 0;
         }
         finally { meas = _video.EndMeasure(); }
-        double hz = 0;
-        try { if (meas != null) hz = TestProbes.AnalyzePacing(meas.Pacing, srcFps, panel).ObservedHz; } catch { }
-        return (rate, hz);
+        double hz = 0, judder = 0;
+        try { if (meas != null) { var pa = TestProbes.AnalyzePacing(meas.Pacing, srcFps, panel); hz = pa.ObservedHz; judder = pa.JudderShare; } } catch { }
+        return (rate, hz, judder);
     }
 
     private async Task OverlayCapStep(TestSection sec, List<CaptureMode> modes)
@@ -355,14 +355,15 @@ public sealed partial class MainForm
         var item = new TestItem { Name = "重ねた表示による更新の低下" };
         double panel = _topt.Target.RefreshHz;
         DisplayInfo? primary = Displays.List().FirstOrDefault(d => d.Primary);
-        if (_topt.Target.Primary)
+        bool drawn = _video.SupportsOverlays;   // Direct3D: the overlays are drawn into the video, there is no window over it
+        if (_topt.Target.Primary && !drawn)
         {
             item.Summary = "試験するモニターがメインのモニターなので、この低下は起きません";
             item.Explanation = "この低下は、メインではないモニターを、メインのモニターとは違う更新の速さで使っているときに起きます。試験するモニターがメインのため調べていません。";
             sec.Items.Add(item);
             return;
         }
-        if (primary != null && Math.Abs(primary.RefreshHz - panel) <= 1)
+        if (primary != null && Math.Abs(primary.RefreshHz - panel) <= 1 && !drawn)
         {
             item.Summary = "メインのモニターと更新の速さが同じなので、この低下は起きません";
             item.Num("更新の速さ", $"試験するモニター {panel:0} Hz / メインのモニター {primary.RefreshHz} Hz");
@@ -381,8 +382,8 @@ public sealed partial class MainForm
             return;
         }
 
-        if (_testCaption != null) _testCaption.Visible = false;
-        bool wasVisible = _info.Visible;
+        if (_testCaption != null) _testCaption.Showing = false;
+        bool wasVisible = _info.Showing;
         try
         {
             _settings.Interpolation = interp;
@@ -397,11 +398,21 @@ public sealed partial class MainForm
                 item.Num("注意", "フレーム補間が働かなかったため、補間なしで測っています");
             double expect = interpOn ? panel : Math.Min(srcFps, panel);
 
+            bool crispable = _video.SupportsCrispness;
+            if (crispable) _video.CrispnessSampling = false;
             var clear = await PresentRate(2000, srcFps, panel);
             ToggleInfo();                      // the real info display, as in normal use
+            // The くっきり度 sampling runs while the info display is up; one sample a second here (the normal
+            // rate is one every 5 s) makes sure the measurement below contains several of them.
+            int crispIntervalWas = _video.CrispnessIntervalMs;
+            if (crispable) _video.CrispnessIntervalMs = 1000;
+            UpdateMetricLabels();
             await Wait(700);
-            var over = await PresentRate(2000, srcFps, panel);
+            var over = await PresentRate(drawn ? 4000 : 2000, srcFps, panel);
+            CrispnessReading? crisp = crispable ? _video.Crispness : null;
+            if (crispable) _video.CrispnessIntervalMs = crispIntervalWas;
             ToggleInfo();
+            UpdateMetricLabels();
             await Wait(700);
             var back = await PresentRate(1500, srcFps, panel);
 
@@ -409,12 +420,48 @@ public sealed partial class MainForm
                 .Num("情報表示を重ねたとき", $"{over.Rate:0.0} fps" + (over.ObservedHz > 0 ? $"（実測の更新 {over.ObservedHz:0.0} Hz）" : ""))
                 .Num("情報表示を消したあと", $"{back.Rate:0.0} fps" + (back.ObservedHz > 0 ? $"（実測の更新 {back.ObservedHz:0.0} Hz）" : ""))
                 .Num("期待した数", $"{expect:0} fps");
+            if (drawn)
+            {
+                item.Num("コマの出方の乱れ（何も重ねていないとき）", Pct(clear.Judder))
+                    .Num("コマの出方の乱れ（情報表示とくっきり度の計測中）", Pct(over.Judder));
+                if (crisp != null)
+                    item.Num("くっきり度の計測", $"{crisp.Samples} 回 ／ 1 回あたり描画スレッドを使った時間 最大 {crisp.RenderMsMax:0.00} ms（目標 2 ms 未満）");
+                else if (crispable)
+                    item.Num("くっきり度の計測", "この条件では計測が働きませんでした（映像が画面より大きくならない、または絵が平らなとき）");
+            }
 
             if (clear.Rate < 5)
             {
                 item.Verdict = Verdict.Warn;
                 item.Summary = "映像が出ていなかったため比べられませんでした";
                 item.Explanation = "何も重ねていない状態で映像のコマがほとんど表示されなかったため、重ねたときとの比較をしていません。";
+            }
+            else if (drawn)
+            {
+                bool judderBad = over.Judder > clear.Judder + 0.02;
+                bool slow = crisp != null && crisp.RenderMsMax >= 2.0;
+                if (over.Rate < clear.Rate * 0.9)
+                {
+                    item.Verdict = Verdict.Ng;
+                    item.Summary = $"映像の中に描いているのに、更新が {clear.Rate:0} から {over.Rate:0} fps に下がりました";
+                    item.Explanation = "Direct3D の描画では、通知と情報表示を映像の中に描くため、重ねても更新は下がらないはずです。下がっているため、何か別の原因があります。";
+                }
+                else if (judderBad || slow)
+                {
+                    item.Verdict = Verdict.Warn;
+                    item.Summary = judderBad ? "くっきり度の計測中にコマの出方が乱れました" : "くっきり度の計測が描画を 2 ms 以上止めました";
+                    item.Explanation = $"更新は {clear.Rate:0} から {over.Rate:0} fps と下がっていませんが、" +
+                        (judderBad ? $"コマの出方の乱れが {Pct(clear.Judder)} から {Pct(over.Judder)} に増えました。" : "") +
+                        (slow ? $"計測 1 回が描画スレッドを最大 {crisp!.RenderMsMax:0.0} ms 使いました。" : "");
+                }
+                else
+                {
+                    item.Verdict = Verdict.Ok;
+                    item.Summary = "映像の中に描くため、表示中も更新は下がりません";
+                    item.Explanation = $"通知と情報表示は別のウィンドウではなく映像の中に描いているので、Windows が映像を作り直す必要がなく、重ねても {clear.Rate:0} fps から {over.Rate:0} fps とほぼ変わりませんでした。" +
+                        "情報表示を出してくっきり度を 1 秒ごとに計測しているあいだも、コマの出方は変わりませんでした（" +
+                        $"{Pct(clear.Judder)} → {Pct(over.Judder)}）。ふだんの計測は 5 秒ごとです。";
+                }
             }
             else if (over.Rate >= clear.Rate * 0.9)
             {
@@ -440,7 +487,8 @@ public sealed partial class MainForm
         }
         finally
         {
-            if (_info.Visible != wasVisible) ToggleInfo();
+            if (_info.Showing != wasVisible) ToggleInfo();
+            if (_video.SupportsCrispness) _video.CrispnessIntervalMs = 5000;
             StopInterpForTest();
         }
     }

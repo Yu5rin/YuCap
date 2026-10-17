@@ -533,6 +533,17 @@ internal static class L
             "Frame interpolation: on (idle: the {0:0} Hz display is not clearly faster than the {1:0} fps video)",
         ["フレーム補間: この環境では使えません"] = "Frame interpolation: not available on this system",
         ["補間"] = "Interpolation",
+        ["補間 {0}"] = "Interp. {0}",
+        ["くっきり {0}"] = "Crisp {0}",
+        ["くっきり度"] = "Crispness",
+        ["{0}p 相当"] = "{0}p equiv.",
+        ["フレーム補間: 映像 {0:0.#} fps を、画面に実際に出ている {1:0.#} fps にしています（画面は {2:0.#} Hz）"] =
+            "Frame interpolation: turning {0:0.#} fps video into the {1:0.#} fps actually shown (display {2:0.#} Hz)",
+        ["フレーム補間は今は働いていません: {0}"] = "Frame interpolation is not running right now: {0}",
+        ["拡大: 元の絵の細かさ {0} から、画面に出す大きさ {1}x{2} へ（{3}）。キャプチャの大きさは {4}x{5} です。"] =
+            "Scaling: from a picture detail of {0} to {1}x{2} on screen ({3}). The capture size is {4}x{5}.",
+        ["くっきり度: 今の拡大処理が、ふつうの拡大（バイリニア）より絵の輪郭をどれだけくっきりさせているか。数秒ごとに、画面の一部分を両方の方法で描いて比べています。"] =
+            "Crispness: how much crisper the current scaling makes the edges than plain bilinear scaling. Every few seconds a small part of the picture is drawn both ways and compared.",
         ["待機（低遅延モード）"] = "idle (low-latency mode)",
         ["待機（画面 {0:0}Hz）"] = "idle (display {0:0} Hz)",
         ["待機（映像待ち）"] = "idle (waiting for video)",

@@ -362,6 +362,28 @@ internal static class TestProbes
         return es;
     }
 
+    /// <summary>The same mean gradient as <see cref="MeasureEdges"/> (|dx| + |dy| of the Rec.709 luma over w*h), for tightly
+    /// packed BGRA bytes - used by the live crispness (くっきり度) sampler so it agrees with the test mode's FSR comparison.</summary>
+    public static double MeanGradient(byte[] bgra, int w, int h)
+    {
+        if (w < 2 || h < 2 || bgra.Length < w * h * 4) return 0;
+        var prev = new int[w]; var cur = new int[w];
+        long total = 0;
+        for (int y = 0; y < h; y++)
+        {
+            int rowOff = y * w * 4;
+            for (int x = 0; x < w; x++)
+            {
+                int o = rowOff + x * 4;
+                cur[x] = (54 * bgra[o + 2] + 183 * bgra[o + 1] + 19 * bgra[o]) >> 8;
+            }
+            if (y > 0)
+                for (int x = 1; x < w; x++) total += Math.Abs(cur[x] - cur[x - 1]) + Math.Abs(cur[x] - prev[x]);
+            (prev, cur) = (cur, prev);
+        }
+        return total / (double)Math.Max(1, (long)w * h);
+    }
+
     /// <summary>The 480x270 tile (aligned to the cell grid) holding the most edges, or null if the picture is smaller.</summary>
     public static Rectangle? BestTile(EdgeStats es, Size image)
     {

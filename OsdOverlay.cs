@@ -10,7 +10,7 @@ namespace YuCap;
 /// notices, mode changes). It is a sibling window above the EVR host, with a
 /// rounded region so the corners reveal the video behind it.
 /// </summary>
-public sealed class OsdOverlay : Control
+public sealed class OsdOverlay : OverlayControl
 {
     // 12pt bold normally; dropped to 9pt when the caller passes a small
     // maxWidth (a small PiP window), where the larger size would force
@@ -28,7 +28,8 @@ public sealed class OsdOverlay : Control
 
     /// <summary>Test mode: draw an opaque solid background of this colour, so a screen sample can tell
     /// whether the overlay really is on top of the video.</summary>
-    internal Color? TestBack { get; set; }
+    internal Color? TestBack { get => _testBack; set { _testBack = value; Changed(); } }
+    private Color? _testBack;
 
     public OsdOverlay()
     {
@@ -41,6 +42,7 @@ public sealed class OsdOverlay : Control
         Cursor = Cursors.Default;
     }
 
+    internal bool Clickable => _clickable;
     internal float TextFactor => _scale;
     /// <summary>The large font in use (for the test mode's size measurement).</summary>
     internal Font TextFont => _fontNormal;
@@ -58,7 +60,7 @@ public sealed class OsdOverlay : Control
         _fontSmall = TextScale.MakeFont("Segoe UI", 12f, scale, FontStyle.Bold);
         _font = small ? _fontSmall : _fontNormal;
         n.Dispose(); s.Dispose();
-        if (Visible && !string.IsNullOrEmpty(Text)) ShowText(Text, _lastMaxWidth, _clickable);
+        if (Showing && !string.IsNullOrEmpty(Text)) ShowText(Text, _lastMaxWidth, _clickable);
     }
 
     /// <summary>Set the message, wrap it to <paramref name="maxWidth"/>, resize
@@ -83,17 +85,21 @@ public sealed class OsdOverlay : Control
         Region?.Dispose();
         Region = new Region(path);
 
-        Visible = true;
-        BringToFront();
-        Invalidate();
+        Showing = true;
+        if (!Virtual) BringToFront();
+        Changed();
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    internal override void PaintOverlay(Graphics g, bool offscreen)
     {
-        Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using var back = new SolidBrush(TestBack ?? Color.FromArgb(215, 20, 20, 20));
-        g.FillRectangle(back, ClientRectangle);
+        if (offscreen)
+        {
+            using var path = Rounded(new Rectangle(0, 0, Width, Height), TextScale.Px(10, _scale));
+            g.FillPath(back, path);
+        }
+        else g.FillRectangle(back, ClientRectangle);
 
         int padX = TextScale.Px(14, _scale), padY = TextScale.Px(8, _scale);
         var textRect = new Rectangle(padX, padY, Math.Max(1, Width - padX * 2), Math.Max(1, Height - padY * 2));

@@ -79,7 +79,8 @@ internal sealed class D3DRenderer : IDisposable
 
     // ---- shaders / states / constant buffers ----
     private ID3D11VertexShader? _vs;
-    private ID3D11PixelShader? _psConvert, _psScale, _psEasu, _psRcas;
+    private ID3D11PixelShader? _psConvert, _psScale, _psEasu, _psRcas, _psOverlay;
+    private ID3D11BlendState? _blendOver;
     private ID3D11PixelShader? _psPre;       // "match the original detail" downscale (null = unavailable)
     private ID3D11Buffer? _cbPre;
     private ID3D11PixelShader? _psIbp;           // back-projection refinement of the shrunk picture
@@ -187,6 +188,8 @@ internal sealed class D3DRenderer : IDisposable
         _vs = Device.CreateVertexShader(b.Vs);
         _psConvert = Device.CreatePixelShader(b.Convert);
         _psScale = Device.CreatePixelShader(b.Scale);
+        _psOverlay = Device.CreatePixelShader(b.Overlay);
+        _blendOver = Device.CreateBlendState(new BlendDescription(Blend.One, Blend.InverseSourceAlpha));
         _psEasu = Device.CreatePixelShader(b.Easu);
         _psRcas = Device.CreatePixelShader(b.Rcas);
 
@@ -997,7 +1000,8 @@ internal sealed class D3DRenderer : IDisposable
     }
 
     /// <summary>Compose into the back buffer and present. Returns the Present result.</summary>
-    public Result PresentFrame(Rectangle dst, ScalingQuality quality, bool pixelPerfect, float sharpness, int nativeH = 0)
+    public Result PresentFrame(Rectangle dst, ScalingQuality quality, bool pixelPerfect, float sharpness, int nativeH = 0,
+        OverlayLayer[]? overlays = null)
     {
         if (_swap == null) { _gpu?.Cancel(); return Result.Fail; }
         EnsureClientTextures(_swapSize);
@@ -1012,12 +1016,158 @@ internal sealed class D3DRenderer : IDisposable
             _composedDst = dst;
             _composedValid = true;
             _gpu?.End();   // convert + scale/FSR + copy; the vsync wait in Present is not GPU work
+            // Overlays go on AFTER the copy stills are read from, so snapshots never contain them.
+            DrawOverlays(rtv, _swapSize, overlays);
         }
         Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
         Result pr = _swap.Present(_syncInterval, _presentFlags);
         if (pr.Success) Volatile.Read(ref _pacing)?.Record(Beat.Mark());
         _gpu?.Poll();
         return pr;
+    }
+
+    // ---- overlays (notice / info panel / caption blended into the back buffer) ----
+    private sealed class OvTex
+    {
+        public ID3D11Texture2D Tex = null!;
+        public ID3D11ShaderResourceView Srv = null!;
+        public int W, H;
+        public long Version;
+        public void Dispose() { Srv.Dispose(); Tex.Dispose(); }
+    }
+    private readonly Dictionary<int, OvTex> _ov = new();
+
+    private void FreeOverlays()
+    {
+        foreach (OvTex t in _ov.Values) t.Dispose();
+        _ov.Clear();
+    }
+
+    private void DrawOverlays(ID3D11RenderTargetView rtv, Size target, OverlayLayer[]? layers)
+    {
+        if (layers == null || layers.Length == 0) { if (_ov.Count > 0) FreeOverlays(); return; }
+        if (_ov.Count > 0)
+        {
+            var gone = new List<int>();
+            foreach (int id in _ov.Keys) if (!layers.Any(l => l.Id == id)) gone.Add(id);
+            foreach (int id in gone) { _ov[id].Dispose(); _ov.Remove(id); }
+        }
+        bool any = false;
+        foreach (OverlayLayer l in layers)
+        {
+            if (l.W <= 0 || l.H <= 0 || l.Pixels.Length < l.W * l.H * 4) continue;
+            Rectangle r = Rectangle.Intersect(new Rectangle(l.X, l.Y, l.W, l.H), new Rectangle(Point.Empty, target));
+            if (r.Width <= 0 || r.Height <= 0) continue;
+            if (!_ov.TryGetValue(l.Id, out OvTex? t) || t.W != l.W || t.H != l.H || t.Version != l.Version)
+            {
+                if (t != null && (t.W != l.W || t.H != l.H)) { t.Dispose(); _ov.Remove(l.Id); t = null; }
+                if (t == null)
+                {
+                    var tex = Device.CreateTexture2D(new Texture2DDescription
+                    {
+                        Width = (uint)l.W, Height = (uint)l.H, MipLevels = 1, ArraySize = 1,
+                        Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                        Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+                    });
+                    t = new OvTex { Tex = tex, Srv = Device.CreateShaderResourceView(tex), W = l.W, H = l.H };
+                    _ov[l.Id] = t;
+                }
+                var h = GCHandle.Alloc(l.Pixels, GCHandleType.Pinned);
+                try { Ctx.UpdateSubresource(t.Tex, 0, null, h.AddrOfPinnedObject(), (uint)(l.W * 4), 0); }
+                finally { h.Free(); }
+                t.Version = l.Version;
+            }
+            if (!any)
+            {
+                Ctx.OMSetBlendState(_blendOver);
+                Ctx.PSSetShader(_psOverlay);
+                Ctx.PSSetConstantBuffer(0, _cbScale);
+                any = true;
+            }
+            WriteCb(_cbScale!, new Vector4(l.X, l.Y, l.W, l.H));
+            SetupTriangle(rtv, r);
+            Ctx.PSSetShaderResource(0, t.Srv);
+            Ctx.Draw(3, 0);
+        }
+        if (any)
+        {
+            Ctx.PSSetShaderResource(0, null!);
+            Ctx.OMSetBlendState(null);
+        }
+    }
+
+    // ---- crispness sample (くっきり度): current pipeline vs plain bilinear on one crop ----
+    private ID3D11Texture2D? _csA, _csB, _csInter, _csStA, _csStB;
+    private ID3D11RenderTargetView? _csRtvA, _csRtvB, _csRtvI;
+    private ID3D11ShaderResourceView? _csSrvI;
+    private Size _csSize;
+
+    private void FreeCrisp()
+    {
+        _csRtvA?.Dispose(); _csRtvB?.Dispose(); _csRtvI?.Dispose(); _csSrvI?.Dispose();
+        _csA?.Dispose(); _csB?.Dispose(); _csInter?.Dispose(); _csStA?.Dispose(); _csStB?.Dispose();
+        _csRtvA = _csRtvB = _csRtvI = null; _csSrvI = null; _csA = _csB = _csInter = _csStA = _csStB = null;
+        _csSize = Size.Empty;
+    }
+
+    /// <summary>Queue the two renders of <paramref name="crop"/> (client pixels of the output whose picture is
+    /// <paramref name="dst"/>) and the copies to staging textures; only submits work, nothing is waited for.
+    /// False when there is no picture to sample.</summary>
+    public bool CrispSubmit(Rectangle dst, Rectangle crop, ScalingQuality quality, bool pixelPerfect, float sharpness, int nativeH)
+    {
+        if (_orientedSrv == null || crop.Width < 16 || crop.Height < 16) return false;
+        if (_csSize != crop.Size)
+        {
+            FreeCrisp();
+            Texture2DDescription rt = new()
+            {
+                Width = (uint)crop.Width, Height = (uint)crop.Height, MipLevels = 1, ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default, BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+            };
+            Texture2DDescription st = rt;
+            st.Usage = ResourceUsage.Staging; st.BindFlags = BindFlags.None; st.CPUAccessFlags = CpuAccessFlags.Read;
+            _csA = Device.CreateTexture2D(rt); _csB = Device.CreateTexture2D(rt); _csInter = Device.CreateTexture2D(rt);
+            _csStA = Device.CreateTexture2D(st); _csStB = Device.CreateTexture2D(st);
+            _csRtvA = Device.CreateRenderTargetView(_csA); _csRtvB = Device.CreateRenderTargetView(_csB);
+            _csRtvI = Device.CreateRenderTargetView(_csInter); _csSrvI = Device.CreateShaderResourceView(_csInter);
+            _csSize = crop.Size;
+        }
+        var local = new Rectangle(dst.X - crop.X, dst.Y - crop.Y, dst.Width, dst.Height);
+        int keep = _prescaleActiveH;
+        try
+        {
+            Compose(_csRtvA!, _csSize, local, quality, pixelPerfect, sharpness, _csRtvI, _csSrvI, nativeH);
+            Compose(_csRtvB!, _csSize, local, ScalingQuality.Standard, false, sharpness, null, null, 0);
+        }
+        finally { _prescaleActiveH = keep; Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>()); }
+        Ctx.CopyResource(_csStA!, _csA!);
+        Ctx.CopyResource(_csStB!, _csB!);
+        Ctx.Flush();
+        return true;
+    }
+
+    /// <summary>Copy the two staged crops out as tightly packed BGRA (call a few ms after <see cref="CrispSubmit"/>).</summary>
+    public bool CrispRead(out byte[] pipeline, out byte[] bilinear, out Size size)
+    {
+        pipeline = bilinear = Array.Empty<byte>(); size = _csSize;
+        if (_csStA == null || _csStB == null) return false;
+        pipeline = CopyStaging(_csStA, _csSize);
+        bilinear = CopyStaging(_csStB, _csSize);
+        return true;
+    }
+
+    private byte[] CopyStaging(ID3D11Texture2D st, Size sz)
+    {
+        MappedSubresource map = Ctx.Map(st, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        try
+        {
+            var buf = new byte[sz.Width * sz.Height * 4];
+            for (int y = 0; y < sz.Height; y++)
+                Marshal.Copy(map.DataPointer + y * (int)map.RowPitch, buf, y * sz.Width * 4, sz.Width * 4);
+            return buf;
+        }
+        finally { Ctx.Unmap(st, 0); }
     }
 
     // ---- latency (YuCap-internal: frame received -> shown) ----
@@ -1915,6 +2065,7 @@ internal sealed class D3DRenderer : IDisposable
         try { Ctx?.ClearState(); Ctx?.Flush(); } catch { }
         Beat.Dispose();
         InterpFree();
+        FreeOverlays(); FreeCrisp();
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
         _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
@@ -1928,7 +2079,7 @@ internal sealed class D3DRenderer : IDisposable
 
         lock (FrameLock) { FreeRing(); DisposeFrameTextures(); }
         _gpu?.Dispose(); _gpu = null;
-        _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
+        _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psOverlay?.Dispose(); _blendOver?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
         _psPre?.Dispose(); _psIbp?.Dispose(); _cbPre?.Dispose();
         for (int i = 0; i < 2; i++) { _pfRtv[i]?.Dispose(); _pfSrv[i]?.Dispose(); _pf[i]?.Dispose(); }
         _psPyr1?.Dispose(); _psPyrD?.Dispose(); _psMe?.Dispose(); _psMed?.Dispose(); _psSynth?.Dispose();
