@@ -52,10 +52,10 @@ internal static class InterpCheck
     // ================================================================ a picture with plenty of detail
 
     /// <summary>A reproducible busy picture (gradient, random shapes, text-like edges) for when the live still is too flat.</summary>
-    public static Bitmap MakePattern(int w, int h)
+    public static Bitmap MakePattern(int w, int h, int seed = 20260613)
     {
         var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-        var rnd = new Random(20260613);
+        var rnd = new Random(seed);
         using Graphics g = Graphics.FromImage(bmp);
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
@@ -102,6 +102,7 @@ internal static class InterpCheck
         public double BgErr, BlkErr;
         public int BadBlocks, BadVectors;
         public string Timing = string.Empty;
+        public double CutShare;                     // scene-cut statistic (share of badly matched blocks) of the moving picture: must stay far below the cut level
     }
 
     public const int GlobalDx = 14, GlobalDy = -8, BlockDx = -40, BlockDy = 12;
@@ -159,6 +160,7 @@ internal static class InterpCheck
             using (mid)
             {
                 res.Timing = timing;
+                res.CutShare = D3DRenderer.DebugCutStats.Z;
                 int[] M = Program.ReadPixels(mid);
                 int m = 24;
                 var bgRect = new Rectangle(m, m, w - 2 * m, h * 30 / 100 - m);
@@ -216,6 +218,55 @@ internal static class InterpCheck
         }
         catch (Exception ex) { res.Failure = ex.Message; return res; }
         finally { own?.Dispose(); }
+    }
+
+    internal sealed class CutResult
+    {
+        public bool Ok;
+        public string Failure = string.Empty;
+        public double Share;                         // share of blocks that matched badly (cut level: 0.07 and up starts, 0.12 is a full cut)
+        public double ErrNearA, ErrNearB;            // mean abs error of the output against A and B: mean abs error of the output against lerp(A, B, alpha) at alpha 0.3 / 0.7
+        public bool Detected => Share >= 0.12;
+        public bool Clean => ErrNearA < 1.0 && ErrNearB < 1.0;
+    }
+
+    /// <summary>Two unrelated pictures (a scene cut): the result must be the plain blend of A and B at alpha, not a warp.</summary>
+    public static CutResult RunSceneCut(D3DVideoEngine engine)
+    {
+        var res = new CutResult();
+        try
+        {
+            // unrelated at every scale: a different picture, and its light and dark swapped (the built-in pictures share a smooth
+            // background, which at the coarse levels the search works on would look like the same scene)
+            using Bitmap a = MakePattern(1920, 1080);
+            int[] pa = Program.ReadPixels(a);
+            int[] pb = Program.ReadPixels(MakePattern(1920, 1080, 777));
+            for (int i = 0; i < pb.Length; i++) pb[i] = (pb[i] ^ 0x00FFFFFF) | unchecked((int)0xFF000000);
+            using Bitmap b = Program.MakeBitmap(pb, 1920, 1080);
+            for (int k = 0; k < 2; k++)
+            {
+                if (!engine.DebugInterpSynthetic(a, b, k == 0 ? 0.3 : 0.7, 0, out Bitmap? mid, out _, out _, out _) || mid == null)
+                { res.Failure = "補間の処理を始められませんでした"; return res; }
+                using (mid)
+                {
+                    res.Share = D3DRenderer.DebugCutStats.Z;
+                    int[] pm = Program.ReadPixels(mid);
+                    double al = k == 0 ? 0.3 : 0.7;
+                    var bl = new int[pa.Length];
+                    for (int i = 0; i < bl.Length; i++)
+                    {
+                        int r = 0;
+                        for (int sh = 0; sh < 24; sh += 8) r |= (int)Math.Round(Ch(pa[i], sh) * (1 - al) + Ch(pb[i], sh) * al) << sh;
+                        bl[i] = r | unchecked((int)0xFF000000);
+                    }
+                    double mae = Errors(pm, bl, null).Mae;
+                    if (k == 0) res.ErrNearA = mae; else res.ErrNearB = mae;
+                }
+            }
+            res.Ok = true;
+        }
+        catch (Exception ex) { res.Failure = ex.Message; }
+        return res;
     }
 
     /// <summary>Mean |dx|+|dy| of the luma over an 8x8 cell.</summary>

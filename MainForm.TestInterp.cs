@@ -105,6 +105,11 @@ public sealed partial class MainForm
                 .Num("動きの向きが合っていた割合（背景）", $"{Pct(vecFrac)}（{vecOk}/{vecN} ブロック、誤差 1 ピクセル以内。" + (texOk ? "模様のある所だけ" : "全部") + $"。全ブロックでは {r.BgOk}/{r.BgN}）")
                 .Num("動きの向きが合っていた割合（四角）", $"{Pct(r.BlkN > 0 ? (double)r.BlkOk / r.BlkN : 0)}（{r.BlkOk}/{r.BlkN} ブロック、平均の誤差 {r.BlkErr:0.00} ピクセル）")
                 .Num("真っ黒になったブロック / 異常な値の動き", $"{r.BadBlocks} 個 / {r.BadVectors} 個");
+            InterpCheck.CutResult cut = await Task.Run(() => InterpCheck.RunSceneCut(eng));
+            bool cutOk = cut.Ok && cut.Detected && cut.Clean && r.CutShare < 0.07;
+            item.Num("場面が切り替わったとき（無関係な 2 コマ）", cut.Ok
+                ? $"{(cut.Detected ? "切り替わりを検出" : "切り替わりを検出できず")}（うまく合わなかったブロックの割合 {Pct(cut.Share)}）。出力は 2 コマの重ね合わせと{(cut.Clean ? "同じ" : "違う")}（平均の差 {cut.ErrNearA:0.00} / {cut.ErrNearB:0.00}）。動く絵では誤検出 {(r.CutShare < 0.07 ? "なし" : "あり")}（{Pct(r.CutShare)}）"
+                : "試せませんでした: " + cut.Failure);
             item.Images.Add(file);
             if (noDetail) item.Num("（参考）映像から取った絵での結果", _probeCardMessage ? "映像がカード自身のメッセージ画面だったため、映像からは取りませんでした" : "映像が真っ黒（または一色）だったため、映像からは取りませんでした");
             if (rs is { Ok: true })
@@ -128,6 +133,8 @@ public sealed partial class MainForm
             if (r.BlkPsnr < blkBlend) why.Add("動く四角の部分が「重ねただけ」より悪くなっています。");
             else if (r.BlkPsnr < blkBlend + 3) why.Add("動く四角の部分の改善が小さいです。");
             if (vecFrac < 0.85) why.Add($"動きの向きが合っていた割合が {Pct(vecFrac)} で、85% に届いていません。");
+            if (!cutOk && v == Verdict.Ok) v = Verdict.Warn;
+            if (!cutOk) why.Add("場面の切り替わり（まったく違う 2 コマ）で、2 コマの重ね合わせを出す動きになっていません。");
             if (v == Verdict.Ok) why.Insert(0, "背景も動く四角も、正解に近い絵を作れています。");
             if (rs is { Ok: true })
                 why.Add("「（参考）映像から取った絵」は、いま映っている映像の 1 コマで同じ検算をしたものです。文字の行が並ぶ画面のように同じ模様が繰り返される絵は、どこへ動いたのか決まらず、補間が苦手とする（誰がやっても難しい）ため、判定には使わず参考にとどめています。実際の映像での出来は、次の「実際の映像での検算」で判定します。");

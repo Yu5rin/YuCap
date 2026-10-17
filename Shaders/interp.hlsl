@@ -4,6 +4,7 @@
 //   pyrd   luma level -> luma level at 1/2 size     (2x2 box average)
 //   mecost matching costs of all integer vectors of the coarsest level (parallel)
 //   me     block matching of one pyramid level      (symmetric: A(x - v/2) against B(x + v/2))
+//   cutstat scene-cut statistics of the coarsest field (one pixel)
 //   med    3x3 component-wise median of a vector field (and unit conversion on the last level)
 //   synth  in-between frame from A, B and the final field
 // One shared constant buffer layout; the meaning of the members is listed per entry point.
@@ -19,6 +20,8 @@ Texture2D<float4> T0 : register(t0);
 Texture2D<float4> T1 : register(t1);
 Texture2D<float4> T2 : register(t2);
 Texture2D<float>  T3 : register(t3);
+Texture2D<float4> T4 : register(t4);
+static const float CutLo = 0.04, CutMid = 0.08, CutHi = 0.15;
 SamplerState      lin : register(s0);
 
 // ---------------------------------------------------------------- pyramid
@@ -184,6 +187,27 @@ float4 med(float4 pos : SV_Position) : SV_Target
     return float4(p4 * P2.y, c4.z, 1);
 }
 
+// ---------------------------------------------------------------- scene cut
+
+// One pixel: how badly the blocks of the coarsest field matched. x = mean cost, y/z/w = share of blocks whose cost is above
+// three levels. Unrelated pictures (a cut) match badly nearly everywhere, a pan or moving objects only in a few blocks.
+float4 cutstat(float4 pos : SV_Position) : SV_Target
+{
+    int2 n = int2(P1.xy);
+    float s = 0, a = 0, b = 0, c = 0;
+    [loop] for (int y = 0; y < n.y; y++)
+    [loop] for (int x = 0; x < n.x; x++)
+    {
+        float z = T2.Load(int3(x, y, 0)).z;
+        s += z;
+        a += z > CutLo ? 1 : 0;
+        b += z > CutMid ? 1 : 0;
+        c += z > CutHi ? 1 : 0;
+    }
+    float k = 1.0 / (n.x * n.y);
+    return float4(s * k, a * k, b * k, c * k);
+}
+
 // ---------------------------------------------------------------- synthesis
 
 float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
@@ -208,6 +232,13 @@ float4 synth(float4 pos : SV_Position) : SV_Target
     float w = saturate((d - 0.08) / 0.25);
 
     int3 p = int3(int2(pos.xy), 0);
-    float3 fb = lerp(T0.Load(p).rgb, T1.Load(p).rgb, alpha);
-    return float4(lerp(mc, fb, w), 1.0);
+    float3 pa = T0.Load(p).rgb, pb = T1.Load(p).rgb;
+    float3 fb = lerp(pa, pb, alpha);
+    float3 o = lerp(mc, fb, w);
+
+    // a scene cut (A and B are unrelated pictures: nearly every block matched badly, see cutstat): show the plain
+    // blend of the two frames (about one source frame of cross-fade) instead of a warp of two different pictures. On real footage the share of
+    // blocks with cost > 0.08 is 0.00-0.04 for pans (up to 0.06 inside a dissolve) and 0.14-0.28 across a cut.
+    float cut = saturate((T4.Load(int3(0, 0, 0)).z - 0.07) / 0.05);
+    return float4(lerp(o, fb, cut), 1.0);
 }

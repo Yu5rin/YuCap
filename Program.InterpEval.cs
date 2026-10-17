@@ -127,6 +127,37 @@ internal static partial class Program
                 string outDir = Path.Combine(dir, "eval");
                 Directory.CreateDirectory(outDir);
 
+                // scene-cut statistics (mean cost, share of blocks above 0.04 / 0.08 / 0.15) for pans, unrelated pictures and fades
+                {
+                    string St(Bitmap a, Bitmap b)
+                    {
+                        if (!engine.DebugInterpSynthetic(a, b, 0.5, 0, out Bitmap? m, out _, out _, out _)) return "failed";
+                        m?.Dispose();
+                        var c = D3DRenderer.DebugCutStats;
+                        return $"{c.X:0.000} {c.Y:0.00} {c.Z:0.00} {c.W:0.00}";
+                    }
+                    log.Add("cut stats: mean | >0.04 | >0.08 | >0.15");
+                    foreach (var t in trip) log.Add($"  pan {t.Name} F0-F2: {St(t.F0, t.F2)}   F0-F1: {St(t.F0, t.F1)}");
+                    for (int i = 0; i < trip.Count; i += 3)
+                    {
+                        int j = (i + 7) % trip.Count;
+                        log.Add($"  cut {trip[i].Name}.F0 -> {trip[j].Name}.F2: {St(trip[i].F0, trip[j].F2)}");
+                        int[] pa = ReadPixels(trip[i].F0), pb = ReadPixels(trip[j].F0);
+                        foreach (double k in new[] { 0.15, 0.35, 0.6, 1.0 })
+                        {
+                            var px = new int[pa.Length];
+                            for (int q = 0; q < px.Length; q++)
+                            {
+                                int r = 0;
+                                for (int sh = 0; sh < 24; sh += 8) r |= (int)Math.Round(((pa[q] >> sh) & 255) * (1 - k) + ((pb[q] >> sh) & 255) * k) << sh;
+                                px[q] = r | unchecked((int)0xFF000000);
+                            }
+                            using Bitmap fb = MakeBitmap(px, trip[i].F0.Width, trip[i].F0.Height);
+                            log.Add($"  fade {trip[i].Name}->{trip[j].Name} step {k}: {St(trip[i].F0, fb)}");
+                        }
+                    }
+                }
+
                 // reference (variant independent) numbers on the first variant's pass
                 log.Add("variant | moving px PSNR interp/blend/repeat | MAE interp/blend/repeat | whole PSNR interp/blend/repeat | synth bg/block dB (blend) | GPU 1080p / 4K synth ms");
                 foreach (EvalVariant v in variants)
@@ -164,6 +195,8 @@ internal static partial class Program
                     string Avg(Func<InterpCheck.Triple, double> f) => used.Count == 0 ? "n/a" : used.Average(f).ToString("0.0");
 
                     var syn = InterpCheck.RunSynthetic(engine, null, Path.Combine(outDir, v.Name + "_synth.png"));
+                    var cutRes = InterpCheck.RunSceneCut(engine);
+                    log.Add($"  scene cut (two unrelated patterns): ok={cutRes.Ok} share>0.08={cutRes.Share:0.00} detected={cutRes.Detected} output vs blend MAE {cutRes.ErrNearA:0.00}/{cutRes.ErrNearB:0.00} clean={cutRes.Clean}; moving-pattern share {syn.CutShare:0.00}");
                     string timing = "n/a";
                     if (!quickTiming)
                     {

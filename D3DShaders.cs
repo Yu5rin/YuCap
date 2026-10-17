@@ -32,7 +32,7 @@ internal static class D3DShaders
         public bool InterpOk;
         public byte[] PyrLuma = Array.Empty<byte>();
         public byte[] PyrDown = Array.Empty<byte>();
-        public byte[] Me = Array.Empty<byte>(), MeCost = Array.Empty<byte>();
+        public byte[] Me = Array.Empty<byte>(), MeCost = Array.Empty<byte>(), CutStat = Array.Empty<byte>();
         public byte[] Med = Array.Empty<byte>();
         public byte[] Synth = Array.Empty<byte>();
     }
@@ -78,6 +78,7 @@ internal static class D3DShaders
                 b.PyrDown = Compile(interp, "pyrd", "interp.hlsl", "ps_5_0");
                 b.Me = Compile(interp, "me", "interp.hlsl", "ps_5_0");
                 b.MeCost = Compile(interp, "mecost", "interp.hlsl", "ps_5_0");
+                b.CutStat = Compile(interp, "cutstat", "interp.hlsl", "ps_5_0");
                 b.Med = Compile(interp, "med", "interp.hlsl", "ps_5_0");
                 b.Synth = Compile(interp, "synth", "interp.hlsl", "ps_5_0");
                 b.InterpOk = true;
