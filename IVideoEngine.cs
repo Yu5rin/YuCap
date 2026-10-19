@@ -27,15 +27,30 @@ public enum ScalingQuality
 /// (-1..1), Contrast and Saturation multiply (0..2), Gamma is the display gamma (0.5..2.0,
 /// above 1 = brighter midtones). <see cref="Neutral"/> is an exact passthrough.
 /// </summary>
-public readonly record struct VideoAdjustments(float Brightness, float Contrast, float Saturation, float Gamma)
+public readonly record struct VideoAdjustments(float Brightness, float Contrast, float Saturation, float Gamma, int Shadow = 0)
 {
-    public static readonly VideoAdjustments Neutral = new(0f, 1f, 1f, 1f);
+    public static readonly VideoAdjustments Neutral = new(0f, 1f, 1f, 1f, 0);
+
+    /// <summary>Shadow-boost strength per level (0 = off, 1 = weak, 2 = medium, 3 = strong): the peak lift of
+    /// the curve in the convert shader (y' = y + k * y * (1 - smoothstep(0.15, 0.5, y))).</summary>
+    public static readonly float[] ShadowStrength = { 0f, 0.2f, 0.4f, 0.65f };
+    public const int MaxShadow = 3;
+
+    /// <summary>The luma curve of the shadow boost on 0..1 (the same formula as Shaders/convert.hlsl).</summary>
+    public static float ShadowCurve(float y, int level)
+    {
+        if (level <= 0) return y;
+        float k = ShadowStrength[Math.Clamp(level, 0, MaxShadow)];
+        float t = Math.Clamp((y - 0.15f) / 0.35f, 0f, 1f);
+        float ss = t * t * (3f - 2f * t);
+        return y + k * y * (1f - ss);
+    }
     public bool IsNeutral => this == Neutral;
 
     /// <summary>Clamp every member into its documented range.</summary>
     public VideoAdjustments Clamped() => new(
         Math.Clamp(Brightness, -1f, 1f), Math.Clamp(Contrast, 0f, 2f),
-        Math.Clamp(Saturation, 0f, 2f), Math.Clamp(Gamma, 0.5f, 2f));
+        Math.Clamp(Saturation, 0f, 2f), Math.Clamp(Gamma, 0.5f, 2f), Math.Clamp(Shadow, 0, MaxShadow));
 }
 
 /// <summary>Why frame interpolation is not running (<see cref="InterpolationStatus.Idle"/>).</summary>
@@ -216,6 +231,9 @@ public interface IVideoEngine : IDisposable
     /// <summary>Test mode: render <paramref name="source"/> (instead of the live frame) through the real GPU pipeline at
     /// <paramref name="output"/>. The live picture is replaced until the next frame arrives.</summary>
     Bitmap? RenderBitmap(Bitmap source, Size output, ScalingQuality quality, int nativeH, int filter) => null;
+    /// <summary>Test mode: a synthetic full-range BT.709 NV12 picture through the real convert pass with <paramref name="adj"/>, read back
+    /// (the live picture is not touched). Null when not available.</summary>
+    Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj) => null;
     /// <summary>Test mode: GPU milliseconds per frame without / with the prescale and of the prescale pass alone.</summary>
     bool BenchPrescale(Bitmap? source, Size output, ScalingQuality quality, int nativeH, int filter, int frames,
         out double[] plain, out double[] withPre, out double[] passOnly)

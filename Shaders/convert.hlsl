@@ -10,7 +10,7 @@
 cbuffer Convert : register(b0)
 {
     int4   dims;    // srcW, srcH, outW, outH
-    int4   orient;  // rotation steps (0..3, clockwise x90), mirror (0/1), adjust on (0/1), 0
+    int4   orient;  // rotation steps (0..3, clockwise x90), mirror (0/1), adjust on (0/1), shadow boost level (0..3)
     float4 coef;    // Cr->R, Cb->G, Cr->G, Cb->B
     float4 range;   // yOffset, yScale, cOffset, cScale
     float4 adj;     // brightness (additive), contrast, 1/gamma, saturation
@@ -56,6 +56,15 @@ float4 main(float4 pos : SV_Position) : SV_Target
         float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));  // BT.709 luma
         rgb = lerp(float3(luma, luma, luma), rgb, adj.w);       // saturation
         rgb = saturate(rgb);
+        // Shadow boost: lift the luma of dark tones by k*y*(1-smoothstep(0.15,0.5,y)) and add the same
+        // amount to R, G and B (Cb/Cr stay as they are). 0 -> 0 and everything from y=0.5 up is untouched.
+        if (orient.w > 0)
+        {
+            float k = orient.w == 1 ? 0.2 : (orient.w == 2 ? 0.4 : 0.65);
+            float ly = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+            float sh = smoothstep(0.15, 0.5, ly);
+            rgb = saturate(rgb + k * ly * (1.0 - sh));
+        }
     }
     return float4(rgb, 1.0);
 }

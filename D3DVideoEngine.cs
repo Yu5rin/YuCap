@@ -164,6 +164,13 @@ public sealed class D3DVideoEngine : IVideoEngine
         return s.Run(r => r.RenderOffscreen(output, quality, sharp, nativeH, filter), 8000, needFrame: true, out _);
     }
 
+    public Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj)
+    {
+        Session? s = _s;
+        if (s == null || !s.Alive) return null;
+        return s.Run(r => r.ConvertSynthetic(luma, chroma, w, h, adj), 8000, needFrame: false, out _);
+    }
+
     public Bitmap? RenderBitmap(Bitmap source, Size output, ScalingQuality quality, int nativeH, int filter)
     {
         Session? s = _s;

@@ -57,10 +57,12 @@ public sealed class AppSettings
     public int AdjContrast { get; set; } = 100;              // 0..200 (100 = unchanged)
     public int AdjSaturation { get; set; } = 100;            // 0..200 (100 = unchanged)
     public int AdjGamma { get; set; } = 100;                 // 50..200, % of gamma 1.0 (100 = unchanged)
+    public int ShadowBoost { get; set; }                     // 0..3 (off / weak / medium / strong): lift dark tones, highlights untouched
 
     // A/V sync offset in ms, one signed value: positive delays the audio, negative makes it
     // earlier (done by delaying the video, which only the Direct3D renderer can do).
-    public int AvOffsetMs { get; set; }                      // -300..300 in steps of 10
+    public int AvOffsetMs { get; set; }                      // -300..300 in steps of 10 (with AvAuto: the fine trim added to the automatic part)
+    public bool AvAuto { get; set; }                         // steer the offset automatically so picture and sound agree inside YuCap
 
     // Black-border crop (Direct3D renderer only), in SOURCE pixels before rotation; 0 = none.
     public int CropLeft { get; set; }
@@ -141,6 +143,9 @@ public sealed class AppSettings
     public int HotkeyPip { get; set; } = 0x20000 | 0x40000 | 0x50;      // Ctrl+Alt+P
     public int HotkeyVolumeUp { get; set; } = 0x20000 | 0x40000 | 0x26;   // Ctrl+Alt+Up
     public int HotkeyVolumeDown { get; set; } = 0x20000 | 0x40000 | 0x28; // Ctrl+Alt+Down
+    public int HotkeyStyle { get; set; } = 0x20000 | 0x40000 | 0x4C;      // Ctrl+Alt+L (なめらか ⇔ 低遅延)
+    /// <summary>What to do when the input changes and another profile fits it clearly better: "off" | "ask" (offer it on the OSD) | "auto".</summary>
+    public string AutoProfileMode { get; set; } = "ask";
     /// <summary>Endpoint id of the audio output (speakers) to play the capture audio on; null = follow the Windows default.</summary>
     public string? AudioOutputDeviceId { get; set; }
     public string DeviceKeyword { get; set; } = "JVA14";
@@ -214,6 +219,8 @@ public sealed class AppSettings
         // already gave them their defaults. Only a combo without a key (modifiers alone) is meaningless.
         if ((HotkeyVolumeUp & 0xFFFF) == 0) HotkeyVolumeUp = 0;
         if ((HotkeyVolumeDown & 0xFFFF) == 0) HotkeyVolumeDown = 0;
+        if ((HotkeyStyle & 0xFFFF) == 0) HotkeyStyle = 0;
+        AutoProfileMode = AutoProfileMode is "off" or "ask" or "auto" ? AutoProfileMode : "ask";
 
         // Anything unrecognised (typo, hand edit, a value from a newer build) falls
         // back to the safe choice: the Media Foundation path / the FSR default.
@@ -234,6 +241,7 @@ public sealed class AppSettings
         // The slider moves in 10 ms steps; snap a hand-edited value to that grid so the dialog
         // and the engines always agree on what "0" and "+30" mean.
         AvOffsetMs = SnapAvOffset(AvOffsetMs);
+        ShadowBoost = Math.Clamp(ShadowBoost, 0, VideoAdjustments.MaxShadow);
 
         CropLeft = Math.Clamp(CropLeft, 0, MaxCrop);
         CropTop = Math.Clamp(CropTop, 0, MaxCrop);
@@ -396,7 +404,9 @@ public sealed class VideoProfile
     public int AdjContrast { get; set; } = 100;
     public int AdjSaturation { get; set; } = 100;
     public int AdjGamma { get; set; } = 100;
+    public int ShadowBoost { get; set; }
     public int AvOffsetMs { get; set; }
+    public bool AvAuto { get; set; }
     public int CropLeft { get; set; }
     public int CropTop { get; set; }
     public int CropRight { get; set; }
@@ -404,6 +414,8 @@ public sealed class VideoProfile
     public bool LowLatency { get; set; }
     public bool Interpolation { get; set; }
     public bool SaveDisplaySize { get; set; }
+    /// <summary>The input this profile was used with (for the automatic switch). Not one of the values: changing it never marks the profile as modified.</summary>
+    public InputSignature? Signature { get; set; }
 
     public CaptureMode? ToMode() =>
         ModeCompression is { } c && ModeWidth is int w && ModeHeight is int h && ModeFps is int f
@@ -424,6 +436,7 @@ public sealed class VideoProfile
         Name = name.Length > MaxNameLength ? name[..MaxNameLength].TrimEnd() : name;
         // A half-written mode (hand edit) is treated as auto rather than guessed at.
         if (ToMode() == null) SetMode(null);
+        Signature = Signature?.Normalized();
 
         DisplayMode = Math.Clamp(DisplayMode, 0, 3);
         Renderer = AppSettings.NormalizeRenderer(Renderer);
@@ -435,6 +448,7 @@ public sealed class VideoProfile
         AdjSaturation = Math.Clamp(AdjSaturation, 0, 200);
         AdjGamma = Math.Clamp(AdjGamma, 50, 200);
         AvOffsetMs = AppSettings.SnapAvOffset(AvOffsetMs);
+        ShadowBoost = Math.Clamp(ShadowBoost, 0, VideoAdjustments.MaxShadow);
         CropLeft = Math.Clamp(CropLeft, 0, AppSettings.MaxCrop);
         CropTop = Math.Clamp(CropTop, 0, AppSettings.MaxCrop);
         CropRight = Math.Clamp(CropRight, 0, AppSettings.MaxCrop);
@@ -447,6 +461,7 @@ public sealed class VideoProfile
         && FsrSharpness == o.FsrSharpness && NativeResScale == o.NativeResScale && DisplayMode == o.DisplayMode
         && AdjBrightness == o.AdjBrightness && AdjContrast == o.AdjContrast
         && AdjSaturation == o.AdjSaturation && AdjGamma == o.AdjGamma && AvOffsetMs == o.AvOffsetMs
+        && ShadowBoost == o.ShadowBoost && AvAuto == o.AvAuto
         && CropLeft == o.CropLeft && CropTop == o.CropTop && CropRight == o.CropRight && CropBottom == o.CropBottom
         && LowLatency == o.LowLatency && Interpolation == o.Interpolation && SaveDisplaySize == o.SaveDisplaySize;
 

@@ -802,6 +802,7 @@ internal sealed partial class D3DRenderer : IDisposable
             SrcW = src.Width, SrcH = src.Height, OutW = o.Width, OutH = o.Height,
             Rot = rotation / 90, Mirror = mirror ? 1 : 0, Coef = coef, Range = range,
             P0 = adj.IsNeutral ? 0 : 1,   // orient.z: adjustments on
+            P1 = Math.Clamp(adj.Shadow, 0, VideoAdjustments.MaxShadow),   // orient.w: shadow boost level
             Adj = new Vector4(adj.Brightness, adj.Contrast, 1f / adj.Gamma, adj.Saturation),
             CropL = keep.X, CropT = keep.Y,
         });

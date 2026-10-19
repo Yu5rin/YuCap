@@ -21,18 +21,40 @@ public sealed partial class MainForm
         Point at = new(cr.Left + cr.Width / 3, cr.Top + cr.Height / 4);
         int dpi = DpiAtPoint(at);
         var problems = new List<string>();
-        var it = new TestItem { Name = "メニュー: 項目の高さ（右クリックのメニューとその下のメニュー）" };
+        var it = new TestItem { Name = "メニュー: 項目の高さと文字の大きさ（右クリックのメニュー・メニューバーとその下のメニュー）" };
         int checkedItems = 0, menusOpened = 0;
         double worst = 0;
-        string rootInfo = "";
+        string rootInfo = "", fontInfo = "";
+        int fontChecked = 0;
+        double fontWorst = 0;
 
+        // pt per 100% of scaling: the same on every monitor when the font really follows the scaling
+        double Norm(Font f, int d) => f.SizeInPoints * 96.0 / Math.Max(96, d);
+        void FontCheck(string where, Font cf, int d, double reference, double formRef)
+        {
+            fontChecked++;
+            double n = Norm(cf, d);
+            double dev = Math.Abs(n - reference) / reference;
+            fontWorst = Math.Max(fontWorst, dev);
+            if (dev > 0.05)
+                problems.Add($"{where}: 文字の大きさが {cf.SizeInPoints:0.#}pt（{d} dpi。基準の {reference:0.#}pt/100% に対して {n:0.#}）");
+            else if (Math.Abs(n - formRef) / formRef > 0.05)
+                problems.Add($"{where}: ウィンドウの文字（{formRef:0.#}pt/100%）と大きさが違います（{n:0.#}）");
+        }
+
+        // "moved from another scaling to this one": build the menus for the other scaling first, then go through the
+        // same rebuild that OnDpiChanged does
+        RebuildMenus(dpi == 96 ? 192 : 96);
+        await Wait(50);
+
+        bool barWasVisible = _menu.Visible;
         _ctxAudit = true;
         try
         {
             foreach (bool english in new[] { false, true })
             {
                 string lang = english ? "[英語] " : "[日本語] ";
-                if (L.English != english || english != lang0 || dpi != _ctxDpi)
+                // rebuild for each language, from the scaling set up above
                 {
                     L.English = english;
                     RebuildMenus(dpi);
@@ -47,8 +69,13 @@ public sealed partial class MainForm
                     if (rootH.Count == 0) { problems.Add(lang + "右クリックのメニューが開きませんでした"); continue; }
                     int baseH = rootH[rootH.Count / 2];
                     rootInfo = $"{baseH}px（{_ctx.DeviceDpi} dpi）";
+                    double formRef = Norm(Font, DeviceDpi);
+                    double fontRef = Norm(_ctx.Font, _ctx.DeviceDpi);
+                    fontInfo = $"右クリック {_ctx.Font.SizeInPoints:0.#}pt（{_ctx.DeviceDpi} dpi）／ メニューバー {_menu.Font.SizeInPoints:0.#}pt（{_menu.DeviceDpi} dpi）／ ウィンドウ {Font.SizeInPoints:0.#}pt（{DeviceDpi} dpi）";
+                    if (Math.Abs(fontRef - formRef) / formRef > 0.05)
+                        problems.Add($"{lang}右クリックのメニューの文字がウィンドウの文字と違います（{_ctx.Font.SizeInPoints:0.#}pt/{_ctx.DeviceDpi}dpi と {Font.SizeInPoints:0.#}pt/{DeviceDpi}dpi）");
 
-                    async Task Walk(string path, ToolStripItemCollection items, int ownerDpi)
+                    async Task Walk(string path, ToolStripItemCollection items, int ownerDpi, double reference)
                     {
                         foreach (ToolStripMenuItem m in items.OfType<ToolStripMenuItem>().Where(m => m.Available && m.HasDropDownItems).ToList())
                         {
@@ -65,8 +92,9 @@ public sealed partial class MainForm
                                 worst = Math.Max(worst, dev);
                                 if (dev > 0.15)
                                     problems.Add($"{lang}{name} > {Tx(c)}: 高さ {c.Height}px（親のメニューは {baseH}px）");
+                                FontCheck($"{lang}{name} > {Tx(c)}", c.Font, ownerDpi, reference, formRef);
                             }
-                            await Walk(name + " > ", m.DropDownItems, ownerDpi);
+                            await Walk(name + " > ", m.DropDownItems, ownerDpi, reference);
                             m.HideDropDown();
                         }
                     }
@@ -76,12 +104,24 @@ public sealed partial class MainForm
                         double dev = Math.Abs(m.Height - baseH) / (double)baseH;
                         worst = Math.Max(worst, dev);
                         if (dev > 0.15) problems.Add($"{lang}{Tx(m)}: 高さ {m.Height}px（他は {baseH}px）");
+                        FontCheck($"{lang}{Tx(m)}", m.Font, _ctx.DeviceDpi, fontRef, formRef);
                     }
-                    await Walk("", _ctx.Items, _ctx.DeviceDpi);
+                    await Walk("", _ctx.Items, _ctx.DeviceDpi, fontRef);
 
-                    // the menu bar's drop-downs, when the bar is on screen
-                    if (_menu.Visible && _menu.Items.Count > 0)
-                        await Walk("メニューバー > ", _menu.Items, _menu.DeviceDpi);
+                    // the menu bar and its drop-downs: shown for the check if the bar is hidden during the test
+                    if (_menu.Items.Count > 0)
+                    {
+                        if (!_menu.Visible) { _menu.Visible = true; LayoutCanvas(); await Wait(100); }
+                        int barDpi = _menu.DeviceDpi;
+                        var barH = _menu.Items.OfType<ToolStripMenuItem>().Where(m => m.Available).ToList();
+                        foreach (var m in barH)
+                        {
+                            checkedItems++;
+                            FontCheck($"{lang}メニューバー {Tx(m)}", m.Font, barDpi, fontRef, formRef);
+                        }
+                        FontCheck($"{lang}メニューバー", _menu.Font, barDpi, fontRef, formRef);
+                        await Walk("メニューバー > ", _menu.Items, barDpi, fontRef);
+                    }
                 }
                 finally { _ctx.Close(); await Wait(50); }
             }
@@ -89,17 +129,20 @@ public sealed partial class MainForm
         finally
         {
             _ctxAudit = false;
-            if (L.English != lang0 || dpi != _ctxDpi) { L.English = lang0; RebuildMenus(dpi); }
+            if (_menu.Visible != barWasVisible) { _menu.Visible = barWasVisible; LayoutCanvas(); }
+            L.English = lang0;
+            RebuildMenus(dpi);
         }
 
         it.Num("開いたメニュー", $"{menusOpened} 個").Num("調べた項目", $"{checkedItems} 個")
+          .Num("文字の大きさ", fontInfo).Num("文字を調べた項目", $"{fontChecked} 個（最大のずれ {Math.Round(fontWorst * 100)}%、5% まで許容）")
           .Num("親のメニューの項目の高さ", rootInfo).Num("最大のずれ", $"{Math.Round(worst * 100)}%（15% まで許容）");
-        if (!_menu.Visible) it.Num("メニューバー", "試験中は非表示のため、右クリックのメニューだけ調べました");
-        if (problems.Count == 0) { it.Verdict = Verdict.Ok; it.Summary = "どのメニューも項目の高さがそろっています"; }
+        if (!barWasVisible) it.Num("メニューバー", "試験中は非表示のため、調べる間だけ表示しました");
+        if (problems.Count == 0) { it.Verdict = Verdict.Ok; it.Summary = "どのメニューも項目の高さと文字の大きさがそろっています"; }
         else
         {
             it.Verdict = Verdict.Ng;
-            it.Summary = $"{problems.Count} か所で高さがそろっていません";
+            it.Summary = $"{problems.Count} か所で高さまたは文字の大きさがそろっていません";
             it.Explanation = string.Join("\n", problems.Distinct().Take(30));
         }
         sec.Items.Add(it);

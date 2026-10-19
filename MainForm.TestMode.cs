@@ -457,7 +457,7 @@ public sealed partial class MainForm
             "標準の拡大・FSR（高画質）・くっきり（Anime4K）を、このモニターの大きさで比べます。");
         TestSection secHdr = rep.AddSection("6. HDR");
         TestSection secFunc = rep.AddSection("7. 機能",
-            "切り取り・色の調整・映像の遅延・表示どおりの保存・回転と反転が正しく働くかを調べます。");
+            "切り取り・色の調整・映像の遅延・表示どおりの保存・回転と反転・なめらか ⇔ 低遅延の切り替え・プロファイル自動切り替えの照合が正しく働くかを調べます。");
         TestSection secAudio = rep.AddSection("8. 音声");
         TestSection secDlg = rep.AddSection("9. ダイアログの表示崩れ",
             "設定のダイアログを日本語と英語で作り、部品が重なったり枠からはみ出したりしていないかを調べます。あわせて、右クリックのメニューとその下のメニューの項目の高さがそろっているかも調べます。");
@@ -526,8 +526,11 @@ public sealed partial class MainForm
             steps.Add((L.F("機能の確認: {0}", L.T("切り取り")), secFunc, () => FeatureCrop(secFunc, mFeat)));
             steps.Add((L.F("機能の確認: {0}", L.T("色の調整")), secFunc, () => FeatureAdjust(secFunc)));
             steps.Add((L.F("機能の確認: {0}", L.T("映像の遅延")), secFunc, () => FeatureDelay(secFunc)));
+            steps.Add((L.F("機能の確認: {0}", L.T("音ズレの自動補正")), secFunc, () => FeatureAvAuto(secFunc)));
+            steps.Add((L.F("機能の確認: {0}", L.T("暗部補正")), secFunc, () => FeatureShadow(secFunc)));
             steps.Add((L.F("機能の確認: {0}", L.T("表示どおりの保存")), secFunc, () => FeatureSnapshot(secFunc)));
             steps.Add((L.F("機能の確認: {0}", L.T("回転と反転")), secFunc, () => FeatureOrientation(secFunc)));
+            steps.Add((L.F("機能の確認: {0}", L.T("なめらか ⇔ 低遅延の切り替え")), secFunc, () => FeatureStyle(secFunc, mFeat)));
         }
         else
         {
@@ -539,6 +542,7 @@ public sealed partial class MainForm
             });
         }
 
+        steps.Add((L.F("機能の確認: {0}", L.T("プロファイルの自動切り替え")), secFunc, () => AutoProfileStep(secFunc)));
         steps.Add((L.T("音声の確認"), secAudio, () => AudioStep(secAudio)));
         steps.Add((L.T("遅延の確認"), secAudio, () => LatencyStep(secAudio, videoOk)));
         steps.Add((L.T("ダイアログの確認"), secDlg, () => DialogStep(secDlg)));
@@ -618,6 +622,8 @@ public sealed partial class MainForm
         // a neutral baseline, so a step measures one thing; restored from the snapshot at the end
         _settings.AdjBrightness = 0; _settings.AdjContrast = 100; _settings.AdjSaturation = 100; _settings.AdjGamma = 100;
         _settings.AvOffsetMs = 0;
+        _settings.AvAuto = false;      // only the 音ズレの自動補正 step turns it on
+        _settings.ShadowBoost = 0;     // only the 暗部補正 step uses it
         _settings.CropLeft = _settings.CropTop = _settings.CropRight = _settings.CropBottom = 0;
         _settings.LowLatency = false;
         _settings.Interpolation = false;   // only the 補間 cases of section 3 turn it on

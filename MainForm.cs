@@ -33,7 +33,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const int PbtApmSuspend = 0x4, PbtApmResumeSuspend = 0x7, PbtApmResumeAutomatic = 0x12;
 
     // Global hotkeys (RegisterHotKey).
-    private const int HkSnapshot = 1, HkMute = 2, HkPip = 3, HkVolUp = 4, HkVolDown = 5;
+    private const int HkSnapshot = 1, HkMute = 2, HkPip = 3, HkVolUp = 4, HkVolDown = 5, HkStyle = 6;
     private const uint ModAlt = 0x1, ModControl = 0x2, ModShift = 0x4, ModNoRepeat = 0x4000;
     [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
@@ -103,6 +103,8 @@ public sealed partial class MainForm : Form, IMessageFilter
     private int _nativeResOsdTarget = -1;      // the auto decision last announced by the OSD (-1 = none yet)
 
     private ToolStripMenuItem _miAdjust = null!;       // 映像 → 映像の調整...
+    private ToolStripMenuItem _miShadow = null!;       // 映像 → 暗部補正
+    private readonly List<ToolStripMenuItem> _shadowItems = new();
     private ToolStripMenuItem _miLockAspect = null!;
     private ToolStripMenuItem _miBorderless = null!;
     private ToolStripMenuItem _miTopmost = null!;
@@ -302,6 +304,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         BuildMenu();
         BuildStatusBar();
         BuildContextMenu();
+        ApplyMenuFonts();
 
         // Dark chrome: the picture itself is black, and the previous light
         // (system-themed) menu/status bars framed it with bright bands that
@@ -346,8 +349,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         // driven per-item by ShowOsd's onClick — see OsdClick().
         _osd.Click += (_, _) => OsdClick();
 
+        InitAvAuto();
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); AutoProfileTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
         _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
@@ -725,8 +729,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         video.DropDownItems.Add(BuildQualitySubmenu());
         video.DropDownItems.Add(BuildInterpolationItem());
         video.DropDownItems.Add(_miLowLatency);
+        _miStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle());
+        video.DropDownItems.Add(_miStyle);
         video.DropDownItems.Add(new ToolStripSeparator());
         video.DropDownItems.Add(_miAdjust);
+        video.DropDownItems.Add(BuildShadowSubmenu());
         video.DropDownItems.Add(_miCrop);
         video.DropDownItems.Add(BuildRotationSubmenu());
         video.DropDownItems.Add(new ToolStripSeparator());
@@ -849,10 +856,6 @@ public sealed partial class MainForm : Form, IMessageFilter
         };
         _miCheckUpdate = new ToolStripMenuItem(L.T("更新を確認..."), null,
             async (_, _) => await CheckForUpdatesAsync(manual: true));
-        _checkUpdateNormalFont?.Dispose();
-        _checkUpdateBoldFont?.Dispose();
-        _checkUpdateNormalFont = new Font(_menu.Font, FontStyle.Regular);
-        _checkUpdateBoldFont = new Font(_menu.Font, FontStyle.Bold);
         help.DropDownItems.Add(shortcuts);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("テストモード（自動試験）..."), null, (_, _) => ShowTestModeDialog()));
         help.DropDownItems.Add(new ToolStripSeparator());
@@ -1203,6 +1206,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _ctx.Items.Add(BuildInterpolationItem());
         _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
         _ctx.Items.Add(_cmiLowLatency);
+        _cmiStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle());
+        _ctx.Items.Add(_cmiStyle);
         _ctx.Items.Add(new ToolStripSeparator());
 
         _ctx.Items.Add(BuildInfoModeSubmenu());
@@ -1290,6 +1295,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gGlobal, L.T("PiP の切替"), FormatHotkey((Keys)_settings.HotkeyPip));
         Row(gGlobal, L.T("音量を上げる"), FormatHotkey((Keys)_settings.HotkeyVolumeUp));
         Row(gGlobal, L.T("音量を下げる"), FormatHotkey((Keys)_settings.HotkeyVolumeDown));
+        Row(gGlobal, L.T("なめらか ⇔ 低遅延"), FormatHotkey((Keys)_settings.HotkeyStyle));
         if (!_settings.GlobalHotkeys)
             Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です）"));
 
@@ -2329,9 +2335,10 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     /// <summary>Note that something worth persisting changed; the write happens
     /// a few seconds later so a burst of changes costs one save.</summary>
-    private void MarkSettingsDirty()
+    private void MarkSettingsDirty(bool userChange = true)
     {
         if (_skipSaveOnClose) return;   // an update is mid-flight
+        if (userChange) NoteUserChange();
         _settingsSaveTimer.Stop();
         _settingsSaveTimer.Start();
     }
@@ -2771,6 +2778,77 @@ public sealed partial class MainForm : Form, IMessageFilter
         ShowOsd(lang == "en" ? "Language: English" : "言語: 日本語");
     }
 
+    // ---- Menu fonts ------------------------------------------------------
+    // Menus are made of several separately-scaled pieces: the bar is a child of the form, but the context menu and every
+    // drop-down are top-level windows that start at 96 dpi and are rescaled (font included) by WinForms when they are
+    // first shown on a monitor with another scaling. Left to inheritance, bar, drop-downs and single items (the update
+    // item has a font of its own) end up with fonts made for different scalings. So one font per scaling is set on every
+    // strip, drop-down and item, always from the DeviceDpi of the window that is going to show it; and each drop-down
+    // checks itself again once it is open, after WinForms has done its own rescaling.
+
+    private const float MenuBasePt = 9f;
+    private readonly Dictionary<(int dpi, bool bold), Font> _menuFonts = new();
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<ToolStripMenuItem, object> _fontHooked = new();
+
+    internal Font MenuFont(int dpi, bool bold = false)
+    {
+        dpi = Math.Max(96, dpi);
+        if (!_menuFonts.TryGetValue((dpi, bold), out Font? f))
+            _menuFonts[(dpi, bold)] = f = new Font("Segoe UI", MenuBasePt * dpi / 96f,
+                bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+        return f;
+    }
+
+    private void ApplyMenuFonts()
+    {
+        _menu.Font = MenuFont(_menu.DeviceDpi);
+        ApplyFontTree(_menu.Items, _menu.DeviceDpi);
+        _ctx.Font = MenuFont(_ctx.DeviceDpi);
+        ApplyFontTree(_ctx.Items, _ctx.DeviceDpi);
+        _ctx.Opened -= OnCtxFontOpened;
+        _ctx.Opened += OnCtxFontOpened;
+
+        _checkUpdateNormalFont = MenuFont(_menu.DeviceDpi);
+        _checkUpdateBoldFont = MenuFont(_menu.DeviceDpi, true);
+        if (_miCheckUpdate != null) _miCheckUpdate.Font = _pendingUpdate != null ? _checkUpdateBoldFont : _checkUpdateNormalFont;
+    }
+
+    private void OnCtxFontOpened(object? sender, EventArgs e) => FixDropDownFont(_ctx);
+
+    /// <summary>Items of one strip/drop-down get the font for <paramref name="dpi"/>; the update item keeps its bold when an update is pending.</summary>
+    private void ApplyFontTree(ToolStripItemCollection items, int dpi)
+    {
+        foreach (ToolStripItem i in items)
+        {
+            i.Font = i == _miCheckUpdate ? MenuFont(dpi, _pendingUpdate != null) : MenuFont(dpi);
+            if (i is ToolStripMenuItem m)
+            {
+                m.DropDown.Font = MenuFont(dpi);
+                if (!_fontHooked.TryGetValue(m, out _))
+                {
+                    _fontHooked.Add(m, this);
+                    // before it opens: sub-menus built just now (device lists, profiles); after: undo WinForms' own rescaling
+                    m.DropDownOpening += (_, _) => { m.DropDown.Font = MenuFont(m.DropDown.DeviceDpi); ApplyFontTree(m.DropDownItems, m.DropDown.DeviceDpi); };
+                    m.DropDownOpened += (_, _) => FixDropDownFont(m.DropDown);
+                }
+                if (m.HasDropDownItems) ApplyFontTree(m.DropDownItems, dpi);
+            }
+        }
+    }
+
+    /// <summary>The drop-down is open and has its final scaling: make its font and its items' the one for that scaling.</summary>
+    private void FixDropDownFont(ToolStripDropDown dd)
+    {
+        int dpi = dd.DeviceDpi;
+        bool wrong = Math.Abs(dd.Font.SizeInPoints - MenuFont(dpi).SizeInPoints) > 0.05f;
+        foreach (ToolStripItem i in dd.Items)
+            if (Math.Abs(i.Font.SizeInPoints - MenuFont(dpi).SizeInPoints) > 0.05f) { wrong = true; break; }
+        if (!wrong) return;
+        Log.Info($"menu font: {dd.Font.SizeInPoints:0.#}pt at {dpi} dpi - set to {MenuFont(dpi).SizeInPoints:0.#}pt");
+        dd.Font = MenuFont(dpi);
+        ApplyFontTree(dd.Items, dpi);
+    }
+
     /// <summary>Discard and re-create every menu so new-language text is used.</summary>
     private void RebuildMenus(int dpi = 0)
     {
@@ -2799,6 +2877,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         BuildMenu();
         BuildContextMenu(dpi);
+        ApplyMenuFonts();
         MainMenuStrip = _menu;
         _menu.Visible = menuWasVisible;
 
@@ -2896,7 +2975,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private VideoAdjustments CurrentAdjustments() => new(
         _settings.AdjBrightness / 100f, _settings.AdjContrast / 100f,
-        _settings.AdjSaturation / 100f, _settings.AdjGamma / 100f);
+        _settings.AdjSaturation / 100f, _settings.AdjGamma / 100f, _settings.ShadowBoost);
 
     /// <summary>One signed offset drives two engines: positive delays the audio; negative
     /// cannot make audio earlier (it already plays at the smallest delay its buffer allows),
@@ -2906,9 +2985,22 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         try
         {
-            int off = _settings.AvOffsetMs;
-            _audio.ExtraDelayMs = Math.Max(0, off);
-            _video.VideoDelayMs = _video.SupportsVideoDelay ? Math.Max(0, -off) : 0;
+            if (_settings.AvAuto)
+            {
+                // automatic: the engines work the change off in small steps (see MainForm.AvAuto.cs)
+                int tgt = AvTotalTarget();
+                _audio.SetExtraDelaySlewed(Math.Max(0, tgt));
+                _avVideoTarget = _video.SupportsVideoDelay ? Math.Max(0, -tgt) : 0;
+                if (!_video.SupportsVideoDelay) _avVideoCur = 0;
+                _video.VideoDelayMs = _avVideoCur;   // a fresh engine starts at 0: put the delay in force back
+            }
+            else
+            {
+                int off = _settings.AvOffsetMs;
+                _audio.ExtraDelayMs = Math.Max(0, off);
+                _avVideoCur = _avVideoTarget = _video.SupportsVideoDelay ? Math.Max(0, -off) : 0;
+                _video.VideoDelayMs = _avVideoCur;
+            }
         }
         catch (Exception ex)
         {
@@ -2924,8 +3016,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Remembered so キャンセル can put back exactly what was there; the sliders apply live.
         (int b0, int c0, int s0, int g0) = (_settings.AdjBrightness, _settings.AdjContrast,
             _settings.AdjSaturation, _settings.AdjGamma);
+        int sh0 = _settings.ShadowBoost;
 
-        using var dlg = Ui.NewDialog(L.T("映像の調整"), 440, 262);
+        using var dlg = Ui.NewDialog(L.T("映像の調整"), 440, 312);
         const int trackX = 96, trackW = 252, valueX = 356;
 
         TrackBar AddRow(string name, int y, int min, int max, int value, int tick,
@@ -2959,20 +3052,53 @@ public sealed partial class MainForm : Form, IMessageFilter
         TrackBar tg = AddRow(L.T("ガンマ"), 154, 50, 200, g0, 25,
             v => (v / 100.0).ToString("0.00"), v => _settings.AdjGamma = v);
 
+        TrackBar tsh = AddRow(L.T("暗部補正"), 200, 0, VideoAdjustments.MaxShadow, sh0, 1,
+            ShadowLevelText, v => _settings.ShadowBoost = v);
+
         var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
-        reset.Click += (_, _) => { tb.Value = 0; tc.Value = 100; ts.Value = 100; tg.Value = 100; };
+        reset.Click += (_, _) => { tb.Value = 0; tc.Value = 100; ts.Value = 100; tg.Value = 100; tsh.Value = 0; };
         dlg.Controls.Add(reset);
         Ui.AddOkCancel(dlg);
 
         if (dlg.ShowDialog(this) != DialogResult.OK)
         {
             (_settings.AdjBrightness, _settings.AdjContrast, _settings.AdjSaturation, _settings.AdjGamma) = (b0, c0, s0, g0);
+            _settings.ShadowBoost = sh0;
             ApplyRenderOptions();
             UpdateStatus();
             return;
         }
         MarkSettingsDirty();
         UpdateStatus();
+    }
+
+    private static string ShadowLevelText(int level) => level switch
+    {
+        1 => L.T("弱"), 2 => L.T("中"), 3 => L.T("強"), _ => L.T("オフ"),
+    };
+
+    private ToolStripMenuItem BuildShadowSubmenu()
+    {
+        _miShadow = new ToolStripMenuItem(L.T("暗部補正"));
+        for (int level = 0; level <= VideoAdjustments.MaxShadow; level++)
+        {
+            int lv = level;
+            var item = new ToolStripMenuItem(ShadowLevelText(lv), null, (_, _) => SetShadowBoost(lv)) { Tag = lv };
+            _shadowItems.Add(item);
+            _miShadow.DropDownItems.Add(item);
+        }
+        return _miShadow;
+    }
+
+    private void SetShadowBoost(int level)
+    {
+        if (!_video.SupportsAdjustments) return;
+        _settings.ShadowBoost = Math.Clamp(level, 0, VideoAdjustments.MaxShadow);
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        UpdateStatus();
+        ShowOsd(L.F("暗部補正: {0}", ShadowLevelText(_settings.ShadowBoost)));
     }
 
     // ---- 音ズレ補正 -------------------------------------------------------
@@ -2988,54 +3114,94 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowAvSyncDialog()
     {
-        int before = _settings.AvOffsetMs;   // キャンセル puts this back
+        int before = _settings.AvOffsetMs;   // キャンセル puts these back
+        bool autoBefore = _settings.AvAuto;
+        double autoMsBefore = _avCtl.AutoMs;
+        // The slider is the manual offset, or (自動) the trim; each keeps its own value while the box is toggled.
+        int manualVal = autoBefore ? 0 : before, trimVal = autoBefore ? before : 0;
 
-        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440, 408);
+        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440, 520);
         int w = dlg.ClientSize.Width;
         int inner = w - 2 * Ui.Pad;
 
-        var left = Ui.Label(L.T("音声を早める"), Ui.Pad, 16);
-        var right = Ui.Label(L.T("音声を遅らせる"), 0, 16);
+        var chkAuto = new CheckBox
+        {
+            Text = L.T("自動で合わせる"), AutoSize = false, Checked = autoBefore,
+            Location = new Point(Ui.Pad, 12), Size = new Size(inner, 24),
+            Enabled = _video.SupportsVideoDelay || autoBefore,
+        };
+        var autoHint = Ui.Hint(L.T("映像と音の遅れの差を測り、少しずつ自動で合わせ続けます。テレビやスピーカーの中の遅れは測れないので、下の微調整で足してください。"),
+            Ui.Pad, 40, inner);
+
+        var left = Ui.Label(L.T("音声を早める"), Ui.Pad, 96);
+        var right = Ui.Label(L.T("音声を遅らせる"), 0, 96);
         right.Left = w - Ui.Pad - right.PreferredWidth;
 
         var track = new TrackBar
         {
             Minimum = -300, Maximum = 300, Value = Math.Clamp(before, -300, 300),
             TickFrequency = 50, SmallChange = 10, LargeChange = 50,
-            Location = new Point(Ui.Pad, 38), Size = new Size(inner, 45),
+            Location = new Point(Ui.Pad, 118), Size = new Size(inner, 45),
         };
         var value = new Label
         {
             AutoSize = false, TextAlign = ContentAlignment.MiddleCenter,
-            Location = new Point(Ui.Pad, 88), Size = new Size(inner, 24),
-            Font = new Font(dlg.Font, FontStyle.Bold), Text = AvOffsetText(track.Value),
+            Location = new Point(Ui.Pad, 166), Size = new Size(inner, 24),
+            Font = new Font(dlg.Font, FontStyle.Bold),
+        };
+        // What is in force right now (and, with 自動, how the automatic part is doing).
+        var current = new Label
+        {
+            AutoSize = false, Location = new Point(Ui.Pad, 196), Size = new Size(inner, 62),
         };
         var hint = Ui.Hint(L.T("映像の動きと音が合う位置にしてください。手をたたく動画などで合わせると分かりやすいです。"),
-            Ui.Pad, 122, inner);
+            Ui.Pad, 262, inner);
         // Live numbers: how long picture and sound take inside YuCap / Windows (offset included).
         var live = new Label
         {
-            AutoSize = false, Location = new Point(Ui.Pad, 170), Size = new Size(inner, 44),
+            AutoSize = false, Location = new Point(Ui.Pad, 312), Size = new Size(inner, 44),
             Font = new Font(dlg.Font, FontStyle.Bold),
         };
         var liveHint = Ui.Hint(L.T("キャプチャーボードやテレビの中の遅れは含みません。目安として使ってください。"),
-            Ui.Pad, 218, inner);
-        var match = Ui.Button(L.T("目安に合わせる"), Ui.Pad, 258, 140);
+            Ui.Pad, 360, inner);
+        var match = Ui.Button(L.T("目安に合わせる"), Ui.Pad, 402, 140);
         long matchedTick = 0;
         var mfHint = Ui.Hint(L.T("音声を早める補正は Direct3D 描画のときに使えます。標準の描画では 0 として扱います。"),
-            Ui.Pad, 300, inner);
-        mfHint.Visible = !_video.SupportsVideoDelay && track.Value < 0;
+            Ui.Pad, 440, inner);
 
         bool snapping = false;
+        void ShowMode()
+        {
+            bool auto = chkAuto.Checked;
+            value.Text = auto ? L.F("微調整: {0} ms", AvSigned(track.Value)) : AvOffsetText(track.Value);
+            match.Visible = !auto;
+            mfHint.Visible = !_video.SupportsVideoDelay && track.Value < 0 && !auto;
+        }
+        void UpdateCurrent()
+        {
+            current.Text = AvCorrectionText() + (_settings.AvAuto ? Environment.NewLine + AvAutoStatusText() : string.Empty);
+        }
+
         track.ValueChanged += (_, _) =>
         {
             if (snapping) return;
             int v = (int)Math.Round(track.Value / 10.0) * 10;   // the track is free, the offset moves in 10 ms steps
             if (v != track.Value) { snapping = true; track.Value = v; snapping = false; }
-            value.Text = AvOffsetText(v);
-            mfHint.Visible = !_video.SupportsVideoDelay && v < 0;
             _settings.AvOffsetMs = v;
-            ApplyAvSync();   // live: the sound / picture shifts while you drag
+            if (chkAuto.Checked) trimVal = v; else manualVal = v;
+            ShowMode();
+            if (_settings.AvAuto) AvAutoChanged(false); else ApplyAvSync();   // live: the sound / picture shifts while you drag
+            UpdateCurrent();
+        };
+        chkAuto.CheckedChanged += (_, _) =>
+        {
+            bool auto = chkAuto.Checked;
+            snapping = true; track.Value = Math.Clamp(auto ? trimVal : manualVal, track.Minimum, track.Maximum); snapping = false;
+            _settings.AvOffsetMs = track.Value;
+            _settings.AvAuto = auto;
+            AvAutoChanged(true);
+            ShowMode();
+            UpdateCurrent();
         };
 
         var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
@@ -3058,9 +3224,10 @@ public sealed partial class MainForm : Form, IMessageFilter
                 : Math.Abs(d) < 10 ? L.T("→ 映像と音は、ほぼ揃っています")
                 : d > 0 ? L.F("→ 音が {0:0} ms 遅れています", d)
                 : L.F("→ 映像が {0:0} ms 遅れています", -d);
-            live.Text = line + "\n" + verdict;
+            live.Text = line + Environment.NewLine + verdict;
             bool settling = matchedTick != 0 && Environment.TickCount64 - matchedTick < 2500;   // the numbers still show the old offset
             match.Enabled = known && !settling;
+            UpdateCurrent();
         }
         match.Click += (_, _) =>
         {
@@ -3075,20 +3242,25 @@ public sealed partial class MainForm : Form, IMessageFilter
         var timer = new System.Windows.Forms.Timer { Interval = 250 };
         timer.Tick += (_, _) => UpdateLive();
         dlg.FormClosed += (_, _) => timer.Dispose();
+        ShowMode();
         UpdateLive();
         timer.Start();
 
-        dlg.Controls.AddRange(new Control[] { left, right, track, value, hint, live, liveHint, match, mfHint, reset });
+        dlg.Controls.AddRange(new Control[] { chkAuto, autoHint, left, right, track, value, current, hint, live, liveHint, match, mfHint, reset });
         Ui.AddOkCancel(dlg);
 
         if (dlg.ShowDialog(this) != DialogResult.OK)
         {
             _settings.AvOffsetMs = before;
+            _settings.AvAuto = autoBefore;
+            if (autoBefore) _avCtl.SetAuto(autoMsBefore); else _avCtl.SetAuto(0);
             ApplyAvSync();
+            UpdateStatus();
             return;
         }
         MarkSettingsDirty();
-        ShowOsd(AvOffsetText(_settings.AvOffsetMs));
+        UpdateStatus();
+        ShowOsd(_settings.AvAuto ? L.T("音ズレ 自動") : AvOffsetText(_settings.AvOffsetMs));
     }
 
     private void SetScalingQuality(string quality)
@@ -4123,6 +4295,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 case HkPip: TogglePip(); break;
                 case HkVolUp: NudgeVolume(+VolumeStep); break;
                 case HkVolDown: NudgeVolume(-VolumeStep); break;
+                case HkStyle: ToggleStyle(); break;
             }
             return;
         }
@@ -4311,6 +4484,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_video.SupportsAdjustments && !CurrentAdjustments().IsNeutral) stateParts.Add(L.T("色調整"));
         if (_video.SupportsCrop && HasCrop()) stateParts.Add(L.T("切り取り"));
         if (_video.SupportsLowLatency && _settings.LowLatency) stateParts.Add(L.T("低遅延"));
+        if (_settings.AvAuto) stateParts.Add(L.T("音ズレ 自動"));
         _lblState.Text = string.Join("  ", stateParts);
         _lblState.Visible = stateParts.Count > 0;
 
@@ -4333,6 +4507,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         _miAdjust.Enabled = _video.SupportsAdjustments;
         _miAdjust.ToolTipText = _video.SupportsAdjustments
             ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
+        _miShadow.Enabled = _video.SupportsAdjustments;
+        _miShadow.ToolTipText = _video.SupportsAdjustments
+            ? L.T("暗い場面の暗い部分だけを持ち上げます。明るい部分と真っ黒はそのままです。")
+            : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
+        foreach (var it in _shadowItems) it.Checked = (int)it.Tag! == _settings.ShadowBoost;
 
         _miCrop.Enabled = _video.SupportsCrop;
         _miCrop.ToolTipText = _video.SupportsCrop
@@ -4352,6 +4531,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cmiLowLatency.Enabled = _miLowLatency.Enabled;
         _cmiLowLatency.Checked = _miLowLatency.Checked;
         _cmiLowLatency.ToolTipText = _miLowLatency.ToolTipText;
+        UpdateStyleItems();
         _miLockAspect.Checked = _lockAspect;
         _miBorderless.Checked = _isBorderless;
         _cmiBorderless.Checked = _isBorderless;
@@ -4443,6 +4623,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (keyData == (Keys)_settings.HotkeyPip) { TogglePip(); return true; }
             if (keyData == (Keys)_settings.HotkeyVolumeUp) { NudgeVolume(+VolumeStep); return true; }
             if (keyData == (Keys)_settings.HotkeyVolumeDown) { NudgeVolume(-VolumeStep); return true; }
+            if (keyData == (Keys)_settings.HotkeyStyle) { ToggleStyle(); return true; }
         }
 
         // Bit 30 of lParam ("previous key state") is set on every WM_KEYDOWN
@@ -4758,6 +4939,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 LatencyText(_video.IsRunning ? _video.VideoLatencyMs : 0, _video.VideoLatencyEstimated),
                 LatencyText(_audio.IsRunning ? _audio.LatencyMs : 0, false)),
             L.T("色調整") + ": " + color,
+            L.T("音ズレ補正") + ": " + AvInfoText(),
             L.T("補間") + ": " + (InterpMetric(out _) ?? InterpolationInfoText()),
             L.T("元の細かさ") + ": " + NativeResInfoText(),
             L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
@@ -4773,6 +4955,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _audio.Dispose();
             _osdTimer.Dispose();
             _uiTimer.Dispose();
+            _avTimer.Dispose();
             _fpsTimer.Dispose();
             _devTimer.Dispose();
             _burstTimer.Dispose();

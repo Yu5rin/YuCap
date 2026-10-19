@@ -118,6 +118,76 @@ public sealed class AudioEngine : IDisposable
     public const int MaxExtraDelayMs = 300;
 
     private int _extraDelayMs;
+    // Slewed A/V-sync changes (see SetExtraDelaySlewed): the delay really in force follows the target packet by packet.
+    private readonly object _slewGate = new();
+    private double _extraEffMs;       // delay in force right now (ms); equals _extraDelayMs when no slew is pending
+    private long _slewFrames;         // frames still to add (+) or remove (-) to reach _extraDelayMs
+    private int _slewRate = 48000;    // capture sample rate the pending frames are counted in
+    private long _slewStepsTotal;     // packets that had frames added / removed (diagnostics)
+
+    /// <summary>Delay change that is still being worked off (ms, signed: + = more delay to come); 0 when settled.</summary>
+    public double SlewPendingMs { get { lock (_slewGate) return _slewFrames * 1000.0 / Math.Max(1, _slewRate); } }
+
+    /// <summary>
+    /// Like <see cref="ExtraDelayMs"/> but without a splice: the change is worked off in the capture path by
+    /// repeating (more delay) or skipping (less delay) a single frame every ~64 frames, i.e. a resampling by at most
+    /// 1.5 % until the target is reached, instead of one block of silence or a cut-out piece of sound.
+    /// <see cref="ExtraDelayMs"/> returns the target at once; <see cref="SlewPendingMs"/> says how much is left.
+    /// </summary>
+    public void SetExtraDelaySlewed(int ms)
+    {
+        int v = Math.Clamp(ms, 0, MaxExtraDelayMs);
+        lock (_slewGate)
+        {
+            var buffer = _buffer;
+            Volatile.Write(ref _extraDelayMs, v);
+            if (buffer == null) { _extraEffMs = v; _slewFrames = 0; return; }
+            _slewRate = Math.Max(1, buffer.WaveFormat.SampleRate);
+            _slewFrames = (long)Math.Round((v - _extraEffMs) * _slewRate / 1000.0);
+            if (_slewFrames == 0) _extraEffMs = v;
+        }
+    }
+
+    /// <summary>Delay (ms) that the buffer logic is holding right now (the target once a slew has finished).</summary>
+    public double ExtraDelayInForceMs { get { lock (_slewGate) return _extraEffMs; } }
+
+    /// <summary>Capture thread: repeat / skip single frames of this packet for a pending slew. Returns the data to queue.</summary>
+    private byte[] ApplySlew(byte[] src, ref int len, WaveFormat wf)
+    {
+        int block = wf.BlockAlign;
+        int frames = block > 0 ? len / block : 0;
+        int n;
+        bool add;
+        lock (_slewGate)
+        {
+            if (_slewFrames == 0 || frames < 128) return src;
+            add = _slewFrames > 0;
+            n = (int)Math.Min(Math.Abs(_slewFrames), Math.Max(1, frames / 64));
+            _slewFrames += add ? -n : n;
+            _extraEffMs += (add ? n : -n) * 1000.0 / Math.Max(1, _slewRate);
+            if (_slewFrames == 0) _extraEffMs = _extraDelayMs;
+            _slewStepsTotal++;
+        }
+        int seg = frames / (n + 1);
+        var dst = new byte[len + (add ? n * block : 0)];
+        int sp = 0, dp = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int copyFrames = add ? seg : seg - 1;
+            Buffer.BlockCopy(src, sp, dst, dp, copyFrames * block);
+            dp += copyFrames * block;
+            if (add)
+            {
+                Buffer.BlockCopy(src, sp + (seg - 1) * block, dst, dp, block);   // the last frame of the segment, once more
+                dp += block;
+            }
+            sp += seg * block;
+        }
+        Buffer.BlockCopy(src, sp, dst, dp, len - sp);
+        dp += len - sp;
+        len = dp;
+        return dst;
+    }
 
     /// <summary>
     /// Deliberate extra audio delay (A/V sync: "play the sound later"), 0..<see cref="MaxExtraDelayMs"/>.
@@ -132,8 +202,16 @@ public sealed class AudioEngine : IDisposable
         set
         {
             int v = Math.Clamp(value, 0, MaxExtraDelayMs);
-            int old = Interlocked.Exchange(ref _extraDelayMs, v);
-            if (v != old) ShiftBacklog(v - old);
+            int shift;
+            lock (_slewGate)
+            {
+                // An immediate set also ends a pending slew: the splice below is the whole difference to what is in force.
+                shift = v - (int)Math.Round(_extraEffMs);
+                Volatile.Write(ref _extraDelayMs, v);
+                _extraEffMs = v;
+                _slewFrames = 0;
+            }
+            if (shift != 0) ShiftBacklog(shift);
         }
     }
 
@@ -414,6 +492,7 @@ public sealed class AudioEngine : IDisposable
             RenderFellBack = fellBack;
             RenderDeviceName = renderDevice.FriendlyName;
             _lastPacketTick = 0; _packetMs = 10; _latencyEma = 0; _backlogEma = 0; _gotData = false; Volatile.Write(ref _latencyTick, 0);
+            lock (_slewGate) { _extraEffMs = _extraDelayMs; _slewFrames = 0; _slewRate = Math.Max(1, capture.WaveFormat.SampleRate); }
             _output = output;
             _captureDevice = captureDevice;
             _renderDevice = renderDevice;
@@ -487,7 +566,7 @@ public sealed class AudioEngine : IDisposable
         // you can hear. Trim early, and only the excess (oldest samples) —
         // ClearBuffer() would leave a whole buffer of silence instead.
         // The A/V-sync delay is part of that target, so it is held, not trimmed away.
-        double extra = ExtraDelayMs;
+        double extra = ExtraDelayInForceMs;
         double target = Math.Max(MinBufferMs, BufferMilliseconds) + extra;
         double buffered = buffer.BufferedDuration.TotalMilliseconds;
         // Hysteresis so normal jitter doesn't cause constant micro-trims.
@@ -518,7 +597,11 @@ public sealed class AudioEngine : IDisposable
         }
         _gotData = true;
 
-        buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
+        byte[] data = e.Buffer;
+        int dataLen = e.BytesRecorded;
+        try { data = ApplySlew(data, ref dataLen, buffer.WaveFormat); }
+        catch { data = e.Buffer; dataLen = e.BytesRecorded; }
+        buffer.AddSamples(data, 0, dataLen);
     }
 
     /// <summary>Volume as a percentage. Above 100% is software gain; the soft

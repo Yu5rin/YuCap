@@ -43,6 +43,8 @@ public sealed partial class MainForm
             AdjSaturation = _settings.AdjSaturation,
             AdjGamma = _settings.AdjGamma,
             AvOffsetMs = _settings.AvOffsetMs,
+            AvAuto = _settings.AvAuto,
+            ShadowBoost = _settings.ShadowBoost,
             CropLeft = _settings.CropLeft,
             CropTop = _settings.CropTop,
             CropRight = _settings.CropRight,
@@ -119,6 +121,8 @@ public sealed partial class MainForm
                 (_, _) => OverwriteActiveProfile()));
         items.Add(new ToolStripMenuItem(L.T("名前を変更..."), null, (_, _) => RenameActiveProfile()) { Enabled = active != null });
         items.Add(new ToolStripMenuItem(L.T("削除..."), null, (_, _) => DeleteActiveProfile()) { Enabled = active != null });
+        items.Add(new ToolStripSeparator());
+        items.Add(BuildAutoProfileMenu());
     }
 
     /// <summary>Ctrl+1 .. Ctrl+9 (also on the number pad) as a zero-based profile index.</summary>
@@ -157,6 +161,8 @@ public sealed partial class MainForm
         _settings.AdjSaturation = p.AdjSaturation;
         _settings.AdjGamma = p.AdjGamma;
         _settings.AvOffsetMs = p.AvOffsetMs;
+        _settings.AvAuto = p.AvAuto;
+        _settings.ShadowBoost = p.ShadowBoost;
         _settings.CropLeft = p.CropLeft;
         _settings.CropTop = p.CropTop;
         _settings.CropRight = p.CropRight;
@@ -168,17 +174,18 @@ public sealed partial class MainForm
         _cliMode = null;   // an explicit choice overrides the --mode switch, as for a menu pick
     }
 
-    private async void ApplyProfile(VideoProfile profile)
+    private async void ApplyProfile(VideoProfile profile, bool auto = false)
     {
         if (_engineSwapping) return;
         _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
-        try { await ApplyProfileCoreAsync(profile); }
+        try { await ApplyProfileCoreAsync(profile, auto); }
         catch (Exception ex) { Log.Info("ApplyProfile: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private async Task ApplyProfileCoreAsync(VideoProfile profile)
+    private async Task ApplyProfileCoreAsync(VideoProfile profile, bool auto = false)
     {
+        NoteUserChange();   // the automatic switch waits for things to be quiet again
         VideoProfile before = CaptureProfile(string.Empty);   // to go back to if the new one cannot start
         bool rendererDiffers = profile.Renderer != _settings.Renderer;
         bool modeDiffers = profile.ToMode() != _savedMode;
@@ -231,6 +238,7 @@ public sealed partial class MainForm
         SaveSettings();
         ShowOsd(failed
             ? L.T("プロファイルを適用できなかったため、元の設定に戻しました")
+            : auto ? L.F("入力に合わせてプロファイルを切り替えました: {0}", profile.Name)
             : L.F("プロファイル: {0}", profile.Name), failed ? OsdLongMilliseconds : null);
     }
 
@@ -239,7 +247,9 @@ public sealed partial class MainForm
         if (Profiles.Count >= AppSettings.MaxProfiles) return;
         string? name = AskProfileName(L.T("新しいプロファイル"), string.Empty, null);
         if (name == null) return;
-        Profiles.Add(CaptureProfile(name));
+        VideoProfile created = CaptureProfile(name);
+        created.Signature = SignatureForSave(null);
+        Profiles.Add(created);
         _settings.ActiveProfile = name;
         FinishProfileEdit(L.F("プロファイルを保存しました: {0}", name));
     }
@@ -249,7 +259,9 @@ public sealed partial class MainForm
         VideoProfile? active = FindActiveProfile();
         if (active == null) return;
         int i = Profiles.IndexOf(active);
-        Profiles[i] = CaptureProfile(active.Name);
+        VideoProfile updated = CaptureProfile(active.Name);
+        updated.Signature = SignatureForSave(active.Signature);
+        Profiles[i] = updated;
         FinishProfileEdit(L.F("プロファイルを上書きしました: {0}", active.Name));
     }
 
@@ -278,6 +290,7 @@ public sealed partial class MainForm
 
     private void FinishProfileEdit(string osd)
     {
+        NoteUserChange();
         UpdateChecks();
         UpdateStatus();
         SaveSettings();
@@ -517,37 +530,9 @@ public sealed partial class MainForm
     private async Task ToggleLowLatencyCoreAsync()
     {
         if (!_video.SupportsLowLatency) return;
+        NoteUserChange();
         bool on = !_settings.LowLatency;
-        if (_frozen) ToggleFreeze();
-        _settings.LowLatency = on;
-
-        if (_currentVideoInfo != null)
-        {
-            Exception? failure = await ReplaceEngineAsync(_settings.Renderer);
-            if (failure != null)
-            {
-                string reason = Errors.Describe(failure);
-                _settings.LowLatency = !on;
-                Exception? back = await ReplaceEngineAsync(_settings.Renderer);
-                _videoError = back != null ? Errors.Describe(back) : null;
-                LayoutCanvas();
-                UpdateChecks();
-                UpdateStatus();
-                MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                ShowOsd(L.T("低遅延モードを切り替えられなかったため、元に戻しました"), OsdLongMilliseconds);
-                return;
-            }
-            _videoError = null;
-        }
-        else
-        {
-            ApplyRenderOptions();
-        }
-
-        LayoutCanvas();
-        UpdateChecks();
-        UpdateStatus();
-        SaveSettings();
-        ShowOsd(on ? L.T("低遅延モード: オン") : L.T("低遅延モード: オフ"));
+        if (await SetLowLatencyAsync(on))   // shared with the style switch (MainForm.Style.cs)
+            ShowOsd(on ? L.T("低遅延モード: オン") : L.T("低遅延モード: オフ"));
     }
 }
