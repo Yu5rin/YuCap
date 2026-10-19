@@ -74,8 +74,14 @@ public sealed partial class MainForm
     /// <summary>Rebuild the dropdown: the profiles as radio items, then the management commands.</summary>
     private void UpdateProfileMenu()
     {
-        if (_miProfiles == null) return;
-        var items = _miProfiles.DropDownItems;
+        FillProfileMenu(_miProfiles);
+        FillProfileMenu(_cmiProfiles);
+    }
+
+    private void FillProfileMenu(ToolStripMenuItem? root)
+    {
+        if (root == null) return;
+        var items = root.DropDownItems;
         items.Clear();   // not disposed: a profile click can be what triggered this rebuild
 
         VideoProfile? active = FindActiveProfile();

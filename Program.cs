@@ -89,6 +89,15 @@ internal static partial class Program
             return;
         }
 
+        // Diagnostic mode: dump the menu bar and the context menu (both languages) as a tree.
+        if (args.Length > 0 && args[0] == "--dump-menus")
+        {
+            string menuOut = args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_menus.txt");
+            using var menuForm = new MainForm();
+            File.WriteAllText(menuOut, menuForm.DumpMenus(), new System.Text.UTF8Encoding(true));
+            return;
+        }
+
         // Update check as a one-shot, for verifying the endpoint and parsing
         // without needing an actual newer release to exist.
         if (args.Length > 0 && args[0] == "--check-update")

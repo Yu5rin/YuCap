@@ -29,6 +29,8 @@ public sealed class AppSettings
     public bool FullscreenStatusVisible { get; set; }
     /// <summary>The info overlay (Ctrl+Shift+I), shared by windowed and fullscreen as it always was. Off by default.</summary>
     public bool InfoVisible { get; set; }
+    /// <summary>情報表示: "off" | "fps" (a small FPS counter) | "full" (all lines). null = a file written by an older version; taken from <see cref="InfoVisible"/> by Normalize.</summary>
+    public string? InfoMode { get; set; }
     public int Volume { get; set; } = 100;
     public int AudioBufferMs { get; set; } = AudioEngine.DefaultBufferMs;
     /// <summary>0 = written before the audio path was rebuilt (v1.9); the old defaults of the buffer (120 / 200 ms) then mean "never changed" and move to the new default once.</summary>
@@ -44,7 +46,7 @@ public sealed class AppSettings
 
     // Renderer. "mf" is the proven Media Foundation preview and stays the default;
     // "d3d" is our own Direct3D 11 swap chain, which is what makes FSR upscaling
-    // possible. It is opt-in (オプション → 描画方式) until verified on a 4K monitor.
+    // possible. It is opt-in (映像 → 描画方式) until verified on a 4K monitor.
     public string Renderer { get; set; } = "mf";            // "mf" | "d3d"
     public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" | "anime4k" (d3d only)
     public int FsrSharpness { get; set; } = 50;              // 0..100 (d3d + fsr only)
@@ -176,6 +178,7 @@ public sealed class AppSettings
     public void Normalize()
     {
         DisplayMode = Math.Clamp(DisplayMode, 0, 3);
+        InfoMode = InfoMode is "off" or "fps" or "full" ? InfoMode : (InfoVisible ? "full" : "off");
         Volume = Math.Clamp(Volume, 0, 500);
         if (AudioSettingsVersion < 1)
         {

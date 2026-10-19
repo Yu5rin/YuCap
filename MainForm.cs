@@ -63,7 +63,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private readonly VideoBox _canvas = new();
     private readonly OsdOverlay _osd = new();
-    private readonly InfoOverlay _info = new();   // Ctrl+Shift+I testing aid, never persisted
+    private readonly InfoOverlay _info = new();   // Ctrl+Shift+I: 情報表示 (off / FPS だけ / 詳しく)
     private bool _compareHeld;                      // Q held: FSR temporarily swapped for Standard
     private readonly MenuStrip _menu = new();
     private readonly StatusStrip _status = new();
@@ -75,6 +75,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly ContextMenuStrip _ctx = new();
     private readonly System.Windows.Forms.Timer _osdTimer = new();
     private readonly System.Windows.Forms.Timer _uiTimer = new();
+    private readonly System.Windows.Forms.Timer _fpsTimer = new() { Interval = 250 };   // FPS だけ: ~4 updates a second
     private readonly System.Windows.Forms.Timer _devTimer = new(); // WM_DEVICECHANGE debounce
     private readonly System.Windows.Forms.Timer _resumeTimer = new(); // post-resume engine restart
     // One-shot: fires almost immediately after the window is shown, so device
@@ -86,7 +87,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly List<ToolStripMenuItem> _aspectItems = new();
     private readonly List<ToolStripMenuItem> _rotationItems = new();
     private readonly List<ToolStripMenuItem> _rendererItems = new();
-    // The quality menu exists twice (View menu + context menu), so everything
+    // The quality menu exists twice (Video menu + context menu), so everything
     // that must follow its state is kept in lists.
     private readonly List<ToolStripMenuItem> _qualityRoots = new();
     private readonly List<ToolStripMenuItem> _qualityItems = new();
@@ -95,7 +96,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly List<ToolStripMenuItem> _nativeResItems = new();
     private int _nativeResOsdTarget = -1;      // the auto decision last announced by the OSD (-1 = none yet)
 
-    private ToolStripMenuItem _miAdjust = null!;       // 表示 → 映像の調整...
+    private ToolStripMenuItem _miAdjust = null!;       // 映像 → 映像の調整...
     private ToolStripMenuItem _miLockAspect = null!;
     private ToolStripMenuItem _miBorderless = null!;
     private ToolStripMenuItem _miTopmost = null!;
@@ -109,6 +110,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _cmiFreeze = null!;
     private ToolStripMenuItem _miPip = null!;
     private ToolStripMenuItem _cmiPip = null!;
+    private ToolStripMenuItem _cmiProfiles = null!;
     private ToolStripMenuItem _miClickThrough = null!;
     private ToolStripMenuItem _miHotkeys = null!;
     private ToolStripMenuItem _miStartup = null!;
@@ -124,6 +126,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miRestoreLevel = null!;
     private readonly List<ToolStripMenuItem> _cursorSecItems = new();
     private readonly List<ToolStripMenuItem> _textSizeItems = new();
+    private readonly List<ToolStripMenuItem> _infoModeItems = new();
     private readonly List<ToolStripMenuItem> _pipIdleItems = new();
     private readonly List<ToolStripMenuItem> _pipHoverItems = new();
     private readonly List<ToolStripMenuItem> _pipSizeItems = new();
@@ -334,7 +337,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _osd.Click += (_, _) => OsdClick();
 
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); CheckNativeResChange(); if (_info.Showing) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); CheckNativeResChange(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
         _devTimer.Interval = 900;
@@ -674,7 +678,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         file.DropDownItems.Add(new ToolStripSeparator());
         file.DropDownItems.Add(exit);
 
-        // ---- デバイス ----
+        // ---- デバイス: 何を取り込むか（映像・音声の機器とモード） ----
         var device = new ToolStripMenuItem(L.T("デバイス(&D)"));
         _videoDevicesRoot = new ToolStripMenuItem(L.T("映像デバイス"));
         _audioDevicesRoot = new ToolStripMenuItem(L.T("音声デバイス"));
@@ -690,27 +694,58 @@ public sealed partial class MainForm : Form, IMessageFilter
         _videoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
 
         device.DropDownItems.Add(_videoDevicesRoot);
-        device.DropDownItems.Add(_audioDevicesRoot);
-        device.DropDownItems.Add(_audioOutputRoot);
         device.DropDownItems.Add(_videoModeRoot);
         device.DropDownItems.Add(new ToolStripSeparator());
+        device.DropDownItems.Add(_audioDevicesRoot);
+        device.DropDownItems.Add(_audioOutputRoot);
+        device.DropDownItems.Add(new ToolStripSeparator());
+        device.DropDownItems.Add(new ToolStripMenuItem(L.T("優先デバイス設定..."), null,
+            (_, _) => ShowDeviceKeywordSettings()));
+
+        // ---- 映像: 絵の見え方（再生・拡大・補間・調整・描画方式） ----
+        var video = new ToolStripMenuItem(L.T("映像(&V)"));
+        video.DropDownOpening += (_, _) => UpdateChecks();
+        _miFreeze = new ToolStripMenuItem(L.T("一時停止 / 再開"), null, (_, _) => ToggleFreeze())
+        {
+            ShortcutKeyDisplayString = "Space",
+        };
+        _miLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
+        _miAdjust = new ToolStripMenuItem(L.T("映像の調整..."), null, (_, _) => ShowAdjustmentsDialog());
+        _miCrop = new ToolStripMenuItem(L.T("黒い縁の切り取り..."), null, (_, _) => ShowCropDialog());
+        video.DropDownItems.Add(_miFreeze);
+        video.DropDownItems.Add(new ToolStripSeparator());
+        video.DropDownItems.Add(BuildQualitySubmenu());
+        video.DropDownItems.Add(BuildInterpolationItem());
+        video.DropDownItems.Add(_miLowLatency);
+        video.DropDownItems.Add(new ToolStripSeparator());
+        video.DropDownItems.Add(_miAdjust);
+        video.DropDownItems.Add(_miCrop);
+        video.DropDownItems.Add(BuildRotationSubmenu());
+        video.DropDownItems.Add(new ToolStripSeparator());
+        video.DropDownItems.Add(BuildRendererSubmenu());
+
+        // ---- 音声 ----
+        var audio = new ToolStripMenuItem(L.T("音声(&A)"));
+        audio.DropDownOpening += (_, _) => UpdateChecks();
         _miMute = new ToolStripMenuItem(L.T("ミュート"), null, (_, _) => ToggleMute())
         {
             ShortcutKeyDisplayString = "M",
         };
-        device.DropDownItems.Add(_miMute);
-        device.DropDownItems.Add(new ToolStripMenuItem(L.T("入力レベルを最大にする"), null,
-            (_, _) => MaximizeCaptureLevel()));
         _miRestoreLevel = new ToolStripMenuItem(L.T("入力レベルを元に戻す"), null, (_, _) => RestoreCaptureLevel());
-        device.DropDownItems.Add(_miRestoreLevel);
-        device.DropDownItems.Add(new ToolStripSeparator());
-        device.DropDownItems.Add(new ToolStripMenuItem(L.T("音ズレ補正..."), null, (_, _) => ShowAvSyncDialog()));
+        audio.DropDownItems.Add(_miMute);
+        audio.DropDownItems.Add(new ToolStripMenuItem(L.T("音ズレ補正..."), null, (_, _) => ShowAvSyncDialog()));
+        audio.DropDownItems.Add(new ToolStripSeparator());
+        audio.DropDownItems.Add(new ToolStripMenuItem(L.T("入力レベルを最大にする"), null,
+            (_, _) => MaximizeCaptureLevel()));
+        audio.DropDownItems.Add(_miRestoreLevel);
+        audio.DropDownItems.Add(new ToolStripSeparator());
+        audio.DropDownItems.Add(new ToolStripMenuItem(L.T("音声バッファ設定..."), null, (_, _) => ShowAudioBufferSettings()));
 
         // ---- プロファイル ----
         var profiles = BuildProfilesMenu();
 
-        // ---- 表示 ----
-        var view = new ToolStripMenuItem(L.T("表示(&V)"));
+        // ---- 表示: ウィンドウと画面の使い方 ----
+        var view = new ToolStripMenuItem(L.T("表示(&W)"));
         view.DropDownOpening += (_, _) => UpdateChecks();
 
         _miLockAspect = new ToolStripMenuItem(L.T("ウィンドウ比率を映像に固定"), null, (_, _) => ToggleLockAspect());
@@ -734,50 +769,36 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             ShortcutKeyDisplayString = "F11",
         };
-
         var zoomReset = new ToolStripMenuItem(L.T("ズームをリセット"), null, (_, _) => ResetZoom())
         {
             ShortcutKeyDisplayString = "Ctrl+0",
-        };
-        _miFreeze = new ToolStripMenuItem(L.T("一時停止 / 再開"), null, (_, _) => ToggleFreeze())
-        {
-            ShortcutKeyDisplayString = "Space",
         };
         // ShortcutKeyDisplayString is set from the real setting in UpdateChecks
         // (FormatHotkey((Keys)_settings.HotkeyPip)) rather than hard-coded here,
         // since the user can rebind it in ホットキー設定.
         _miPip = new ToolStripMenuItem(L.T("ピクチャインピクチャ"), null, (_, _) => TogglePip());
 
-        // 上から: 画面の使い方 → 再生操作 → 映像の見え方 → ウィンドウの振る舞い
         view.DropDownItems.Add(fullscreen);
         view.DropDownItems.Add(BuildFullscreenDisplaySubmenu());
         view.DropDownItems.Add(_miPip);
-        view.DropDownItems.Add(_miFreeze);
+        view.DropDownItems.Add(BuildPipSettingsSubmenu());
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildAspectSubmenu());
-        view.DropDownItems.Add(BuildQualitySubmenu());
-        view.DropDownItems.Add(BuildInterpolationItem());
-        _miAdjust = new ToolStripMenuItem(L.T("映像の調整..."), null, (_, _) => ShowAdjustmentsDialog());
-        view.DropDownItems.Add(_miAdjust);
-        _miCrop = new ToolStripMenuItem(L.T("黒い縁の切り取り..."), null, (_, _) => ShowCropDialog());
-        view.DropDownItems.Add(_miCrop);
-        view.DropDownItems.Add(BuildRotationSubmenu());
-        view.DropDownItems.Add(zoomReset);
-        view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildSizeSubmenu());
         view.DropDownItems.Add(_miLockAspect);
+        view.DropDownItems.Add(zoomReset);
         view.DropDownItems.Add(new ToolStripSeparator());
-        view.DropDownItems.Add(_miBorderless);
-        view.DropDownItems.Add(_miTopmost);
+        view.DropDownItems.Add(BuildInfoModeSubmenu());
+        view.DropDownItems.Add(BuildTextSizeSubmenu());
+        view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(_miMenuBar);
         view.DropDownItems.Add(_miStatusBar);
+        view.DropDownItems.Add(_miBorderless);
+        view.DropDownItems.Add(_miTopmost);
 
         // ---- オプション: アプリ全体の動作設定 ----
         var options = new ToolStripMenuItem(L.T("オプション(&O)"));
         var snapCfg = new ToolStripMenuItem(L.T("スナップショット設定..."), null, (_, _) => ShowSnapshotSettings());
-        var audioBufCfg = new ToolStripMenuItem(L.T("音声バッファ設定..."), null, (_, _) => ShowAudioBufferSettings());
-        var deviceKeywordCfg = new ToolStripMenuItem(L.T("優先デバイス設定..."), null,
-            (_, _) => ShowDeviceKeywordSettings());
         var hotkeyCfg = new ToolStripMenuItem(L.T("ホットキー設定..."), null, (_, _) => ShowHotkeySettings());
         _miHotkeys = new ToolStripMenuItem(L.T("グローバルホットキーを有効化"), null, (_, _) => ToggleGlobalHotkeys());
         _miStartup = new ToolStripMenuItem(L.T("Windows起動時に自動実行"), null, (_, _) => ToggleStartup());
@@ -801,16 +822,9 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         options.DropDownOpening += (_, _) => { _miStartup.Checked = IsStartupRegistered(); UpdateChecks(); };
         options.DropDownItems.Add(snapCfg);
-        options.DropDownItems.Add(audioBufCfg);
-        options.DropDownItems.Add(deviceKeywordCfg);
         options.DropDownItems.Add(hotkeyCfg);
-        options.DropDownItems.Add(BuildPipSettingsSubmenu());
-        options.DropDownItems.Add(BuildRendererSubmenu());
-        options.DropDownItems.Add(BuildTextSizeSubmenu());
-        _miLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
-        options.DropDownItems.Add(_miLowLatency);
-        options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(_miHotkeys);
+        options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(_miCursorHide);
         options.DropDownItems.Add(cursorSecs);
         options.DropDownItems.Add(new ToolStripSeparator());
@@ -832,13 +846,27 @@ public sealed partial class MainForm : Form, IMessageFilter
         _checkUpdateNormalFont = new Font(_menu.Font, FontStyle.Regular);
         _checkUpdateBoldFont = new Font(_menu.Font, FontStyle.Bold);
         help.DropDownItems.Add(shortcuts);
-        help.DropDownItems.Add(new ToolStripSeparator());
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("テストモード（自動試験）..."), null, (_, _) => ShowTestModeDialog()));
         help.DropDownItems.Add(new ToolStripSeparator());
         help.DropDownItems.Add(_miCheckUpdate);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
 
-        _menu.Items.AddRange(new ToolStripItem[] { file, device, profiles, view, options, help });
+        _menu.Items.AddRange(new ToolStripItem[] { file, device, video, audio, view, profiles, options, help });
+    }
+
+    /// <summary>情報表示 > オフ / FPS だけ / 詳しく (Ctrl+Shift+I cycles through them).</summary>
+    private ToolStripMenuItem BuildInfoModeSubmenu()
+    {
+        var m = new ToolStripMenuItem(L.T("情報表示")) { ShortcutKeyDisplayString = "Ctrl+Shift+I" };
+        foreach ((string label, InfoMode mode) in new[]
+                 { (L.T("オフ"), InfoMode.Off), (L.T("FPS だけ"), InfoMode.Fps), (L.T("詳しく"), InfoMode.Full) })
+        {
+            InfoMode md = mode;
+            var item = new ToolStripMenuItem(label, null, (_, _) => ChooseInfoMode(md)) { Tag = md };
+            _infoModeItems.Add(item);
+            m.DropDownItems.Add(item);
+        }
+        return m;
     }
 
     private ToolStripMenuItem BuildRotationSubmenu()
@@ -1035,7 +1063,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         LayoutCanvas(ModeChangeSettleMs);
     }
 
-    /// <summary>オプション > 描画方式.</summary>
+    /// <summary>映像 > 描画方式.</summary>
     private ToolStripMenuItem BuildRendererSubmenu()
     {
         var m = new ToolStripMenuItem(L.T("描画方式"));
@@ -1093,10 +1121,11 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         _ctx.Opening += (_, _) => UpdateChecks();
 
-        // 使用頻度順: 画面切替系 → 撮影系 → 映像調整系 → ウィンドウ挙動系 → 終了
-        _ctx.Items.Add(new ToolStripMenuItem(L.T("全画面表示"), null, (_, _) => ToggleFullscreen()));
-        _cmiPip = new ToolStripMenuItem(L.T("ピクチャインピクチャ"), null, (_, _) => TogglePip());
-        _ctx.Items.Add(_cmiPip);
+        // 右クリックには、よく使うものだけ: 画面 → 再生 → 撮影 → 映像 → 表示・プロファイル → ウィンドウ → 終了
+        _ctx.Items.Add(new ToolStripMenuItem(L.T("全画面表示"), null, (_, _) => ToggleFullscreen())
+        {
+            ShortcutKeyDisplayString = "F11",
+        });
         _cmiFreeze = new ToolStripMenuItem(L.T("一時停止 / 再開"), null, (_, _) => ToggleFreeze());
         _ctx.Items.Add(_cmiFreeze);
         _cmiMute = new ToolStripMenuItem(L.T("ミュート"), null, (_, _) => ToggleMute());
@@ -1107,26 +1136,37 @@ public sealed partial class MainForm : Form, IMessageFilter
         _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットをコピー"), null, (_, _) => CopySnapshotToClipboard()));
         _ctx.Items.Add(new ToolStripSeparator());
 
-        _ctx.Items.Add(BuildAspectSubmenu());
-        _ctx.Items.Add(BuildQualitySubmenu());
-        _ctx.Items.Add(BuildInterpolationItem());
-        _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
-        _ctx.Items.Add(_cmiLowLatency);
-        _ctx.Items.Add(BuildSizeSubmenu());
         _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
         _cmiVideoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_cmiVideoModeRoot);
         _cmiVideoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _ctx.Items.Add(_cmiVideoModeRoot);
+        _ctx.Items.Add(BuildQualitySubmenu());
+        _ctx.Items.Add(BuildInterpolationItem());
+        _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
+        _ctx.Items.Add(_cmiLowLatency);
         _ctx.Items.Add(new ToolStripSeparator());
+
+        _ctx.Items.Add(BuildInfoModeSubmenu());
+        _cmiProfiles = new ToolStripMenuItem(L.T("プロファイル"));
+        _cmiProfiles.DropDownOpening += (_, _) => UpdateProfileMenu();
+        UpdateProfileMenu();
+        _ctx.Items.Add(_cmiProfiles);
+        _cmiPip = new ToolStripMenuItem(L.T("ピクチャインピクチャ"), null, (_, _) => TogglePip());
+        _ctx.Items.Add(_cmiPip);
 
         _cmiBorderless = new ToolStripMenuItem(L.T("ウィンドウ枠を非表示"), null, (_, _) => ToggleBorderless());
         _cmiTopmost = new ToolStripMenuItem(L.T("常に前面に表示"), null, (_, _) => ToggleAlwaysOnTop());
         _cmiMenuBar = new ToolStripMenuItem(L.T("メニューバーを表示"), null, (_, _) => ToggleMenuBar());
         _cmiStatusBar = new ToolStripMenuItem(L.T("ステータスバーを表示"), null, (_, _) => ToggleStatusBar());
-        _ctx.Items.Add(_cmiBorderless);
-        _ctx.Items.Add(_cmiTopmost);
-        _ctx.Items.Add(_cmiMenuBar);
-        _ctx.Items.Add(_cmiStatusBar);
+        var window = new ToolStripMenuItem(L.T("ウィンドウ"));
+        window.DropDownItems.Add(BuildAspectSubmenu());
+        window.DropDownItems.Add(BuildSizeSubmenu());
+        window.DropDownItems.Add(new ToolStripSeparator());
+        window.DropDownItems.Add(_cmiBorderless);
+        window.DropDownItems.Add(_cmiTopmost);
+        window.DropDownItems.Add(_cmiMenuBar);
+        window.DropDownItems.Add(_cmiStatusBar);
+        _ctx.Items.Add(window);
         _ctx.Items.Add(new ToolStripSeparator());
         _ctx.Items.Add(new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close()));
         _canvas.ContextMenuStrip = _ctx;
@@ -1179,7 +1219,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gHere, L.T("常に前面に表示"), "Ctrl+T");
         Row(gHere, L.T("ウィンドウ枠を非表示"), "Ctrl+B");
         Row(gHere, L.T("メニューバーの表示"), "F10");
-        Row(gHere, L.T("情報表示の切替"), "Ctrl+Shift+I");
+        Row(gHere, L.T("情報表示の切替（オフ → FPS だけ → 詳しく）"), "Ctrl+Shift+I");
         Row(gHere, L.T("FSR・くっきりと標準の拡大を見比べる"), L.T("Q（押している間）"));
         Row(gHere, L.T("プロファイルを切り替える"), "Ctrl+1 – 9");
         Row(gHere, L.T("メニュー"), L.T("右クリック"));
@@ -1256,7 +1296,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Restore how the last session was being viewed. Both can be set: a PiP
         // entered FROM fullscreen — EnterPip records the fullscreen state so
         // exiting PiP returns there.
-        if (_settings.InfoVisible && !_info.Showing) ToggleInfo();
+        if (ParseInfoMode(_settings.InfoMode) is var savedInfo && savedInfo != InfoMode.Off && !_info.Showing) SetInfoMode(savedInfo);
         if (_settings.Fullscreen && !_isFullscreen) EnterFullscreen(userAction: false);
         if (_settings.Pip && !_isPip) EnterPip();
 
@@ -1378,7 +1418,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _settings.StatusVisible = _isFullscreen ? _savedStatusVisible : (_isPip ? _prePipStatus : _status.Visible);
         _settings.FullscreenMenuVisible = _fsMenuVisible;
         _settings.FullscreenStatusVisible = _fsStatusVisible;
-        _settings.InfoVisible = _info.Showing;
+        _settings.InfoMode = InfoModeKey(CurrentInfoMode);
+        _settings.InfoVisible = _info.Showing;   // kept in step for older versions reading the same file
         _settings.Volume = _volumeOverridden ? _persistVolume : _audio.VolumePercent;
         _settings.AudioBufferMs = _audio.BufferMilliseconds;
         _settings.Rotation = _video.Rotation;
@@ -2502,6 +2543,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         _pipPosItems.Clear();
         _cursorSecItems.Clear();
         _textSizeItems.Clear();
+        _infoModeItems.Clear();
+        _rendererItems.Clear();
+        _qualityRoots.Clear();
+        _qualityItems.Clear();
+        _interpItems.Clear();
+        _sharpnessItems.Clear();
+        _nativeResItems.Clear();
 
         BuildMenu();
         BuildContextMenu();
@@ -3081,7 +3129,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         string quality = _settings.ScalingQuality;
         bool supported = _video.SupportsScalingQuality;
         bool pixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
-        string tip = !supported ? L.T("Direct3D 描画のときに使えます（オプション → 描画方式）")
+        string tip = !supported ? L.T("Direct3D 描画のときに使えます（映像 → 描画方式）")
             : pixelPerfect ? L.T("整数倍表示では使いません")
             : string.Empty;
         foreach (var root in _qualityRoots)
@@ -3911,23 +3959,23 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateQualityMenu();
         _miAdjust.Enabled = _video.SupportsAdjustments;
         _miAdjust.ToolTipText = _video.SupportsAdjustments
-            ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+            ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
 
         _miCrop.Enabled = _video.SupportsCrop;
         _miCrop.ToolTipText = _video.SupportsCrop
-            ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+            ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
         foreach (var it in _interpItems)
         {
             it.Enabled = _video.SupportsInterpolation;
             it.Checked = _video.SupportsInterpolation && _settings.Interpolation;
             it.ToolTipText = _video.SupportsInterpolation
                 ? L.T("画面の更新が映像のコマ数より十分速いときだけ、間のコマを作って滑らかにします。映像が 1 コマぶん遅れます。")
-                : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+                : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
         }
         _miLowLatency.Enabled = _video.SupportsLowLatency;
         _miLowLatency.Checked = _video.SupportsLowLatency && _settings.LowLatency;
         _miLowLatency.ToolTipText = _video.SupportsLowLatency
-            ? string.Empty : L.T("Direct3D 描画のときに使えます（オプション → 描画方式）");
+            ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
         _cmiLowLatency.Enabled = _miLowLatency.Enabled;
         _cmiLowLatency.Checked = _miLowLatency.Checked;
         _cmiLowLatency.ToolTipText = _miLowLatency.ToolTipText;
@@ -3989,6 +4037,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             item.Checked = _settings.CursorAutoHide && (int)item.Tag! == _settings.CursorHideSeconds;
         foreach (var item in _textSizeItems)
             item.Checked = (int)item.Tag! == _settings.OverlayTextPct;
+        UpdateInfoModeChecks();
         foreach (var item in _pipIdleItems)
             item.Checked = (int)item.Tag! == _settings.PipOpacity;
         foreach (var item in _pipHoverItems)
@@ -4065,7 +4114,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 ResetZoom();
                 return true;
             case Keys.Control | Keys.Shift | Keys.I:
-                if (!isRepeat) ToggleInfo();
+                if (!isRepeat) CycleInfoMode();
                 return true;
             case Keys.Q:
                 if (!isRepeat) BeginCompare();
@@ -4147,15 +4196,60 @@ public sealed partial class MainForm : Form, IMessageFilter
     private static extern bool EnumDisplaySettingsW(string? deviceName, int modeNum, ref DevMode dm);
     private const int EnumCurrentSettings = -1;
 
-    private void ToggleInfo()
+    private InfoMode CurrentInfoMode => _info.Showing ? _info.Mode : InfoMode.Off;
+
+    /// <summary>On/off for the detailed panel (what the test mode uses to put "the real info display" up and take it away).</summary>
+    private void ToggleInfo() => SetInfoMode(_info.Showing ? InfoMode.Off : InfoMode.Full);
+
+    private void SetInfoMode(InfoMode mode)
     {
-        if (_info.Showing) { _info.Showing = false; return; }
+        if (mode == InfoMode.Off)
+        {
+            _fpsTimer.Stop();
+            _info.Showing = false;
+            UpdateInfoModeChecks();
+            return;
+        }
+        _info.SetMode(mode);
         UpdateInfo();
         _info.Showing = true;
         _info.BringToFront();
         _osd.BringToFront();
         PositionInfo();
+        if (mode == InfoMode.Fps) _fpsTimer.Start(); else _fpsTimer.Stop();
+        UpdateInfoModeChecks();
     }
+
+    /// <summary>Ctrl+Shift+I: オフ → FPS だけ → 詳しく → オフ.</summary>
+    private void CycleInfoMode() => ChooseInfoMode(CurrentInfoMode switch
+    {
+        InfoMode.Off => InfoMode.Fps,
+        InfoMode.Fps => InfoMode.Full,
+        _ => InfoMode.Off,
+    });
+
+    /// <summary>A change the user made (key or menu): set it and say so.</summary>
+    private void ChooseInfoMode(InfoMode mode)
+    {
+        SetInfoMode(mode);
+        ShowOsd(L.F("情報表示: {0}", InfoModeName(mode)));
+    }
+
+    private static string InfoModeName(InfoMode mode) => mode switch
+    {
+        InfoMode.Fps => L.T("FPS だけ"),
+        InfoMode.Full => L.T("詳しく"),
+        _ => L.T("オフ"),
+    };
+
+    private void UpdateInfoModeChecks()
+    {
+        InfoMode cur = CurrentInfoMode;
+        foreach (var item in _infoModeItems) item.Checked = (InfoMode)item.Tag! == cur;
+    }
+
+    private static string InfoModeKey(InfoMode mode) => mode switch { InfoMode.Fps => "fps", InfoMode.Full => "full", _ => "off" };
+    private static InfoMode ParseInfoMode(string? key) => key switch { "fps" => InfoMode.Fps, "full" => InfoMode.Full, _ => InfoMode.Off };
 
     private void PositionInfo()
     {
@@ -4195,8 +4289,31 @@ public sealed partial class MainForm : Form, IMessageFilter
         return string.Empty;
     }
 
+    /// <summary>FPS だけ: the frames actually shown per second, and under it the game's rate / the input rate / 補間.</summary>
+    private void UpdateFpsInfo()
+    {
+        string big = "—";
+        var parts = new List<string>();
+        if (_video.IsRunning)
+        {
+            if (_video.Stats is { } st)
+            {
+                big = Math.Round(st.PresentedFps).ToString("0");
+                if (_video.GameFpsReliable && _video.GameFps > 0) parts.Add(L.F("ゲーム {0:0}", _video.GameFps));
+                else if (_video.PictureStill) parts.Add(L.T("静止"));
+                if (st.InputFps > 0) parts.Add(L.F("入力 {0:0}", st.InputFps));
+            }
+            if (_video.SupportsInterpolation && _settings.Interpolation && _video.InterpolationState is { Active: true })
+                parts.Add(L.T("補間"));
+        }
+        string before = _info.Text;
+        _info.SetFps(big, string.Join(" ・ ", parts));
+        if (_info.Text != before || !_info.Showing) PositionInfo();
+    }
+
     private void UpdateInfo()
     {
+        if (_info.Mode == InfoMode.Fps) { UpdateFpsInfo(); return; }
         string renderer = _video.SupportsScalingQuality ? "Direct3D" : L.T("標準（Media Foundation）");
         string input = _video.CurrentMode is { } m ? ModeLabel(m) : "—";
         string fps = _video.Stats is { } st
@@ -4256,6 +4373,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _audio.Dispose();
             _osdTimer.Dispose();
             _uiTimer.Dispose();
+            _fpsTimer.Dispose();
             _devTimer.Dispose();
             _burstTimer.Dispose();
             _pipHoverTimer.Dispose();

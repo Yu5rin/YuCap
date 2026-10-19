@@ -273,7 +273,7 @@ public sealed partial class MainForm
     //  Run / restore
     // =============================================================================================
 
-    private sealed record UiBefore(bool Fullscreen, bool Pip, double Zoom, int PanX, int PanY, bool InfoVisible);
+    private sealed record UiBefore(bool Fullscreen, bool Pip, double Zoom, int PanX, int PanY, InfoMode Info);
 
     private async Task RunTestModeAsync(TestOptions o, bool openReport)
     {
@@ -288,7 +288,7 @@ public sealed partial class MainForm
         string json = JsonSerializer.Serialize(_settings);
         _testSaved = JsonSerializer.Deserialize<AppSettings>(json)!;
         TestModeGuard.WriteMarker(JsonSerializer.Deserialize<AppSettings>(json)!);
-        var before = new UiBefore(_isFullscreen, _isPip, _zoom, _panX, _panY, _info.Showing);
+        var before = new UiBefore(_isFullscreen, _isPip, _zoom, _panX, _panY, CurrentInfoMode);
         Log.Info($"test mode: start target={o.Target.DeviceName} quick={o.Quick} report={_rep.Folder}");
 
         try
@@ -354,7 +354,7 @@ public sealed partial class MainForm
         _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Showing = false;
         Ui.DialogAudit = null;
         if (_frozen) ToggleFreeze();
-        if (_info.Showing != before.InfoVisible) ToggleInfo();
+        if (CurrentInfoMode != before.Info) SetInfoMode(before.Info);
 
         // settings back, then everything that was derived from them
         if (_testSaved != null) CopySettings(_testSaved, _settings);
@@ -415,7 +415,7 @@ public sealed partial class MainForm
         TestSection secRender = rep.AddSection("3. 表示のなめらかさ・負荷",
             "モニターに全画面で出したときの、コマ数・GPU の余裕・コマの出方（フレームペーシング）・可変リフレッシュレート（VRR）の効きを調べます。続けて、フレーム補間の絵の正しさと、映像の上に何かを重ねたときの更新の低下も調べます。");
         TestSection secNotice = rep.AddSection("4. 通知の表示",
-            "全画面のとき、通知・一時停止の画像・情報表示が映像の上に見えているかを、画面の色で確かめます。");
+            "全画面のとき、通知・一時停止の画像・情報表示（詳しく／FPS だけ）が映像の上に見えているかを、画面の色で確かめます。");
         TestSection secFsr = rep.AddSection("5. FSR の効き",
             "標準の拡大・FSR（高画質）・くっきり（Anime4K）を、このモニターの大きさで比べます。");
         TestSection secHdr = rep.AddSection("6. HDR");
@@ -465,6 +465,7 @@ public sealed partial class MainForm
                 steps.Add((L.F("通知の表示: {0}", tag + " / " + L.T("通知")), secNotice, () => NoticeStep(secNotice, l2, m1080, 0)));
                 steps.Add((L.F("通知の表示: {0}", tag + " / " + L.T("一時停止の画像")), secNotice, () => NoticeStep(secNotice, l2, m1080, 1)));
                 steps.Add((L.F("通知の表示: {0}", tag + " / " + L.T("情報表示")), secNotice, () => NoticeStep(secNotice, l2, m1080, 2)));
+                steps.Add((L.F("通知の表示: {0}", tag + " / " + L.T("情報表示（FPS だけ）")), secNotice, () => NoticeStep(secNotice, l2, m1080, 3)));
             }
 
             steps.Add((L.F("通知の表示: {0}", L.T("通知と情報表示の文字の大きさ")), secNotice, () => TextSizeStep(secNotice, m1080)));
@@ -536,7 +537,7 @@ public sealed partial class MainForm
         {
             Name = "シャープさの好み", Verdict = Verdict.Info,
             Summary = "再生中に Q を押している間は標準の拡大、離すと FSR になります。",
-            Explanation = "【測れない理由】輪郭の強さは5の項目で数字にしていますが、どれくらいのくっきり感を心地よいと感じるかは人によって違い、正解がありません。いろいろなシーンで見比べて、シャープさ（表示メニュー → 拡大の画質）を決めてください。5 の項目の画像も参考になります。",
+            Explanation = "【測れない理由】輪郭の強さは5の項目で数字にしていますが、どれくらいのくっきり感を心地よいと感じるかは人によって違い、正解がありません。いろいろなシーンで見比べて、シャープさ（映像メニュー → 拡大の画質）を決めてください。5 の項目の画像も参考になります。",
         });
         secManual.Items.Add(new TestItem
         {
@@ -548,7 +549,7 @@ public sealed partial class MainForm
         {
             Name = "音ズレ", Verdict = Verdict.Info,
             Summary = "手をたたく動画などで、映像の動きと音が合っているか見てください。",
-            Explanation = "【測れない理由】映像の遅れ（3 の数字）と音声側のたまっている量（8）は測っていますが、「映像のこの瞬間に音が鳴る」という基準を持つ映像がないと、実際の音ズレは測れません。ずれていたら、デバイス → 音ズレ補正 で調整します（音を遅らせる／映像を遅らせる）。",
+            Explanation = "【測れない理由】映像の遅れ（3 の数字）と音声側のたまっている量（8）は測っていますが、「映像のこの瞬間に音が鳴る」という基準を持つ映像がないと、実際の音ズレは測れません。ずれていたら、音声 → 音ズレ補正 で調整します（音を遅らせる／映像を遅らせる）。",
         });
         secManual.Items.Add(new TestItem
         {
@@ -1234,10 +1235,10 @@ public sealed partial class MainForm
             "1. テレビ: ゲームモードにして、VRR（機種により「VRR」「可変リフレッシュレート」）をオンにします。Hisense のテレビは、設定のゲームモード／VRR の項目です。\n" +
             "2. GPU のドライバ: NVIDIA は、NVIDIA コントロールパネル → G-SYNC の設定 → 「G-SYNC 互換を有効にする」にチェックを入れ、「ウィンドウモードと全画面モードで有効にする」を選びます。AMD は、Radeon 設定 → ディスプレイ → AMD FreeSync をオンにします。\n" +
             "3. Windows: 設定 → システム → ディスプレイ → グラフィックス → 既定のグラフィックス設定 で、「可変リフレッシュレート」と「ウィンドウ化されたゲームの最適化」をオンにします。\n" +
-            "4. YuCap: VRR を使うのは低遅延モードのときだけです。オプション → 低遅延モードをオンにしてください（オフのときは Windows が画面を合成するため、VRR は効きません）。\n" +
+            "4. YuCap: VRR を使うのは低遅延モードのときだけです。映像 → 低遅延モードをオンにしてください（オフのときは Windows が画面を合成するため、VRR は効きません）。\n" +
             "設定を変えたあと、もう一度試験すると、効いているかを確かめられます。";
         it.Explanation = onWorks && !offWorks
-            ? "低遅延モードをオンにしたときだけ VRR が効きました。VRR を使いたいときは、オプション → 低遅延モードをオンにしてください。"
+            ? "低遅延モードをオンにしたときだけ VRR が効きました。VRR を使いたいときは、映像 → 低遅延モードをオンにしてください。"
             : onWorks
                 ? "VRR が効く設定があります。どの設定かは上の各項目を見てください。"
                 : "VRR が効いている設定は確認できませんでした。120 fps のように、モニターの更新（例: 144 Hz）の整数倍にならない映像は、固定のリフレッシュレートでは 1 コマが 1 回か 2 回の更新で出るため、約 2 割のコマが長く見えます（軽いカクつき）。これは VRR が効いていないときの普通の動きで、故障ではありません。\n" + steps +
@@ -1260,7 +1261,7 @@ public sealed partial class MainForm
     private async Task NoticeStep(TestSection sec, bool ll, CaptureMode? mode, int what)
     {
         string tag = ll ? "低遅延オン" : "低遅延オフ";
-        string[] names = { "通知（画面左上の表示）", "一時停止の画像", "情報表示" };
+        string[] names = { "通知（画面左上の表示）", "一時停止の画像", "情報表示（詳しく）", "情報表示（FPS だけ）" };
         var item = new TestItem { Name = $"{names[what]} / {tag}" };
         try { EnsureEngine(ll, mode); }
         catch (Exception ex)
@@ -1315,13 +1316,14 @@ public sealed partial class MainForm
                 break;
             default:
                 marker = Color.FromArgb(0, 255, 0);
-                bool wasVisible = _info.Showing;
+                InfoMode wasMode = CurrentInfoMode;
+                InfoMode wantMode = what == 3 ? InfoMode.Fps : InfoMode.Full;
                 _info.TestBack = marker;
-                if (!wasVisible) ToggleInfo(); else _info.Invalidate();
+                if (wasMode != wantMode) SetInfoMode(wantMode); else { UpdateInfo(); _info.Invalidate(); }
                 _info.BringToFront(); _osd.BringToFront(); _testCaption?.BringToFront();
                 await Wait(300);
                 area = OverlayScreenRect(_info, new Rectangle(2, Math.Max(0, _info.Height / 2 - 4), 6, 8));
-                cleanup = () => { _info.TestBack = null; if (!wasVisible && _info.Showing) ToggleInfo(); else _info.Invalidate(); };
+                cleanup = () => { _info.TestBack = null; if (CurrentInfoMode != wasMode) SetInfoMode(wasMode); else _info.Invalidate(); };
                 break;
         }
 
@@ -1345,7 +1347,7 @@ public sealed partial class MainForm
                     item.Verdict = Verdict.Ok;
                     item.Summary = "映像の上に見えています";
                     item.Explanation = "この表示方式でも、重ねて出す表示は映像の上に出ています。";
-                    OverlayControl? ov = what == 0 ? _osd : what == 2 ? _info : null;
+                    OverlayControl? ov = what == 0 ? _osd : what >= 2 ? _info : null;
                     if (ov is { Virtual: true })
                     {
                         item.Explanation = "この表示方式でも、重ねて出す表示は映像の上に出ています。表示は別のウィンドウではなく、映像の中に描いています（そのため、表示中も画面の更新は下がりません）。";
@@ -1408,9 +1410,9 @@ public sealed partial class MainForm
             return;
         }
         await Wait(SettleMs);
-        bool infoWasVisible = _info.Showing;
+        InfoMode infoWas = CurrentInfoMode;
         ShowOsd(L.T("テスト表示"), OsdLongMilliseconds);
-        if (!infoWasVisible) ToggleInfo(); else UpdateInfo();
+        if (infoWas != InfoMode.Full) SetInfoMode(InfoMode.Full); else UpdateInfo();
         _info.BringToFront(); _osd.BringToFront(); _testCaption?.BringToFront();
         await Wait(300);
         try
@@ -1432,7 +1434,22 @@ public sealed partial class MainForm
                 .Num("情報表示の文字（大文字の高さ）", $"{infoCap} ピクセル ／ 画面の高さの {F(infoFrac)} ／ 約 {infoDeg:0.00}°")
                 .Num("前提", "画面の高さの 1.5 倍の距離から見る。目安は通知 0.35° 以上・情報表示 0.25° 以上、画面の高さの 5% 以下");
 
+            // 情報表示「FPS だけ」: the big number and the small line, measured the same way.
+            SetInfoMode(InfoMode.Fps);
+            _info.BringToFront(); _osd.BringToFront(); _testCaption?.BringToFront();
+            await Wait(300);
+            int fpsBigCap = TextScale.CapHeightPx(_info.BigFont);
+            double fpsBigFrac = (double)fpsBigCap / screenH, fpsBigDeg = Deg(fpsBigFrac);
+            bool fpsInside = _canvas.Bounds.Contains(_info.Bounds);
+            item.Num("YuCap が掛けた倍率（FPS だけ）", $"x{_info.TextFactor:0.00}")
+                .Num("FPS だけ（大きい数字）の文字（大文字の高さ）", $"{fpsBigCap} ピクセル ／ 画面の高さの {F(fpsBigFrac)} ／ 約 {fpsBigDeg:0.00}°")
+                .Num("FPS だけ（下の小さい行）の文字", $"情報表示（詳しく）と同じ大きさ（{infoCap} ピクセル）")
+                .Num("FPS だけのパネルの大きさ", $"{_info.Width}x{_info.Height} ピクセル（映像の枠の中に収まっているか: {(fpsInside ? "はい" : "いいえ")}）");
+
             var problems = new List<string>();
+            if (fpsBigDeg < infoMinDeg) problems.Add("FPS だけの数字が小さすぎます。");
+            if (fpsBigFrac > maxFrac) problems.Add("FPS だけの数字が大きすぎます。");
+            if (!fpsInside) problems.Add("FPS だけの表示が映像の枠からはみ出しています。");
             if (osdDeg < osdMinDeg) problems.Add("通知の文字が小さすぎます。");
             if (infoDeg < infoMinDeg) problems.Add("情報表示の文字が小さすぎます。");
             if (osdFrac > maxFrac || infoFrac > maxFrac) problems.Add("文字が大きすぎます。");
@@ -1450,13 +1467,13 @@ public sealed partial class MainForm
             {
                 item.Verdict = Verdict.Warn;
                 item.Summary = "文字の大きさに注意";
-                item.Explanation = string.Join(" ", problems) + "「オプション」の「表示の文字の大きさ」で変えられます。";
+                item.Explanation = string.Join(" ", problems) + "「表示」メニューの「表示の文字の大きさ」で変えられます。";
             }
         }
         finally
         {
             _osdQueue.Clear(); _osdCurrent = null; _osdTimer.Stop(); _osd.Showing = false;
-            if (!infoWasVisible && _info.Showing) ToggleInfo();
+            if (CurrentInfoMode != infoWas) SetInfoMode(infoWas);
         }
         sec.Items.Add(item);
     }

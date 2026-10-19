@@ -512,12 +512,12 @@ public sealed partial class MainForm
         }
 
         if (_testCaption != null) _testCaption.Showing = false;
-        bool wasVisible = _info.Showing;
+        InfoMode wasInfo = CurrentInfoMode;
         try
         {
             _settings.Interpolation = interp;
             EnsureEngine(false, mode);
-            if (wasVisible) ToggleInfo();      // the baseline needs nothing over the video
+            if (wasInfo != InfoMode.Off) SetInfoMode(InfoMode.Off);      // the baseline needs nothing over the video
             await Wait(SettleMs);
             double srcFps = _video.NegotiatedFps > 0 ? _video.NegotiatedFps : mode.Fps;
             bool interpOn = interp && _video.InterpolationState is { Active: true };
@@ -616,7 +616,7 @@ public sealed partial class MainForm
         }
         finally
         {
-            if (_info.Showing != wasVisible) ToggleInfo();
+            if (CurrentInfoMode != wasInfo) SetInfoMode(wasInfo);
             if (_video.SupportsCrispness) _video.CrispnessIntervalMs = 5000;
             StopInterpForTest();
         }

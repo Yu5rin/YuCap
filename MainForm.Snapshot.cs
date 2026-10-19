@@ -278,7 +278,7 @@ public sealed partial class MainForm
             Location = new Point(16, 124),
             Size = new Size(460 - Ui.Pad * 2, 38),
         };
-        var displayHint = Ui.Hint(L.T("Direct3D 描画のときに使えます（オプション → 描画方式）"),
+        var displayHint = Ui.Hint(L.T("Direct3D 描画のときに使えます（映像 → 描画方式）"),
             34, 164, 460 - Ui.Pad * 2 - 18);
         displayHint.Visible = !canDisplaySize;
 
