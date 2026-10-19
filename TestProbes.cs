@@ -118,6 +118,81 @@ internal static class TestProbes
         return 0;
     }
 
+    public const double MinSaneHz = 30, MaxSaneHz = 500;
+    public static bool SaneHz(double hz) => !double.IsNaN(hz) && hz >= MinSaneHz && hz <= MaxSaneHz;
+
+    /// <summary>
+    /// The monitor's refresh rate from GetFrameStatistics samples: the median of per-refresh intervals of consecutive
+    /// samples (pairs with a zero/negative refresh or time delta, or an interval outside 30-500 Hz, are ignored, so one
+    /// GPU stall or a counter glitch cannot move it). Falls back to the vblank beat, then to Windows' refresh
+    /// (<paramref name="panelHz"/>); returns 0 (unknown) when nothing plausible remains.
+    /// </summary>
+    public static double EstimateRefreshHz(StatSample[] st, double qpcFreq, double panelHz, VBlankMark[]? marks, out string note)
+    {
+        note = string.Empty;
+        var per = new List<double>();   // ms per refresh
+        for (int i = 1; i < st.Length; i++)
+        {
+            long dr = (long)st[i].SyncRefreshCount - st[i - 1].SyncRefreshCount;
+            long dq = st[i].SyncQpc - st[i - 1].SyncQpc;
+            if (dr <= 0 || dq <= 0 || dr > 1000) continue;
+            double ms = dq * 1000.0 / qpcFreq / dr;
+            if (SaneHz(1000.0 / ms)) per.Add(ms);
+        }
+        if (per.Count >= 5)
+        {
+            per.Sort();
+            double med = per.Count % 2 == 1 ? per[per.Count / 2] : (per[per.Count / 2 - 1] + per[per.Count / 2]) / 2;
+            double hz = 1000.0 / med;
+            if (SaneHz(hz)) return hz;
+        }
+        if (marks != null)
+        {
+            long idxSum = 0, tickSum = 0; int valid = 0;
+            for (int i = 1; i < marks.Length; i++)
+            {
+                if (marks[i].Index < 0 || marks[i - 1].Index < 0 || marks[i].Epoch != marks[i - 1].Epoch) continue;
+                long di = marks[i].Index - marks[i - 1].Index;
+                if (di <= 0) continue;
+                valid++; idxSum += di; tickSum += marks[i].Qpc - marks[i - 1].Qpc;
+            }
+            if (valid >= 20 && idxSum > 0 && tickSum > 0)
+            {
+                double hz = idxSum * qpcFreq / tickSum;
+                if (SaneHz(hz)) { note = "リフレッシュレートは垂直同期の記録から求めました"; return hz; }
+            }
+        }
+        if (SaneHz(panelHz)) { note = "リフレッシュレートは Windows の設定値を使いました"; return panelHz; }
+        note = "リフレッシュレートを求められませんでした";
+        return 0;
+    }
+
+    /// <summary>Self-check (hidden CLI --selftest-hz): glitchy synthetic samples must never give an out-of-range rate.</summary>
+    public static int SelfCheckRefreshHz()
+    {
+        long f = 10_000_000; int fail = 0;
+        void Check(string name, double got, Func<double, bool> ok) { bool g = ok(got); if (!g) fail++; Console.WriteLine($"{(g ? "OK  " : "FAIL")} {name}: {got:0.00} Hz"); }
+        StatSample[] Make(int n, double hz, Func<int, StatSample, StatSample>? glitch = null)
+        {
+            var r = new StatSample[n];
+            for (int i = 0; i < n; i++)
+            {
+                var s = new StatSample((uint)i, (uint)i, (uint)i, (long)(i * f / hz));
+                r[i] = glitch != null ? glitch(i, s) : s;
+            }
+            return r;
+        }
+        Check("clean 120", EstimateRefreshHz(Make(100, 120, null), f, 0, null, out _), h => Math.Abs(h - 120) < 0.5);
+        Check("stall + same-qpc + backwards", EstimateRefreshHz(Make(100, 120, (i, s) =>
+            i == 40 ? s with { SyncQpc = s.SyncQpc + f / 2 } : i == 50 ? s with { SyncQpc = Make(100, 120)[49].SyncQpc } :
+            i == 60 ? s with { SyncRefreshCount = 10 } : s), f, 0, null, out _), h => Math.Abs(h - 120) < 1);
+        Check("refresh count frozen -> panel fallback", EstimateRefreshHz(Make(100, 120, (i, s) => s with { SyncRefreshCount = 5 }), f, 144, null, out _), h => h == 144);
+        Check("qpc nearly identical -> no 39M Hz", EstimateRefreshHz(Make(100, 120, (i, s) => s with { SyncQpc = i }), f, 0, null, out _), h => h == 0);
+        Check("too few samples, no fallback", EstimateRefreshHz(Make(3, 120), f, 0, null, out _), h => h == 0);
+        Check("insane panel hz ignored", EstimateRefreshHz(Make(0, 120), f, 39323396.6, null, out _), h => h == 0);
+        return fail;
+    }
+
     // ================================================================ pacing
 
     public sealed class PacingAnalysis
@@ -185,7 +260,8 @@ internal static class TestProbes
             a.Source = "表示側の記録（GetFrameStatistics）";
             a.Frames = durs.Count;
             a.SameRefreshShare = pairs > 0 ? (double)same / pairs : 0;
-            a.ObservedHz = sumMs > 0 ? sumRefresh * 1000.0 / sumMs : 0;
+            a.ObservedHz = EstimateRefreshHz(st, freq, panelHz, cap.Marks, out string hzNote);
+            if (hzNote.Length > 0) a.StatsNote += "／" + hzNote;
         }
         else
         {
@@ -219,7 +295,7 @@ internal static class TestProbes
                 a.UsedVBlank = true;
                 a.Source = "垂直同期の記録（表示側の記録が取れなかったための代用）";
                 a.Frames = durs.Count;
-                a.ObservedHz = 1000.0 / periodMs;
+                a.ObservedHz = SaneHz(1000.0 / periodMs) ? 1000.0 / periodMs : 0;
                 a.StatsNote += $"／垂直同期の記録 {mk.Length} 件、同じ更新に重なった Present {shared} 回";
             }
             else
@@ -273,7 +349,12 @@ internal static class TestProbes
             a.Vrr = a.UsedVBlank ? "判定できません（垂直同期の記録はリフレッシュの単位でしか分からないため）" : "判定できません（表示側の時刻が取れませんでした）";
             return a;
         }
-        double hz = a.ObservedHz > 20 ? a.ObservedHz : panelHz;
+        double hz = SaneHz(a.ObservedHz) ? a.ObservedHz : panelHz;
+        if (!SaneHz(hz))
+        {
+            a.Vrr = "判定できません（リフレッシュレートを求められませんでした）";
+            return a;
+        }
         if (hz <= 0)
         {
             a.Vrr = "判定できません（モニターのリフレッシュレートが分かりません）";

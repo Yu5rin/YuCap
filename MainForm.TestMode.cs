@@ -1133,7 +1133,7 @@ public sealed partial class MainForm
                 .Num("記録の状況", p.StatsNote);
             if (p.Frames > 0)
             {
-                if (p.ObservedHz > 0) item.Num("実測のリフレッシュレート", $"{p.ObservedHz:0.0} Hz");
+                item.Num("実測のリフレッシュレート", TestProbes.SaneHz(p.ObservedHz) ? $"{p.ObservedHz:0.0} Hz" : "求められませんでした");
                 item.Num("1コマが画面に出ていた時間", $"平均 {p.MeanMs:0.00} ms（ばらつき {p.StdMs:0.00} ms、5〜95% は {p.P5Ms:0.0}〜{p.P95Ms:0.0} ms）  [{p.Frames} コマ]")
                     .Num("カクつき率", $"{Pct(p.JudderShare)}（1コマの本来の長さ {budget:0.0} ms の 1.25 倍より長く出ていたコマ）")
                     .Num("コマ飛び", panel > 0 && panel < srcFps * 0.98

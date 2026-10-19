@@ -2946,8 +2946,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (st.Idle == InterpolationIdle.None && st.Active)
         {
             double shown = _video.Stats?.PresentedFps ?? st.RefreshHz;
-            tip = L.F("フレーム補間: 映像 {0:0.#} fps を、画面に実際に出ている {1:0.#} fps にしています（画面は {2:0.#} Hz）", st.SourceFps, shown, st.RefreshHz);
-            return $"{st.SourceFps:0}→{shown:0} fps";
+            double src = _video.GameFpsReliable && _video.GameFps > 0 ? _video.GameFps : st.SourceFps;
+            tip = L.F("フレーム補間: 映像 {0:0.#} fps を、画面に実際に出ている {1:0.#} fps にしています（画面は {2:0.#} Hz）", src, shown, st.RefreshHz);
+            return $"{src:0}→{shown:0} fps";
         }
         string why = InterpolationInfoText();
         tip = L.F("フレーム補間は今は働いていません: {0}", why);
@@ -4289,25 +4290,28 @@ public sealed partial class MainForm : Form, IMessageFilter
         return string.Empty;
     }
 
-    /// <summary>FPS だけ: the frames actually shown per second, and under it the game's rate / the input rate / 補間.</summary>
+    /// <summary>FPS だけ. Interpolation off: the game's real rate (unique pictures per second) alone; the input rate when the
+    /// game rate is unknown, 「静止」 for a still picture. Interpolation on: the pictures shown per second (each refresh is a
+    /// distinct interpolated picture) and 「ゲーム N」 under it.</summary>
     private void UpdateFpsInfo()
     {
-        string big = "—";
-        var parts = new List<string>();
-        if (_video.IsRunning)
+        string big = "—", small = string.Empty;
+        if (_video.IsRunning && _video.Stats is { } st)
         {
-            if (_video.Stats is { } st)
+            bool gameKnown = _video.GameFpsReliable && _video.GameFps > 0;
+            bool interp = _video.SupportsInterpolation && _settings.Interpolation && _video.InterpolationState is { Active: true };
+            if (interp)
             {
                 big = Math.Round(st.PresentedFps).ToString("0");
-                if (_video.GameFpsReliable && _video.GameFps > 0) parts.Add(L.F("ゲーム {0:0}", _video.GameFps));
-                else if (_video.PictureStill) parts.Add(L.T("静止"));
-                if (st.InputFps > 0) parts.Add(L.F("入力 {0:0}", st.InputFps));
+                small = gameKnown ? L.F("ゲーム {0:0}", _video.GameFps)
+                    : st.InputFps > 0 ? L.F("入力 {0:0}", st.InputFps) : string.Empty;
             }
-            if (_video.SupportsInterpolation && _settings.Interpolation && _video.InterpolationState is { Active: true })
-                parts.Add(L.T("補間"));
+            else if (_video.PictureStill) big = L.T("静止");
+            else if (gameKnown) big = Math.Round(_video.GameFps).ToString("0");
+            else big = Math.Round(st.InputFps).ToString("0");
         }
         string before = _info.Text;
-        _info.SetFps(big, string.Join(" ・ ", parts));
+        _info.SetFps(big, small);
         if (_info.Text != before || !_info.Showing) PositionInfo();
     }
 

@@ -191,6 +191,13 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(akOut, "report.txt"), akText, new System.Text.UTF8Encoding(true));
             return;
         }
+        if (args.Length > 0 && args[0] == "--refresh-hz-check")
+        {
+            int bad = TestProbes.SelfCheckRefreshHz();
+            Console.WriteLine(bad == 0 ? "ALL OK" : $"{bad} FAILED");
+            Environment.Exit(bad == 0 ? 0 : 1);
+            return;
+        }
         // Calibration of the picture-detail estimator on synthetic enlarged pictures (no device, no window).
         if (args.Length > 0 && args[0] == "--res-estimate-check")
         {
