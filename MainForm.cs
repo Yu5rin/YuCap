@@ -351,7 +351,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         InitAvAuto();
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); AutoProfileTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); AutoProfileTick(); SignalTick(); StreamTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
         _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
@@ -679,6 +679,10 @@ public sealed partial class MainForm : Form, IMessageFilter
             ShortcutKeyDisplayString = "Ctrl+C",
         };
         _miBurst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog());
+        var gallery = new ToolStripMenuItem(L.T("スナップショット一覧..."), null, (_, _) => ShowSnapshotGallery())
+        {
+            ShortcutKeyDisplayString = "Ctrl+G",
+        };
         var openDir = new ToolStripMenuItem(L.T("保存先フォルダを開く"), null, (_, _) => OpenSnapshotFolder());
         var exit = new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close());
         file.DropDownOpening += (_, _) => UpdateChecks();
@@ -686,6 +690,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         file.DropDownItems.Add(copy);
         file.DropDownItems.Add(_miBurst);
         file.DropDownItems.Add(new ToolStripSeparator());
+        file.DropDownItems.Add(gallery);
         file.DropDownItems.Add(openDir);
         file.DropDownItems.Add(new ToolStripSeparator());
         file.DropDownItems.Add(exit);
@@ -795,6 +800,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         view.DropDownItems.Add(fullscreen);
         view.DropDownItems.Add(BuildFullscreenDisplaySubmenu());
+        view.DropDownItems.Add(BuildSignalSubmenu());
         view.DropDownItems.Add(_miPip);
         view.DropDownItems.Add(BuildPipSettingsSubmenu());
         view.DropDownItems.Add(new ToolStripSeparator());
@@ -805,6 +811,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(BuildInfoModeSubmenu());
         view.DropDownItems.Add(BuildTextSizeSubmenu());
+        view.DropDownItems.Add(new ToolStripSeparator());
+        AddStreamMenu(view);
         view.DropDownItems.Add(new ToolStripSeparator());
         view.DropDownItems.Add(_miMenuBar);
         view.DropDownItems.Add(_miStatusBar);
@@ -1196,6 +1204,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットを保存"), null, (_, _) => SaveSnapshot()));
         _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットをコピー"), null, (_, _) => CopySnapshotToClipboard()));
+        _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショット一覧..."), null, (_, _) => ShowSnapshotGallery()));
         _ctx.Items.Add(new ToolStripSeparator());
 
         _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
@@ -1281,6 +1290,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gHere, L.T("ウィンドウの移動"), L.T("映像をドラッグ"));
         Row(gHere, L.T("スナップショットを保存"), "Ctrl+S");
         Row(gHere, L.T("スナップショットをコピー"), "Ctrl+C");
+        Row(gHere, L.T("スナップショット一覧"), "Ctrl+G");
         Row(gHere, L.T("常に前面に表示"), "Ctrl+T");
         Row(gHere, L.T("ウィンドウ枠を非表示"), "Ctrl+B");
         Row(gHere, L.T("メニューバーの表示"), "F10");
@@ -1833,6 +1843,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             try { SaveSettings(); } catch { /* ignore */ }
         }
         _uiTimer.Stop();
+        StreamOnMainClosing();
         _osdTimer.Stop();
         _devTimer.Stop();
         _burstTimer.Stop();
@@ -2959,6 +2970,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _video.Crop = new Padding(_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
             _video.LowLatency = _settings.LowLatency;    // read by the engine at its next start
             _video.Interpolation = _settings.Interpolation;
+            _video.PowerSaveEnabled = !_testRunning || _testPowerSave;   // the test mode often runs on a black source: it must not be put to sleep
         }
         catch (Exception ex)
         {
@@ -4532,6 +4544,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cmiLowLatency.Checked = _miLowLatency.Checked;
         _cmiLowLatency.ToolTipText = _miLowLatency.ToolTipText;
         UpdateStyleItems();
+        UpdateStreamChecks();
+        UpdateSignalChecks();
         _miLockAspect.Checked = _lockAspect;
         _miBorderless.Checked = _isBorderless;
         _cmiBorderless.Checked = _isBorderless;
@@ -4655,6 +4669,9 @@ public sealed partial class MainForm : Form, IMessageFilter
                 return true;
             case Keys.Control | Keys.C:
                 if (!isRepeat) CopySnapshotToClipboard();
+                return true;
+            case Keys.Control | Keys.G:
+                if (!isRepeat) ShowSnapshotGallery();
                 return true;
             case Keys.Control | Keys.T:
                 ToggleAlwaysOnTop();
@@ -4839,6 +4856,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         if (!_video.IsRunning) return string.Empty;
         if (_video.GameFpsReliable && _video.GameFps > 0) return L.F("（ゲーム {0:0} fps）", _video.GameFps);
+        if (NoSignalNow) return L.T("（信号なし）");
         if (_video.PictureStill) return L.T("（静止）");
         return string.Empty;
     }
@@ -4858,7 +4876,8 @@ public sealed partial class MainForm : Form, IMessageFilter
                 : st.InputFps > 0 ? L.F("入力 {0:0}", st.InputFps) : string.Empty;
             return;
         }
-        if (_video.PictureStill) big = L.T("静止");
+        if (NoSignalNow) big = L.T("信号なし");
+        else if (_video.PictureStill) big = L.T("静止");
         else if (gameKnown) big = _video.GameFps.ToString("0");
         else big = st.InputFps.ToString("0");
         // 補間 is on but waiting: say why under the number, or the bare game rate looks like a broken 補間

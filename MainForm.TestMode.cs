@@ -531,6 +531,8 @@ public sealed partial class MainForm
             steps.Add((L.F("機能の確認: {0}", L.T("表示どおりの保存")), secFunc, () => FeatureSnapshot(secFunc)));
             steps.Add((L.F("機能の確認: {0}", L.T("回転と反転")), secFunc, () => FeatureOrientation(secFunc)));
             steps.Add((L.F("機能の確認: {0}", L.T("なめらか ⇔ 低遅延の切り替え")), secFunc, () => FeatureStyle(secFunc, mFeat)));
+            steps.Add((L.F("機能の確認: {0}", L.T("配信用ウィンドウ")), secFunc, () => FeatureStream(secFunc, mFeat)));
+            steps.Add((L.F("機能の確認: {0}", L.T("信号なしの検出と省電力")), secFunc, () => FeatureSignal(secFunc, modes, mFeat)));
         }
         else
         {
@@ -543,6 +545,7 @@ public sealed partial class MainForm
         }
 
         steps.Add((L.F("機能の確認: {0}", L.T("プロファイルの自動切り替え")), secFunc, () => AutoProfileStep(secFunc)));
+        steps.Add((L.F("機能の確認: {0}", L.T("スナップショット一覧")), secFunc, () => FeatureGallery(secFunc)));
         steps.Add((L.T("音声の確認"), secAudio, () => AudioStep(secAudio)));
         steps.Add((L.T("遅延の確認"), secAudio, () => LatencyStep(secAudio, videoOk)));
         steps.Add((L.T("ダイアログの確認"), secDlg, () => DialogStep(secDlg)));
@@ -1437,9 +1440,10 @@ public sealed partial class MainForm
     /// <summary>Is the text over the video big enough to read from where one sits? Measures the real fonts of the
     /// notice and the info panel in fullscreen on the test monitor.
     /// Assumptions: viewing distance = 1.5 x the screen height (TV / desktop monitor); capital-letter height
-    /// is what is judged; minimum comfortable visual angle about 0.25 deg for small info text and about
+    /// is what is judged; minimum comfortable visual angle about 0.12 deg for the small info panels (they are
+    /// meant to be unobtrusive like a game's FPS counter; at most 1.2% of the screen height) and about
     /// 0.35 deg for notices (0.4 deg rounded down, so the classic 12pt notice on a 1080p screen still passes);
-    /// more than 5% of the screen height is judged absurdly large.</summary>
+    /// more than 5% of the screen height is judged absurdly large for a notice.</summary>
     /// <summary>Screen rectangle of a part of an overlay (it may be a layer drawn into the video, not a window).</summary>
     private Rectangle OverlayScreenRect(OverlayControl c, Rectangle local) =>
         new(PointToScreen(new Point(c.Left + local.X, c.Top + local.Y)), local.Size);
@@ -1468,7 +1472,7 @@ public sealed partial class MainForm
             double osdFrac = (double)osdCap / screenH, infoFrac = (double)infoCap / screenH;
             double Deg(double frac) => Math.Atan(frac / 1.5) * 180 / Math.PI;   // distance = 1.5 x screen height
             double osdDeg = Deg(osdFrac), infoDeg = Deg(infoFrac);
-            const double osdMinDeg = 0.35, infoMinDeg = 0.2, maxFrac = 0.05;
+            const double osdMinDeg = 0.35, osdMaxFrac = 0.05, infoMinDeg = 0.12, infoMaxFrac = 0.012;
             string F(double f) => (f * 100).ToString("0.00") + "%";
 
             item.Num("モニターの大きさ（高さ）", $"{screenH} ピクセル")
@@ -1477,7 +1481,7 @@ public sealed partial class MainForm
                 .Num("YuCap が掛けた倍率（情報表示）", $"x{_info.TextFactor:0.00}")
                 .Num("通知の文字（大文字の高さ）", $"{osdCap} ピクセル ／ 画面の高さの {F(osdFrac)} ／ 約 {osdDeg:0.00}°")
                 .Num("情報表示の文字（大文字の高さ）", $"{infoCap} ピクセル ／ 画面の高さの {F(infoFrac)} ／ 約 {infoDeg:0.00}°")
-                .Num("前提", "画面の高さの 1.5 倍の距離から見る。目安は通知 0.35° 以上・情報表示 0.2° 以上、画面の高さの 5% 以下");
+                .Num("前提", "画面の高さの 1.5 倍の距離から見る。目安は通知 0.35° 以上・画面の高さの 5% 以下、情報表示（小さく控えめ）0.12° 以上・画面の高さの 1.2% 以下");
 
             // 情報表示「FPS だけ」: the big number and the small line, measured the same way.
             SetInfoMode(InfoMode.Fps);
@@ -1493,11 +1497,12 @@ public sealed partial class MainForm
 
             var problems = new List<string>();
             if (fpsBigDeg < infoMinDeg) problems.Add("FPS だけの数字が小さすぎます。");
-            if (fpsBigFrac > maxFrac) problems.Add("FPS だけの数字が大きすぎます。");
+            if (fpsBigFrac > infoMaxFrac) problems.Add("FPS だけの数字が大きすぎます。");
             if (!fpsInside) problems.Add("FPS だけの表示が映像の枠からはみ出しています。");
             if (osdDeg < osdMinDeg) problems.Add("通知の文字が小さすぎます。");
             if (infoDeg < infoMinDeg) problems.Add("情報表示の文字が小さすぎます。");
-            if (osdFrac > maxFrac || infoFrac > maxFrac) problems.Add("文字が大きすぎます。");
+            if (osdFrac > osdMaxFrac) problems.Add("通知の文字が大きすぎます。");
+            if (infoFrac > infoMaxFrac) problems.Add("情報表示の文字が大きすぎます。");
             Rectangle cv = _canvas.Bounds;
             if (_osd.Showing && !cv.Contains(_osd.Bounds)) problems.Add("通知が映像の枠からはみ出しています。");
             if (_info.Showing && !cv.Contains(_info.Bounds)) problems.Add("情報表示が映像の枠からはみ出しています。");
@@ -2106,7 +2111,7 @@ public sealed partial class MainForm
         var dialogs = new List<Action>
         {
             ShowBurstDialog, ShowAudioBufferSettings, ShowAvSyncDialog, ShowAdjustmentsDialog, ShowCropDialog,
-            ShowSnapshotSettings, ShowAbout, ShowShortcuts, ShowDeviceKeywordSettings, ShowHotkeySettings,
+            ShowSnapshotSettings, () => ShowSnapshotGallery(), ShowAbout, ShowShortcuts, ShowDeviceKeywordSettings, ShowHotkeySettings,
             () => AskProfileName(L.T("新しいプロファイル"), string.Empty, null),
         };
         Ui.DialogAudit = AuditDialog;

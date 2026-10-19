@@ -210,6 +210,36 @@ public sealed class D3DVideoEngine : IVideoEngine
     public double GameFps => _s?.Renderer?.GameFps ?? 0;
     public bool GameFpsReliable => _s?.Renderer?.GameFpsReliable ?? false;
     public bool PictureStill => _s?.Renderer?.PictureStill ?? false;
+    public SignalState SignalState => _s?.Renderer?.Signal.State ?? SignalState.Unknown;
+    public long SignalChanges => _s?.Renderer?.Signal.Changes ?? 0;
+    public bool PowerSaving => _s?.PowerSaving ?? false;
+    private volatile bool _powerSaveEnabled = true;
+    public bool PowerSaveEnabled { get => _powerSaveEnabled; set => _powerSaveEnabled = value; }
+
+    // ---- 配信用ウィンドウ: a second swap chain on another top-level window, picture only ----
+    private IntPtr _streamHwnd;
+    private Size _streamSize;
+    private int _streamGen;                        // bumped by every SetStreamWindow
+    private readonly object _streamLock = new();
+    public bool SupportsStreamWindow => true;
+    public void SetStreamWindow(IntPtr hwnd, Size size)
+    {
+        lock (_streamLock)
+        {
+            _streamHwnd = hwnd; _streamSize = size; _streamGen++;
+        }
+        _s?.Poke();
+    }
+    private (IntPtr Hwnd, Size Size, int Gen) StreamRequest() { lock (_streamLock) return (_streamHwnd, _streamSize, _streamGen); }
+    public long StreamPresented => _s?.Renderer?.StreamPresented ?? 0;
+    public string StreamParts => _s?.Renderer?.StreamParts ?? "-";
+    public (double Avg, double Max, long N) StreamCpu => _s?.Renderer?.StreamCpu ?? (0, 0, 0);
+    public Bitmap? StreamSnapshot()
+    {
+        Session? s = _s;
+        if (s == null) return null;
+        return s.Run(r => r.ReadStream(), 3000, needFrame: true, out _, allowNull: true);
+    }
     public long FramesReceived => _s?.FramesReceived ?? 0;
     public long FramesPresented => _s?.FramesPresented ?? 0;
     public long FramesDropped => _s?.FramesDropped ?? 0;
@@ -670,7 +700,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     nextAt = now + 800;
                 }
                 D3DRenderer? r = _r;
-                if (r == null || !r.HasFrame || _e._rotation is 90 or 270) continue;
+                if (r == null || !r.HasFrame || _e._rotation is 90 or 270 || PowerSaving) continue;
                 // A new picture size (mode, crop, device) is judged at once, however settled the last decision was.
                 Size cur = r.OrientedSize;
                 if (lastSize != Size.Empty && cur.Width > 0 && cur != lastSize && nextAt > now) nextAt = now;
@@ -926,6 +956,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 Thread.Sleep(100);
                 D3DRenderer? r = _r;
                 if (!_e._crispOn || r == null || !r.HasFrame) { if (_crisp != null && !_e._crispOn) _crisp = null; continue; }
+                if (PowerSaving) continue;                    // no signal: nothing to measure
                 Rectangle dst = _e.CurrentDst();
                 Size client = r.SwapSize;
                 Size src = r.OrientedSize;
@@ -988,6 +1019,10 @@ public sealed class D3DVideoEngine : IVideoEngine
                 catch (Exception ex) { Log.Info("D3D: crispness sample failed - " + ex.Message.Split('\n')[0]); Thread.Sleep(1000); }
             }
         }
+
+        private volatile bool _powerSaving;
+        /// <summary>No signal for a while: the render loop is in its power-saving mode (see RenderLoop).</summary>
+        public bool PowerSaving => _powerSaving;
 
         public void Poke() { Volatile.Write(ref _dirtyCompose, 1); TryWake(); }
         public void PokeConvert() { Volatile.Write(ref _dirtyConvert, 1); Poke(); }
@@ -1190,11 +1225,31 @@ public sealed class D3DVideoEngine : IVideoEngine
             // change of the destination rectangle or window size, and a long silence all force a present.
             Rectangle lastDstSeen = Rectangle.Empty;
             long lastPresentTick = Stopwatch.GetTimestamp();
+            int streamGenSeen = 0;
 
             while (!_stopping)
             {
                 bool newFrame, reconvert, dirty;
                 iter++;
+                // No signal for a while (the card shows its own message): do almost nothing until a real picture is back. The
+                // loop then only looks every 30 ms and, once per 500 ms, converts and presents the card's (unchanging) picture.
+                long loopNow = Stopwatch.GetTimestamp();
+                bool saving = _e.PowerSaveEnabled && r.Signal.SavingPower(loopNow);
+                if (saving != _powerSaving)
+                {
+                    _powerSaving = saving;
+                    Log.Info(saving ? "D3D: no signal - power saving (presenting at most twice a second)" : "D3D: signal back - normal rendering");
+                    if (!saving) { Volatile.Write(ref _dirtyConvert, 1); Volatile.Write(ref _dirtyCompose, 1); }
+                }
+                var sreq = _e.StreamRequest();
+                if (sreq.Gen != streamGenSeen)
+                {
+                    streamGenSeen = sreq.Gen;
+                    try { r.StreamConfigure(sreq.Hwnd, sreq.Size); }
+                    catch (Exception ex) { Log.Info("D3D: stream window could not be set up - " + ex.Message.Split('\n')[0]); }
+                }
+                bool savingTick = saving && (loopNow - lastPresentTick) * 2 >= Stopwatch.Frequency;   // time for the 2-a-second refresh
+                bool skipWork = saving && !savingTick;
                 int userDelayMs = _e._videoDelayMs;
                 double marginMs = displayDriven ? PacingMarginMs : 0;
                 if (displayDriven && !marginLogged && marginMs > 0)
@@ -1205,7 +1260,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 int delayMs = userDelayMs + (int)Math.Round(marginMs);   // what the ring holds frames back by
                 bool waitedLatency = false;
 
-                if (displayDriven)
+                if (displayDriven && !saving)
                 {
                     long tk = Environment.TickCount64;
                     bool reeval = Interlocked.Exchange(ref _interpReeval, 0) == 1;
@@ -1226,7 +1281,19 @@ public sealed class D3DVideoEngine : IVideoEngine
                 }
                 long arrivalShown = 0;
 
-                if (displayDriven)
+                if (displayDriven && saving)
+                {
+                    // Not one iteration per refresh: nothing changes, so look in only now and then.
+                    _wake.WaitOne(30);
+                    if (_stopping) break;
+                    ServiceRequests(r);
+                    if (!IsWindow(_hwnd)) { RequestStop("window gone", unexpected: true); break; }
+                    Interlocked.Exchange(ref _frameReady, 0);
+                    newFrame = false;
+                    waitedLatency = true;
+                    presentedLast = false;
+                }
+                else if (displayDriven)
                 {
                     // One iteration per refresh. The beat is the vertical blank of the output the window is on
                     // (IDXGIOutput.WaitForVBlank), which is the same clock the panel runs on whichever monitor
@@ -1264,8 +1331,8 @@ public sealed class D3DVideoEngine : IVideoEngine
                     // With a video delay the next frame is due at a known time: sleep until then
                     // instead of until the next capture wake-up, or every frame would be shown up
                     // to one frame late.
-                    int waitMs = 250;
-                    if (userDelayMs > 0)
+                    int waitMs = saving ? 30 : 250;
+                    if (userDelayMs > 0 && !saving)
                     {
                         long due = r.NextDueTicks(userDelayMs * Stopwatch.Frequency / 1000);
                         if (due != long.MaxValue)
@@ -1290,7 +1357,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 // due one that arrived at least `delayMs` ago (user delay + pacing margin).
                 // With interpolation the hold-back also includes one source frame interval: the picture
                 // shown is that of time now - hold, made from the two frames around it.
-                bool interp = displayDriven && _interpActive;
+                bool interp = displayDriven && _interpActive;   // (kept while saving: the ring and the hold stay as they are; only the work stops)
                 double nominalNow = Volatile.Read(ref _nominalMs);
                 // Pictures that repeat (a 30 fps game in a 60 fps stream) are skipped by the interpolation, so the next NEW
                 // picture is one picture interval away instead of one frame interval: the hold-back grows by the difference
@@ -1314,20 +1381,20 @@ public sealed class D3DVideoEngine : IVideoEngine
                     newFrame = false;
                     long holdTicks = (long)(interpHoldMs * Stopwatch.Frequency / 1000.0);
                     long interpT = Stopwatch.GetTimestamp() - holdTicks;
-                    if (r.InterpUpdate(interpT, _e._rotation, _e._mirror,
-                            _e.CurrentAdjustments(), _e.Crop, reconvert, out bool changed))
+                    if (!skipWork && r.InterpUpdate(interpT, _e._rotation, _e._mirror,
+                            _e.CurrentAdjustments(), _e.Crop, reconvert || savingTick, out bool changed))
                     {
                         newFrame = changed;
                         if (changed) contentTicks = interpT;
                     }
                     long rd2 = r.TakeRingDropped();
-                    if (rd2 > 0) Interlocked.Add(ref _dropped, rd2);
+                    if (rd2 > 0 && !saving) Interlocked.Add(ref _dropped, rd2);
                 }
                 else if (ringed)
                 {
                     newFrame = false;   // capture arrivals do not drive presentation here
                     long delayTicks = drawnOnce ? delayMs * Stopwatch.Frequency / 1000 : 0;   // the first frame needs no pacing margin
-                    bool due = r.HasDueFrame(Stopwatch.GetTimestamp(), delayTicks);
+                    bool due = !skipWork && r.HasDueFrame(Stopwatch.GetTimestamp(), delayTicks);
                     if (!dueLogged && Early && (due || iter <= 3))
                     {
                         if (due) dueLogged = true;
@@ -1341,7 +1408,12 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if (newFrame) contentTicks = arrivalShown;
                     }
                     long rd = r.TakeRingDropped();
-                    if (rd > 0) Interlocked.Add(ref _dropped, rd);
+                    if (rd > 0 && !saving) Interlocked.Add(ref _dropped, rd);
+                }
+                if (saving && !interp)
+                {
+                    // the card's picture is converted and shown only on the 2-a-second tick (whatever frame is current then)
+                    newFrame = savingTick;
                 }
                 bool delayed = userDelayMs > 0 || interp;
                 int delayKey = interp ? (int)Math.Ceiling(interpHoldMs) : delayMs;
@@ -1365,7 +1437,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 Rectangle dstSeen = _e.CurrentDst();
                 if (dstSeen != lastDstSeen) dirty = true;                     // rect change: independent of Poke
                 if (!drawnOnce) dirty = true;                                 // session start: present as soon as there is a frame
-                else if ((Stopwatch.GetTimestamp() - lastPresentTick) * 4 > Stopwatch.Frequency) dirty = true;   // nothing shown for 250 ms
+                else if ((Stopwatch.GetTimestamp() - lastPresentTick) * (saving ? 2 : 4) > Stopwatch.Frequency) dirty = true;   // nothing shown for 250 ms (500 ms with no signal)
                 if (!r.HasFrame || client.Width <= 0 || client.Height <= 0)
                 {
                     // Nothing to draw yet: keep the requests instead of dropping them.
@@ -1393,7 +1465,10 @@ public sealed class D3DVideoEngine : IVideoEngine
                     Rectangle dst = _e.CurrentDst();
                     if (dst.Width <= 0 || dst.Height <= 0)
                         dst = new Rectangle(0, 0, client.Width, client.Height);
-                    Result hr = r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness, NativeTargetHeight(), _e._overlays);
+                    // no signal: the card's message is drawn with the plain bilinear scaler (no FSR / CNN / shrink pass)
+                    Result hr = saving
+                        ? r.PresentFrame(dst, ScalingQuality.Standard, _e._pixelPerfect, _e._sharpness, 0, _e._overlays)
+                        : r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness, NativeTargetHeight(), _e._overlays);
                     if (hr.Failure)
                     {
                         HandlePresentFailure(r, hr);
@@ -1402,6 +1477,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     drawnOnce = true;
                     presentedLast = true;
                     Interlocked.Increment(ref _presented);
+                    if (r.StreamActive) r.StreamPresent(_e._quality, _e._pixelPerfect, _e._sharpness);   // after the main Present: it never delays the main window
                     if (newFrame)
                     {
                         // Direct path (no ring): the frame shown is the newest one that arrived.

@@ -15,11 +15,13 @@ public enum InfoMode { Off, Fps, Full }
 /// </summary>
 public sealed class InfoOverlay : OverlayControl
 {
-    // 12px = 9pt at 96 DPI, times a scale that follows the monitor DPI and the video size (see TextScale).
-    private Font _font = TextScale.MakeFont("Consolas", 12f, 1f, FontStyle.Regular);
+    // Small like the FPS counters of games (Steam, RTSS): 11px = 8pt at 96 DPI, times a scale that follows the monitor DPI only
+    // (not the video size; see TextScale).
+    private const float BasePx = 11f;
+    private Font _font = TextScale.MakeFont("Consolas", BasePx, 1f, FontStyle.Regular);
     private Font _bigFont = TextScale.MakeFont("Consolas", BigBasePx, 1f, FontStyle.Bold);
     private float _scale = 1f;
-    private const float BigBasePx = 24f;
+    private const float BigBasePx = 17f;   // 12.75pt: capitals about 11px
     private string _big = "", _small = "";
     private static readonly Color Fore = Color.FromArgb(220, 220, 220);
 
@@ -41,12 +43,12 @@ public sealed class InfoOverlay : OverlayControl
     /// <summary>The big-number font of the FPS mode (for the test mode's size measurement).</summary>
     internal Font BigFont => _bigFont;
 
-    /// <summary>Scale factor currently applied (1 = the classic 9pt at 100% DPI).</summary>
+    /// <summary>Scale factor currently applied (1 = 8pt at 100% DPI).</summary>
     internal float TextFactor => _scale;
     /// <summary>The font in use (for the test mode's size measurement).</summary>
     internal Font TextFont => _font;
     /// <summary>Gap to the edge of the video area, in pixels at the current scale.</summary>
-    internal int EdgeGap => TextScale.Px(12, _scale);
+    internal int EdgeGap => TextScale.Px(8, _scale);
 
     /// <summary>Follow the monitor DPI / video size: new font, new padding, re-fit. No-op when unchanged.</summary>
     internal void ApplyScale(float scale)
@@ -54,7 +56,7 @@ public sealed class InfoOverlay : OverlayControl
         if (Math.Abs(scale - _scale) < 0.001f) return;
         _scale = scale;
         Font old = _font;
-        _font = TextScale.MakeFont("Consolas", 12f, scale, FontStyle.Regular);
+        _font = TextScale.MakeFont("Consolas", BasePx, scale, FontStyle.Regular);
         old.Dispose();
         Font oldBig = _bigFont;
         _bigFont = TextScale.MakeFont("Consolas", BigBasePx, scale, FontStyle.Bold);
@@ -173,13 +175,13 @@ public sealed class InfoOverlay : OverlayControl
             return;
         }
         Size sz = TextRenderer.MeasureText(Text, _font, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding);
-        int px = TextScale.Px(10, _scale), py = TextScale.Px(7, _scale);
+        int px = TextScale.Px(7, _scale), py = TextScale.Px(5, _scale);
         Size = new Size(sz.Width + px * 2, sz.Height + py * 2);
         SetRoundedRegion();
         Changed();
     }
 
-    private int CornerRadius => TextScale.Px(10, _scale);   // the same as the notice (OsdOverlay)
+    private int CornerRadius => TextScale.Px(6, _scale);
 
     private void SetRoundedRegion()
     {
@@ -209,7 +211,7 @@ public sealed class InfoOverlay : OverlayControl
             return;
         }
         TextRenderer.DrawText(g, Text, _font,
-            new Point(TextScale.Px(10, _scale), TextScale.Px(7, _scale)), Fore, TextFormatFlags.NoPadding);
+            new Point(TextScale.Px(7, _scale), TextScale.Px(5, _scale)), Fore, TextFormatFlags.NoPadding);
     }
 
     internal override void PaintOverlay(Graphics g, bool offscreen)
@@ -243,7 +245,7 @@ public sealed class InfoOverlay : OverlayControl
 /// </summary>
 internal static class TextScale
 {
-    public const double KInfo = 1.8;     // 4K: x2.8 -> Consolas capitals about 1.0% of the screen height (FPS digits about 2%)
+    public const double KInfo = 0;       // info panels follow the monitor DPI only (like game overlays): 4K at 200% -> digits about 1.0% of the screen height
     public const double KOsd = 4.2;      // 4K: x5.2 -> Segoe UI bold capitals about 2.7%
     public const double KCaption = 1.5;  // test-mode caption bar
     public const double KMessage = 2.0;  // "no video" message

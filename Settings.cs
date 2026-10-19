@@ -39,6 +39,10 @@ public sealed class AppSettings
     // Snapshot output.
     public string? SnapshotDir { get; set; }      // null => Pictures\CaptureViewer
     public string SnapshotFormat { get; set; } = "png"; // "png" | "jpg"
+    /// <summary>保存したらクリップボードにもコピーする (Ctrl+S / hotkey only; burst shots are not copied).</summary>
+    public bool SnapshotAlsoCopy { get; set; }
+    /// <summary>プロファイルごとにフォルダを分ける: save into &lt;保存先&gt;\&lt;active profile name&gt;\.</summary>
+    public bool SnapshotByProfile { get; set; }
 
     // Video orientation (for camera-style sources).
     public int Rotation { get; set; }             // 0 / 90 / 180 / 270
@@ -80,6 +84,17 @@ public sealed class AppSettings
     // Which display fullscreen uses: "" = the one the window is on; otherwise "\.\DISPLAYn|name|WxH"
     // (see Displays.cs). Not part of the video profiles: it describes the room, not the source.
     public string FullscreenDisplay { get; set; } = "";
+
+    // ゲーム機の電源に合わせる: when the picture comes back after "no signal" (the console was switched on) go fullscreen on the
+    // 全画面にするモニター; when it goes away again, optionally return to the window. Off by default: a game's black screen that stays
+    // for 3 seconds, or a dark still scene with a bit of text in it, can look like the card's "No Signal" screen, and a fullscreen that jumps
+    // up by itself is not something to surprise anybody with.
+    public bool SignalFullscreen { get; set; }
+    public bool SignalLeaveFullscreen { get; set; }
+
+    // 配信用ウィンドウ (OBS etc. capture it): open or not, and its client size: "1920x1080", "1280x720", "2560x1440", "3840x2160" or "video".
+    public bool StreamWindowOpen { get; set; }
+    public string StreamWindowSize { get; set; } = "1920x1080";
 
     // Snapshots at the size shown on screen (FSR included) instead of the source size
     // (Direct3D only). Off by default: the saved file stays the exact source picture.
@@ -225,6 +240,7 @@ public sealed class AppSettings
         // Anything unrecognised (typo, hand edit, a value from a newer build) falls
         // back to the safe choice: the Media Foundation path / the FSR default.
         FullscreenDisplay = (FullscreenDisplay ?? "").Trim();
+        StreamWindowSize = StreamSizes.Normalize(StreamWindowSize);
         Renderer = NormalizeRenderer(Renderer);
         ScalingQuality = NormalizeQuality(ScalingQuality);
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);

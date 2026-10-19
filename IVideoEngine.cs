@@ -176,6 +176,16 @@ public interface IVideoEngine : IDisposable
     bool GameFpsReliable => false;
     /// <summary>The picture did not change over the last second or so: there is no frame rate to show.</summary>
     bool PictureStill => false;
+    /// <summary>Is the console sending a picture (<see cref="SignalState.Signal"/>) or is the card showing its own black "No Signal"
+    /// screen (<see cref="SignalState.NoSignal"/>)? Direct3D only (judged from the same-picture thumbnails); <c>Unknown</c> elsewhere
+    /// and until either has been seen. <see cref="SignalChanges"/> counts the changes, so a poller notices a quick there-and-back.</summary>
+    SignalState SignalState => SignalState.Unknown;
+    long SignalChanges => 0;
+    /// <summary>Direct3D: no signal for a while, so the renderer does almost nothing (no interpolation, scaling filters or measuring; at most
+    /// two presents a second) until a real picture comes back.</summary>
+    bool PowerSaving => false;
+    /// <summary>Test hook: false = never go into power saving (the test mode measures a source that may well be black; a measurement must not be cut short).</summary>
+    bool PowerSaveEnabled { get => true; set { } }
     /// <summary>Exact cumulative count of frames received from the capture device since Start
     /// (0 when not applicable). Unlike <see cref="Stats"/> it is not a rolling average, so the
     /// caller can take deltas over any precise window.</summary>
@@ -268,6 +278,18 @@ public interface IVideoEngine : IDisposable
     /// from), so nothing has to be a window over the video. Null/empty removes them.</summary>
     bool SupportsOverlays => false;
     void SetOverlays(IReadOnlyList<OverlayLayer>? layers) { }
+    /// <summary>Direct3D only: a second, top-level window (<paramref name="hwnd"/>, client <paramref name="size"/>) that shows just the
+    /// video (what 配信用ウィンドウ is for): the picture aspect-fit on black, no overlays, one present per presented main frame.
+    /// <c>hwnd == 0</c> closes it. The engine owns a flip-model swap chain on that window.</summary>
+    bool SupportsStreamWindow => false;
+    void SetStreamWindow(IntPtr hwnd, Size size) { }
+    /// <summary>Count of pictures presented to the stream window since it was set.</summary>
+    long StreamPresented => 0;
+    /// <summary>Test mode: render-thread CPU milliseconds per stream present (average, worst) and the count.</summary>
+    string StreamParts => "-";
+    (double Avg, double Max, long N) StreamCpu => (0, 0, 0);
+    /// <summary>Test mode: what the stream window last received, read back (null when not available).</summary>
+    Bitmap? StreamSnapshot() => null;
     /// <summary>Direct3D only: sample the crispness every <see cref="CrispnessIntervalMs"/> while this is on.</summary>
     bool SupportsCrispness => false;
     bool CrispnessSampling { get => false; set { } }

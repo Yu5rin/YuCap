@@ -2330,7 +2330,7 @@ internal sealed partial class D3DRenderer : IDisposable
         Beat.Dispose();
         InterpFree();
         A4kFree();
-        FreeOverlays(); FreeCrisp();
+        FreeOverlays(); FreeCrisp(); StreamFree();
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
         _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();

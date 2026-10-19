@@ -50,6 +50,8 @@ internal sealed partial class D3DRenderer
     private readonly IntPtr _dupScratch = Marshal.AllocHGlobal(64);
 
     private readonly GameRateMeter _meter = new();
+    /// <summary>No signal / signal, judged from the thumbnails (see Signal.cs).</summary>
+    public readonly SignalDetector Signal = new();
     private readonly UniqueTimeline _uniq = new();
     private volatile bool _dupDisabled;               // test hook: no detection at all (the old behaviour)
     private double _nominalMs = 1000.0 / 60;
@@ -91,11 +93,11 @@ internal sealed partial class D3DRenderer
         {
             _csDup = Device.CreateComputeShader(b.Dup);
             _dupCb = Device.CreateBuffer(new BufferDescription(32, BindFlags.ConstantBuffer, ResourceUsage.Default));
-            _dupStat = Device.CreateBuffer(new BufferDescription(16, BindFlags.UnorderedAccess, ResourceUsage.Default));
+            _dupStat = Device.CreateBuffer(new BufferDescription(32, BindFlags.UnorderedAccess, ResourceUsage.Default));
             _dupStatUav = Device.CreateUnorderedAccessView(_dupStat, new UnorderedAccessViewDescription
             {
                 Format = Format.R32_UInt, ViewDimension = UnorderedAccessViewDimension.Buffer,
-                Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = 4 },
+                Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = 8 },
             });
             for (int i = 0; i < 2; i++)
             {
@@ -115,7 +117,7 @@ internal sealed partial class D3DRenderer
             {
                 _tk[i] = new DupTicket
                 {
-                    Staging = Device.CreateBuffer(new BufferDescription(16, BindFlags.None, ResourceUsage.Staging, CpuAccessFlags.Read)),
+                    Staging = Device.CreateBuffer(new BufferDescription(32, BindFlags.None, ResourceUsage.Staging, CpuAccessFlags.Read)),
                 };
             }
         }
@@ -174,7 +176,7 @@ internal sealed partial class D3DRenderer
             {
                 // the oldest answer never came: give it up (that frame counts as a new picture)
                 DupTicket lost = _tk[_tkHead]!;
-                DupTaken(lost, false, 0, 0, 0, 0);
+                DupTaken(lost, false, 0, 0, 0, 0, 0, 0);
                 _tkHead = (_tkHead + 1) % TicketCount; _tkCount--;
             }
             bool hasPrev = _thumbValid && _thumbW == w && _thumbH == h;
@@ -216,15 +218,16 @@ internal sealed partial class D3DRenderer
             DupTicket tk = _tk[_tkHead]!;
             Result hr = Ctx.Map(tk.Staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.DoNotWait, out MappedSubresource m);
             if (hr.Failure) break;                         // still drawing (or lost): look again later
-            uint sum, max, c1, c2;
+            uint sum, max, c1, c2, dark, lit;
             try
             {
                 sum = (uint)Marshal.ReadInt32(m.DataPointer, 0); max = (uint)Marshal.ReadInt32(m.DataPointer, 4);
                 c1 = (uint)Marshal.ReadInt32(m.DataPointer, 8); c2 = (uint)Marshal.ReadInt32(m.DataPointer, 12);
+                dark = (uint)Marshal.ReadInt32(m.DataPointer, 16); lit = (uint)Marshal.ReadInt32(m.DataPointer, 20);
             }
             finally { Ctx.Unmap(tk.Staging, 0); }
             _tkHead = (_tkHead + 1) % TicketCount; _tkCount--;
-            DupTaken(tk, true, sum, max, c1, c2);
+            DupTaken(tk, true, sum, max, c1, c2, dark, lit);
         }
     }
 
@@ -245,8 +248,15 @@ internal sealed partial class D3DRenderer
     /// <summary>Frames submitted so far (replay: the number the next frame will follow).</summary>
     internal long FramesSubmitted { get { lock (FrameLock) return _frameNo; } }
 
-    private void DupTaken(DupTicket tk, bool known, uint sum, uint max, uint c1, uint c2)
+    private void DupTaken(DupTicket tk, bool known, uint sum, uint max, uint c1, uint c2, uint dark, uint lit)
     {
+        if (known)
+        {
+            // "Is the console sending a picture?": the card's own No Signal screen is mostly black with a little bright text and never changes.
+            bool message = SignalMath.MessageLike(dark, lit);
+            bool still = tk.HasPrev && SignalMath.Still(sum, c2);
+            Signal.Feed(tk.Arrival, message, SignalMath.BlackAll(dark, lit), still);
+        }
         bool same = known && tk.HasPrev && DupMath.Same(sum, max, c1, c2);
         bool unique = !same;
         long now = ClockOverride?.Invoke() ?? Stopwatch.GetTimestamp();

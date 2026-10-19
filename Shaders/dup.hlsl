@@ -5,6 +5,8 @@
 //             Stat[1] max of |d| * 64
 //             Stat[2] number of thumbnail pixels with |d| > T1
 //             Stat[3] number of thumbnail pixels with |d| > T2
+//             Stat[4] number of thumbnail pixels darker than 24 levels    (no-signal detection: "mostly black")
+//             Stat[5] number of thumbnail pixels brighter than 40 levels  (... with a little bright text)
 // The result is read back asynchronously (staging copy, Map with DO_NOT_WAIT) a frame or so later.
 cbuffer Cb : register(b0)
 {
@@ -25,12 +27,14 @@ groupshared float gSum[64];
 groupshared float gMax[64];
 groupshared uint  gC1[64];
 groupshared uint  gC2[64];
+groupshared uint  gDk[64];
+groupshared uint  gLt[64];
 
 [numthreads(8, 8, 1)]
 void thumb(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     float d = 0;
-    uint c1 = 0, c2 = 0;
+    uint c1 = 0, c2 = 0, dk = 0, lt = 0;
     if (id.x < TW && id.y < TH)
     {
         float x0 = (float)(id.x * P0.x / TW), x1 = (float)((id.x + 1) * P0.x / TW);
@@ -48,6 +52,8 @@ void thumb(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         float v = s / (float)(nx * ny) * 255.0;
         uint idx = id.y * TW + id.x;
         Cur[idx] = v;
+        dk = v < 24.0 ? 1 : 0;
+        lt = v > 40.0 ? 1 : 0;
         if (P0.z != 0)
         {
             d = abs(v - Prev[idx]);
@@ -55,7 +61,7 @@ void thumb(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             c2 = d > P1.y ? 1 : 0;
         }
     }
-    gSum[gi] = d; gMax[gi] = d; gC1[gi] = c1; gC2[gi] = c2;
+    gSum[gi] = d; gMax[gi] = d; gC1[gi] = c1; gC2[gi] = c2; gDk[gi] = dk; gLt[gi] = lt;
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint k = 32; k > 0; k >>= 1)
     {
@@ -65,6 +71,8 @@ void thumb(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             gMax[gi] = max(gMax[gi], gMax[gi + k]);
             gC1[gi] += gC1[gi + k];
             gC2[gi] += gC2[gi + k];
+            gDk[gi] += gDk[gi + k];
+            gLt[gi] += gLt[gi + k];
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -75,5 +83,7 @@ void thumb(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         InterlockedMax(Stat[1], (uint)(gMax[0] * 64.0), ignore);
         InterlockedAdd(Stat[2], gC1[0], ignore);
         InterlockedAdd(Stat[3], gC2[0], ignore);
+        InterlockedAdd(Stat[4], gDk[0], ignore);
+        InterlockedAdd(Stat[5], gLt[0], ignore);
     }
 }
