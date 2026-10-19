@@ -98,6 +98,7 @@ internal static class InterpCheck
         public double Detail;                       // mean gradient of the picture used
         public Size Size;
         public double BgPsnr, BlkPsnr, BgBlend, BlkBlend;
+        public double BdPsnr, BdBlend;             // the ring of +-10 px around the moving block's outline (covered / uncovered strips): the occlusion case
         public int BgN, BgOk, BgTexN, BgTexOk, BlkN, BlkOk;
         public double BgErr, BlkErr;
         public int BadBlocks, BadVectors;
@@ -170,12 +171,29 @@ internal static class InterpCheck
                 res.BlkPsnr = Program.Psnr(M, gt, w, blkRect);
                 res.BgBlend = Program.Psnr(blend, gt, w, bgRect);
                 res.BlkBlend = Program.Psnr(blend, gt, w, blkRect);
+                {
+                    // ring around the block outline at the middle picture (the edges where the block covers and uncovers the background)
+                    var ringOut = Rectangle.Inflate(blkMid, 10, 10);
+                    var ringIn = Rectangle.Inflate(blkMid, -10, -10);
+                    double Ring(int[] p)
+                    {
+                        double se = 0; long n = 0;
+                        for (int y = ringOut.Top; y < ringOut.Bottom; y++)
+                            for (int x = ringOut.Left; x < ringOut.Right; x++)
+                            {
+                                if (ringIn.Contains(x, y)) continue;
+                                for (int sh = 0; sh < 24; sh += 8) { int d = Ch(p[y * w + x], sh) - Ch(gt[y * w + x], sh); se += d * d; n++; }
+                            }
+                        return PsnrOf(se / Math.Max(1, n));
+                    }
+                    res.BdPsnr = Ring(M); res.BdBlend = Ring(blend);
+                }
 
                 // the field: one vector per block (8x8 source pixels, 16x16 for a wide source), centred at bp*fx + bp/2; "textured" = the block of A has real detail,
                 // so a vector there is well defined (a flat block can match anywhere)
                 var inner = Rectangle.Inflate(blk, -m, -m);
                 var outer = Rectangle.Inflate(blk, m * 2, m * 2);
-                int bp = D3DRenderer.InterpBlockPx(new Size(w, h));
+                int bp = D3DRenderer.DebugFieldPx > 0 ? D3DRenderer.DebugFieldPx : D3DRenderer.InterpBlockPx(new Size(w, h));
                 for (int fy = 0; fy < fs.Height; fy++)
                     for (int fx = 0; fx < fs.Width; fx++)
                     {

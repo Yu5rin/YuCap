@@ -129,6 +129,19 @@ internal static class Displays
         catch { return 0; }
     }
 
+    /// <summary>GDI device name (\.\DISPLAYn) of the monitor <paramref name="hwnd"/> is mostly on; empty when it cannot be told.</summary>
+    public static string DeviceNameOfWindow(IntPtr hwnd)
+    {
+        try
+        {
+            IntPtr mon = MonitorFromWindow(hwnd, 2 /* MONITOR_DEFAULTTONEAREST */);
+            if (mon == IntPtr.Zero) return string.Empty;
+            var mi = new MonitorInfoEx { cbSize = Marshal.SizeOf<MonitorInfoEx>() };
+            return GetMonitorInfoW(mon, ref mi) ? mi.szDevice : string.Empty;
+        }
+        catch { return string.Empty; }
+    }
+
     private static int RefreshRate(string deviceName)
     {
         try
@@ -215,5 +228,46 @@ internal static class Displays
         }
         catch (Exception ex) { Log.Info("Displays: friendly-name query failed: " + ex.Message); }
         return map;
+    }
+
+    /// <summary>Windows' "SDR content brightness" of the monitor <paramref name="deviceName"/> (\.\DISPLAYn) in nits
+    /// (DISPLAYCONFIG_SDR_WHITE_LEVEL / 1000 x 80); 0 when it cannot be read (the monitor is not in HDR mode, or the query fails).</summary>
+    public static float SdrWhiteNits(string deviceName)
+    {
+        try
+        {
+            if (GetDisplayConfigBufferSizes(QdcOnlyActivePaths, out uint np, out uint nm) != 0) return 0;
+            var paths = new PathInfo[np];
+            var modes = new ModeInfo[nm];
+            if (QueryDisplayConfig(QdcOnlyActivePaths, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) return 0;
+            IntPtr buf = Marshal.AllocHGlobal(512);
+            try
+            {
+                for (int i = 0; i < np; i++)
+                {
+                    PathInfo p = paths[i];
+                    Marshal.WriteInt32(buf, 0, SourceNameType);
+                    Marshal.WriteInt32(buf, 4, 84);
+                    Marshal.WriteInt32(buf, 8, unchecked((int)p.Source.AdapterId.Low));
+                    Marshal.WriteInt32(buf, 12, p.Source.AdapterId.High);
+                    Marshal.WriteInt32(buf, 16, unchecked((int)p.Source.Id));
+                    if (DisplayConfigGetDeviceInfo(buf) != 0) continue;
+                    string gdi = Marshal.PtrToStringUni(buf + 20, 32).Split(' ')[0];
+                    if (!string.Equals(gdi, deviceName, StringComparison.OrdinalIgnoreCase)) continue;
+                    Marshal.WriteInt32(buf, 0, 11 /* DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL */);
+                    Marshal.WriteInt32(buf, 4, 24);
+                    Marshal.WriteInt32(buf, 8, unchecked((int)p.Target.AdapterId.Low));
+                    Marshal.WriteInt32(buf, 12, p.Target.AdapterId.High);
+                    Marshal.WriteInt32(buf, 16, unchecked((int)p.Target.Id));
+                    Marshal.WriteInt32(buf, 20, 0);
+                    if (DisplayConfigGetDeviceInfo(buf) != 0) return 0;
+                    int v = Marshal.ReadInt32(buf, 20);
+                    return v > 0 ? v / 1000f * 80f : 0;
+                }
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        catch { }
+        return 0;
     }
 }

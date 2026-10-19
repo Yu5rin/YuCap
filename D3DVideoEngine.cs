@@ -130,7 +130,7 @@ public sealed class D3DVideoEngine : IVideoEngine
     public ScalingQuality Quality
     {
         get => _quality;
-        set { _quality = value; _s?.Poke(); }
+        set { if (value == ScalingQuality.NvRtx && _quality != value) D3DRenderer.NvMeasureDue = true; _quality = value; GuardConfigure(); _s?.Poke(); }
     }
     public float Sharpness
     {
@@ -155,6 +155,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         }
     }
     public NativeResStatus? NativeResState => _s?.NativeRes(_nrModeStr, _nrMode);
+    public Bitmap? GrabOrientedFrame() => _s?.GrabFrameCopy();
 
     public Bitmap? RenderOffscreen(Size output, ScalingQuality quality, int nativeH, int filter)
     {
@@ -162,6 +163,84 @@ public sealed class D3DVideoEngine : IVideoEngine
         if (s == null || !s.Alive) return null;
         float sharp = _sharpness;
         return s.Run(r => r.RenderOffscreen(output, quality, sharp, nativeH, filter), 8000, needFrame: true, out _);
+    }
+
+    private readonly QualityGuard _guard = new();
+    public string? GuardStatus => _guard.Text;
+    public long GuardSerial => _guard.Serial;
+    public System.Collections.Generic.IReadOnlyList<string> GuardLog => _guard.Log;
+    private void GuardConfigure()
+    {
+        _guard.Configure(_quality, D3DRenderer.A4kVariantLetter, D3DRenderer.RestoreMode == 1);
+        // the smaller network the guard may switch to compiles (about 0.3 s) now, in the background, not on the render thread mid-stream
+        if (_quality == ScalingQuality.Anime4K && D3DRenderer.A4kVariantLetter != 'S')
+            System.Threading.Tasks.Task.Run(() => { try { D3DShaders.GetA4k('S'); } catch { } });
+    }
+
+    public bool NvRtxSupported => D3DRenderer.NvAdapterPresent() && !D3DRenderer.NvVsrBroken;
+    public bool NvRtxIneffective => D3DRenderer.NvEffective < 0;
+    public string? NvRtxBrokenWhy => D3DRenderer.NvVsrBroken ? D3DRenderer.NvBrokenWhy : null;
+
+    private string _hdrModeStr = "off";
+    public string HdrMode
+    {
+        get => _hdrModeStr;
+        set
+        {
+            _hdrModeStr = AppSettings.NormalizeHdr(value);
+            D3DRenderer.HdrModeRequested = _hdrModeStr == "rtx" ? 1 : _hdrModeStr == "simple" ? 2 : 0;
+            _s?.Poke();
+        }
+    }
+    public int HdrKind => D3DRenderer.HdrActiveKind;
+    public float[]? HdrLiveCheck(int[] codes, out int kind, out string why)
+    {
+        float[]? res = null; int k = 0; string w = "映像が動いていません";
+        Session? s = _s;
+        if (s != null && s.Alive) s.Run(r => { res = r.HdrLiveCheck(codes, out k, out w); return null; }, 20000, needFrame: false, out _, allowNull: true);
+        kind = k; why = w;
+        return res;
+    }
+    public string SwapFormat => _s?.Renderer?.SwapFormatDesc ?? string.Empty;
+    public bool WideSdrActive => _s?.Renderer?.WideSdrActive ?? false;
+    public float[]? WideLiveCheck(int[] codes, out string why)
+    {
+        float[]? res = null; string w = "映像が動いていません";
+        Session? s = _s;
+        if (s != null && s.Alive) s.Run(r => { res = r.WideLiveCheck(codes, out w); return null; }, 20000, needFrame: false, out _, allowNull: true);
+        why = w;
+        return res;
+    }
+    public double MeasureVsr()
+    {
+        double d = -1;
+        Session? s = _s;
+        if (s != null && s.Alive) s.Run(r => { d = r.MeasureVsr(); return null; }, 20000, needFrame: false, out _, allowNull: true);
+        return d;
+    }
+    public string? HdrNote => string.IsNullOrEmpty(D3DRenderer.HdrActiveNote) ? null : D3DRenderer.HdrActiveNote;
+
+    public string RestoreMode
+    {
+        get => D3DRenderer.RestoreMode == 1 ? "on" : "off";
+        set { D3DRenderer.RestoreMode = value == "on" ? 1 : 0; GuardConfigure(); _s?.Poke(); }
+    }
+
+    public bool ChromaGuided
+    {
+        get => D3DRenderer.ChromaGuided;
+        set { if (D3DRenderer.ChromaGuided != value) { D3DRenderer.ChromaGuided = value; _s?.PokeConvert(); } }
+    }
+
+    public Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj, int matrix, bool fullRange, int chromaMode, int benchFrames, out double[] ms)
+    {
+        double[] t = Array.Empty<double>();
+        Session? s = _s;
+        Bitmap? bmp = null;
+        if (s != null && s.Alive)
+            bmp = s.Run(r => r.ConvertSynthetic(luma, chroma, w, h, adj, new YuvInfo(matrix, fullRange), chromaMode, benchFrames, out t), 60000, needFrame: false, out _);
+        ms = t;
+        return bmp;
     }
 
     public Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj)
@@ -542,6 +621,16 @@ public sealed class D3DVideoEngine : IVideoEngine
         return ok;
     }
 
+    internal bool DebugInterpChain(System.Collections.Generic.IList<Bitmap> pics, double alpha, out Bitmap? mid)
+    {
+        Bitmap? rm = null; bool ok = false;
+        Session? s = _s;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.InterpDebugChain(pics, alpha, out rm); return null; }, 120000, needFrame: false, out _);
+        mid = rm;
+        return ok && rm != null;
+    }
+
     internal bool DebugInterpSynthetic(Bitmap a, Bitmap b, double alpha, int benchFrames,
         out Bitmap? mid, out float[] fieldXy, out Size fieldSize, out string timing)
     {
@@ -766,6 +855,44 @@ public sealed class D3DVideoEngine : IVideoEngine
             finally { got.Dispose(); }
         }
 
+        /// <summary>A 24-bit copy of the current oriented picture for the training-picture collector (same GPU-copy route as
+        /// <see cref="GrabLuma"/>: the render thread only queues the copy, the pixels are read and copied here). Null when there is no picture.</summary>
+        public Bitmap? GrabFrameCopy()
+        {
+            D3DRenderer? r = _r;
+            if (r == null || !r.HasFrame || PowerSaving) return null;
+            D3DRenderer.AnalysisShot? shot = null;
+            Run(rr => { shot = rr.AnalysisBegin(); return null; }, 1500, needFrame: true, out _, allowNull: true);
+            D3DRenderer.AnalysisShot? got = shot;
+            if (got == null) return null;
+            try
+            {
+                long deadline = Environment.TickCount64 + 1500;
+                while (!r.AnalysisTryMap(got))
+                {
+                    if (_stopping || Environment.TickCount64 > deadline) return null;
+                    Thread.Sleep(3);
+                }
+                int w = got.Size.Width, h = got.Size.Height;
+                var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+                System.Drawing.Imaging.BitmapData bd = bmp.LockBits(new Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+                try
+                {
+                    var src = new byte[w * 4];
+                    var dst = new byte[w * 3];
+                    for (int j = 0; j < h; j++)
+                    {
+                        System.Runtime.InteropServices.Marshal.Copy(got.Data + j * got.RowPitch, src, 0, src.Length);
+                        for (int i = 0, o = 0; i < w; i++, o += 3) { int s = i * 4; dst[o] = src[s]; dst[o + 1] = src[s + 1]; dst[o + 2] = src[s + 2]; }
+                        System.Runtime.InteropServices.Marshal.Copy(dst, 0, bd.Scan0 + j * bd.Stride, dst.Length);
+                    }
+                }
+                finally { bmp.UnlockBits(bd); }
+                return bmp;
+            }
+            finally { got.Dispose(); }
+        }
+
         // Video delay bookkeeping (render thread writes, anyone reads).
         private double _delayActual;
         public double DelayActualMs => Volatile.Read(ref _delayActual);
@@ -803,6 +930,14 @@ public sealed class D3DVideoEngine : IVideoEngine
         public void PokeInterpolation() { Volatile.Write(ref _interpReeval, 1); TryWake(); }
 
         /// <summary>The refresh rate Windows reports for the monitor the window is on (59.94 Hz shows as 59 or 60).</summary>
+        /// <summary>The quality to draw with: the user's, or what the GPU budget guard stepped it down to (also tells the renderer the rest).</summary>
+        private ScalingQuality GuardApply(D3DRenderer r)
+        {
+            r.GuardVariant = _e._guard.Variant;
+            r.GuardNoRestore = _e._guard.NoRestore;
+            return _e._guard.Effective(_e._quality);
+        }
+
         private int RefreshHz()
         {
             long now = Environment.TickCount64;
@@ -1468,7 +1603,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     // no signal: the card's message is drawn with the plain bilinear scaler (no FSR / CNN / shrink pass)
                     Result hr = saving
                         ? r.PresentFrame(dst, ScalingQuality.Standard, _e._pixelPerfect, _e._sharpness, 0, _e._overlays)
-                        : r.PresentFrame(dst, _e._quality, _e._pixelPerfect, _e._sharpness, NativeTargetHeight(), _e._overlays);
+                        : r.PresentFrame(dst, GuardApply(r), _e._pixelPerfect, _e._sharpness, NativeTargetHeight(), _e._overlays);
                     if (hr.Failure)
                     {
                         HandlePresentFailure(r, hr);
@@ -1520,6 +1655,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     double secs = (nowTick - statTick) / 1000.0;
                     long inF = Interlocked.Read(ref _inFrames), pr = Interlocked.Read(ref _presented);
                     r.GpuRecent(out double gpuAvg, out double gpuMax);
+                    if (_e._guard.Tick(gpuAvg, gpuMax, QualityGuard.BudgetScale * 1000.0 / Math.Max(24, RefreshHz()), !saving && pr > lastPresented, nowTick)) Poke();
                     _stats = new RenderStats((inF - lastIn) / secs, (pr - lastPresented) / secs, Interlocked.Read(ref _dropped),
                         gpuAvg, gpuMax);
                     lastIn = inF; lastPresented = pr; statTick = nowTick;

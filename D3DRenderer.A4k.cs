@@ -22,6 +22,26 @@ internal sealed partial class D3DRenderer
     // ---- settings (static: shared by the live pipeline and the test code) ----
     /// <summary>Which network: 'S' small, 'M' medium (the default), 'L' large. See A4kModels / the README.</summary>
     public static char A4kVariantLetter = 'M';
+    /// <summary>The GPU budget guard's override of the network size ('\0' = none) and of the Restore pre-pass (render thread sets them).</summary>
+    public char GuardVariant;
+    public bool GuardNoRestore;
+    private char A4kVariantNow => GuardVariant != '\0' ? GuardVariant : A4kCustomPath != null ? 'C' : A4kVariantLetter;
+
+    /// <summary>自分専用モデル: a model file of the user's own training (tools/train_upscaler.py; Anime4K M layout) that replaces the built-in
+    /// network while no guard override is active. null = the built-in one. Set it with <see cref="SetA4kCustom"/>.</summary>
+    public static string? A4kCustomPath { get; private set; }
+    /// <summary>Changes whenever the custom model (file or content) changes: part of the cache key, so a switched or retrained model is never shown from the cache.</summary>
+    public static int A4kCustomEpoch { get; private set; }
+
+    /// <summary>Use the user-trained model at <paramref name="path"/> (null = the built-in network). Safe to call from any thread.</summary>
+    public static void SetA4kCustom(string? path)
+    {
+        int stamp = path == null ? 0 : HashCode.Combine(path, File.GetLastWriteTimeUtc(path).Ticks);
+        if (path != null && stamp == _a4kCustomBadStamp) { path = null; stamp = 0; }     // this very file did not compile: stay on the built-in network until it changes
+        if (path == A4kCustomPath && stamp == A4kCustomEpoch) return;
+        A4kCustomPath = path; A4kCustomEpoch = stamp;
+    }
+    private static int _a4kCustomBadStamp;
     /// <summary>float16 intermediate textures (false = float32; the equivalence check uses float32 to show the port is exact).</summary>
     public static bool A4kHalf = true;
     /// <summary>After the CNN, resample to a different destination size with FSR EASU instead of bilinear (both are followed by RCAS).</summary>
@@ -38,7 +58,7 @@ internal sealed partial class D3DRenderer
     public static double A4kBudgetMs = 3.0;
     private static double A4kMsPerMegapixel(char v) => v switch { 'S' => 0.4, 'L' => 1.2, _ => 0.8 };
 
-    internal readonly record struct A4kKey(long Ver, int PreH, int PreFilter, int PreIter, float PreClamp, char Variant, int Stages, bool Half);
+    internal readonly record struct A4kKey(long Ver, int PreH, int PreFilter, int PreIter, float PreClamp, char Variant, int Stages, bool Half, char Restore = '\0', int Model = 0);
 
     private sealed class A4kTex
     {
@@ -58,6 +78,7 @@ internal sealed partial class D3DRenderer
     private readonly A4kTex?[] _a4kOut = new A4kTex?[2];             // per stage: the x2 picture
     private ID3D11PixelShader[]? _a4kPs;
     private char _a4kPsLetter;
+    private int _a4kPsModel;
     private ID3D11Buffer? _cbA4k;
     private bool _a4kBroken;
 
@@ -82,13 +103,29 @@ internal sealed partial class D3DRenderer
 
     private bool EnsureA4kShaders()
     {
-        char v = A4kVariantLetter;
-        if (_a4kPs != null && _a4kPsLetter == v) return true;
-        byte[][] code = D3DShaders.GetA4k(v);
+        char v = A4kVariantNow;
+        int model = v == 'C' ? A4kCustomEpoch : 0;
+        if (_a4kPs != null && _a4kPsLetter == v && _a4kPsModel == model) return true;
+        byte[][] code;
+        if (v == 'C')
+        {
+            string? path = A4kCustomPath;
+            if (path == null) throw new InvalidOperationException("no user model");
+            try { code = D3DShaders.GetA4kCustom(path); }
+            catch (Exception ex)
+            {
+                // a broken or half-written model file must never take the built-in network down with it
+                Log.Info("D3D: user model " + Path.GetFileName(path) + " unusable, using the built-in Anime4K network - " + ex.Message.Split('\n')[0]);
+                _a4kCustomBadStamp = A4kCustomEpoch;
+                SetA4kCustom(null);
+                return EnsureA4kShaders();
+            }
+        }
+        else code = D3DShaders.GetA4k(v);
         if (_a4kPs != null) foreach (var p in _a4kPs) p.Dispose();
         _a4kPs = new ID3D11PixelShader[code.Length];
         for (int i = 0; i < code.Length; i++) _a4kPs[i] = Device.CreatePixelShader(code[i]);
-        _a4kPsLetter = v;
+        _a4kPsLetter = v; _a4kPsModel = model;
         _cbA4k ??= Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         return true;
     }
@@ -104,7 +141,7 @@ internal sealed partial class D3DRenderer
         if (ratio >= A4kSecondStageRatio)
         {
             double mp = src.Width * (double)src.Height / 1e6;
-            if (A4kMsPerMegapixel(A4kVariantLetter) * (mp + 4 * mp) <= A4kBudgetMs) return 2;
+            if (A4kMsPerMegapixel(A4kVariantNow) * (mp + 4 * mp) <= A4kBudgetMs) return 2;
         }
         return 1;
     }
@@ -135,6 +172,7 @@ internal sealed partial class D3DRenderer
         for (int i = 0; i < 2; i++) { _a4kOut[i]?.Dispose(); _a4kOut[i] = null; }
         _a4kResult = null; _a4kHaveKey = false;
         if (_a4kPs != null) { foreach (var p in _a4kPs) p.Dispose(); _a4kPs = null; }
+        RestoreFree();
         _cbA4k?.Dispose(); _cbA4k = null;
     }
 

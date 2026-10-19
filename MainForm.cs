@@ -97,9 +97,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     // that must follow its state is kept in lists.
     private readonly List<ToolStripMenuItem> _qualityRoots = new();
     private readonly List<ToolStripMenuItem> _qualityItems = new();
+    private readonly List<ToolStripMenuItem> _hdrRoots = new();
+    private readonly List<ToolStripMenuItem> _hdrItems = new();
     private readonly List<ToolStripMenuItem> _interpItems = new();
     private readonly List<ToolStripMenuItem> _sharpnessItems = new();
     private readonly List<ToolStripMenuItem> _nativeResItems = new();
+    private readonly List<ToolStripMenuItem> _chromaItems = new();
+    private readonly List<ToolStripMenuItem> _restoreItems = new();
     private int _nativeResOsdTarget = -1;      // the auto decision last announced by the OSD (-1 = none yet)
 
     private ToolStripMenuItem _miAdjust = null!;       // 映像 → 映像の調整...
@@ -351,7 +355,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         InitAvAuto();
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); AutoProfileTick(); SignalTick(); StreamTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); GuardOsdTick(); AutoProfileTick(); SignalTick(); StreamTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
         _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
@@ -732,6 +736,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         video.DropDownItems.Add(_miFreeze);
         video.DropDownItems.Add(new ToolStripSeparator());
         video.DropDownItems.Add(BuildQualitySubmenu());
+        video.DropDownItems.Add(BuildHdrSubmenu());
         video.DropDownItems.Add(BuildInterpolationItem());
         video.DropDownItems.Add(_miLowLatency);
         _miStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle());
@@ -853,6 +858,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(_miStartup);
         options.DropDownItems.Add(_miUpdateCheck);
+        options.DropDownItems.Add(new ToolStripSeparator());
+        options.DropDownItems.Add(BuildTrainSubmenu());
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(lang);
 
@@ -985,17 +992,25 @@ public sealed partial class MainForm : Form, IMessageFilter
         var m = new ToolStripMenuItem(L.T("拡大の画質"));
         var std = new ToolStripMenuItem(L.T("標準"), null, (_, _) => SetScalingQuality("standard")) { Tag = "standard" };
         var fsr = new ToolStripMenuItem(L.T("高画質（FSR）"), null, (_, _) => SetScalingQuality("fsr")) { Tag = "fsr" };
-        var a4k = new ToolStripMenuItem(L.T("くっきり（アニメ・イラスト向け）"), null, (_, _) => SetScalingQuality("anime4k"))
+        var a4k = new ToolStripMenuItem(L.T("くっきり（アニメ・イラスト向け）"), null, (_, _) => { _settings.A4kModel = ""; SetScalingQuality("anime4k"); })
         {
             Tag = "anime4k",
             ToolTipText = L.T("ニューラルネット（Anime4K）で線や文字を細くくっきり描き直します。ゲーム機の絵やイラスト向けで、GPU を多く使います。"),
         };
         _qualityItems.Add(std);
         _qualityItems.Add(fsr);
+        var nv = new ToolStripMenuItem(L.T("AI 拡大（NVIDIA RTX）"), null, (_, _) => SetScalingQuality("nvrtx"))
+        {
+            Tag = "nvrtx",
+            ToolTipText = L.T("NVIDIA の RTX ビデオ超解像（VSR）で拡大します。NVIDIA コントロールパネルの「RTX ビデオ強調」をオンにしてください。"),
+        };
         _qualityItems.Add(a4k);
+        _qualityItems.Add(nv);
         m.DropDownItems.Add(std);
         m.DropDownItems.Add(fsr);
         m.DropDownItems.Add(a4k);
+        m.DropDownItems.Add(nv);
+        AttachUserModelItems(m, a4k);
         m.DropDownItems.Add(new ToolStripSeparator());
         var sharp = new ToolStripMenuItem(L.T("シャープさ"));
         foreach (int pct in new[] { 0, 25, 50, 75, 100 })
@@ -1017,6 +1032,20 @@ public sealed partial class MainForm : Form, IMessageFilter
             native.DropDownItems.Add(item);
         }
         m.DropDownItems.Add(native);
+        m.DropDownItems.Add(new ToolStripSeparator());
+        var chroma = new ToolStripMenuItem(L.T("色のにじみを抑える"), null, (_, _) => ToggleChromaGuided())
+        {
+            CheckOnClick = false,
+            ToolTipText = L.T("色の境目（赤い文字など）のにじみを、映像の明るさの情報を使って抑えます。Direct3D 描画のとき働きます。"),
+        };
+        _chromaItems.Add(chroma);
+        m.DropDownItems.Add(chroma);
+        var restore = new ToolStripMenuItem(L.T("ぼやけを取ってから拡大"), null, (_, _) => ToggleRestore())
+        {
+            ToolTipText = L.T("拡大の前に、ニューラルネット（Anime4K Restore）でぼやけを取ります。GPU を余分に使い、縁に輪が出やすくなります。元の細かさに合わせて拡大が働いているときは使いません。"),
+        };
+        _restoreItems.Add(restore);
+        m.DropDownItems.Add(restore);
         _qualityRoots.Add(m);
         return m;
     }
@@ -1127,12 +1156,12 @@ public sealed partial class MainForm : Form, IMessageFilter
         _lblState.BorderSides = ToolStripStatusLabelBorderSides.Right;
         _lblState.ForeColor = Ui.Colors.Accent;
         var filler = new ToolStripStatusLabel { Spring = true, Text = string.Empty };
-        foreach (var l in new[] { _lblInterp, _lblScale, _lblCrisp })
+        foreach (var l in new[] { _lblInterp, _lblScale, _lblCrisp, _lblTrain })
         {
             l.BorderSides = ToolStripStatusLabelBorderSides.Right;
             l.Visible = false;
         }
-        _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, _lblInterp, _lblScale, _lblCrisp, _lblState, filler });
+        _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, _lblInterp, _lblScale, _lblCrisp, _lblTrain, _lblState, filler });
         _status.SizingGrip = true;
     }
 
@@ -1212,6 +1241,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cmiVideoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _ctx.Items.Add(_cmiVideoModeRoot);
         _ctx.Items.Add(BuildQualitySubmenu());
+        _ctx.Items.Add(BuildHdrSubmenu());
         _ctx.Items.Add(BuildInterpolationItem());
         _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
         _ctx.Items.Add(_cmiLowLatency);
@@ -2882,9 +2912,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         _rendererItems.Clear();
         _qualityRoots.Clear();
         _qualityItems.Clear();
+        _hdrRoots.Clear();
+        _hdrItems.Clear();
         _interpItems.Clear();
         _sharpnessItems.Clear();
         _nativeResItems.Clear();
+        _chromaItems.Clear();
+        _restoreItems.Clear();
 
         BuildMenu();
         BuildContextMenu(dpi);
@@ -2965,6 +2999,9 @@ public sealed partial class MainForm : Form, IMessageFilter
             _video.Quality = QualityOf(_settings.ScalingQuality);
             _video.Sharpness = _settings.FsrSharpness / 100f;
             _video.NativeResScale = _settings.NativeResScale;
+            _video.ChromaGuided = _settings.ChromaGuided;
+            _video.RestoreMode = _settings.RestoreMode;
+            _video.HdrMode = _settings.HdrMode;
             _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
             _video.Adjustments = CurrentAdjustments();   // ignored by engines without the capability
             _video.Crop = new Padding(_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
@@ -2976,6 +3013,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             Log.Info("ApplyRenderOptions failed: " + ex.Message);
         }
+        ApplyTrainFeatures();
         ApplyAvSync();
 
         // A crop changes the picture's size, so the aspect-fit layout (and with it the FSR factor)
@@ -3282,18 +3320,132 @@ public sealed partial class MainForm : Form, IMessageFilter
         ApplyRenderOptions();
         UpdateChecks();
         UpdateStatus();
-        ShowOsd(L.F("拡大の画質: {0}", QualityLabel(quality)));
+        ShowOsd(L.F("拡大の画質: {0}", quality == "anime4k" && UserModelActive ? L.F("自分専用モデル（{0}）", _settings.A4kModel) : QualityLabel(quality)));
     }
 
     private static ScalingQuality QualityOf(string setting) =>
-        setting == "fsr" ? ScalingQuality.Fsr : setting == "anime4k" ? ScalingQuality.Anime4K : ScalingQuality.Standard;
+        setting == "fsr" ? ScalingQuality.Fsr : setting == "anime4k" ? ScalingQuality.Anime4K : setting == "nvrtx" ? ScalingQuality.NvRtx : ScalingQuality.Standard;
 
     private static string QualityLabel(string setting) =>
-        setting == "fsr" ? L.T("高画質（FSR）") : setting == "anime4k" ? L.T("くっきり（アニメ・イラスト向け）") : L.T("標準");
+        setting == "fsr" ? L.T("高画質（FSR）") : setting == "anime4k" ? L.T("くっきり（アニメ・イラスト向け）") : setting == "nvrtx" ? L.T("AI 拡大（NVIDIA RTX）") : L.T("標準");
 
     /// <summary>The short name of the engine's scaling quality for the status bar / info panel (FSR, くっきり, 標準).</summary>
     private string ScalerShortName() =>
-        _video.Quality == ScalingQuality.Fsr ? "FSR" : _video.Quality == ScalingQuality.Anime4K ? L.T("くっきり") : L.T("標準");
+        _video.Quality == ScalingQuality.Fsr ? "FSR" : _video.Quality == ScalingQuality.Anime4K ? (UserModelActive ? L.T("自分専用") : L.T("くっきり")) : _video.Quality == ScalingQuality.NvRtx ? L.T("AI 拡大") : L.T("標準");
+
+    private void ToggleChromaGuided()
+    {
+        _settings.ChromaGuided = !_settings.ChromaGuided;
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        ShowOsd(L.F("色のにじみを抑える: {0}", _settings.ChromaGuided ? L.T("オン") : L.T("オフ")));
+    }
+
+    private long _guardSerialSeen;
+    /// <summary>The GPU budget guard moved: say so (OSD) only when the user changed a setting a moment ago, otherwise the status bar tooltip and
+    /// the info panel carry it silently.</summary>
+    private bool _nvHintShown;
+    private int _hdrKindSeen;
+
+    /// <summary>NVIDIA RTX scaler: say (once per choice) when it fell back to FSR or when the driver is not applying it; HDR: say what is shown when it changes.</summary>
+    private void NvHdrOsdTick()
+    {
+        if (_testRunning) return;
+        if (_settings.ScalingQuality == "nvrtx" && _video.IsRunning)
+        {
+            if (!_nvHintShown && _video.NvRtxBrokenWhy is { } why)
+            {
+                _nvHintShown = true;
+                Log.Info("NVIDIA RTX scaler fell back to FSR: " + why);
+                ShowOsd(L.T("AI 拡大が使えないため、FSR にしています"), OsdLongMilliseconds);
+            }
+            else if (!_nvHintShown && _video.NvRtxIneffective)
+            {
+                _nvHintShown = true;
+                ShowOsd(L.T("NVIDIA コントロールパネルで「RTX ビデオ強調」をオンにしてください"), OsdLongMilliseconds);
+            }
+        }
+        else _nvHintShown = false;
+        int k = _video.HdrKind;
+        if (k != _hdrKindSeen)
+        {
+            _hdrKindSeen = k;
+            if (_settings.HdrMode != "off" || k != 0)
+                ShowOsd(k == 1 ? L.T("HDR 表示: RTX Video HDR") : k == 2 ? L.T("HDR 表示: 簡易") : L.T("HDR 表示: オフ"), OsdLongMilliseconds);
+        }
+    }
+
+    private void SetHdrMode(string mode)
+    {
+        _settings.HdrMode = AppSettings.NormalizeHdr(mode);
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        ShowOsd(L.F("HDR 表示: {0}", mode == "rtx" ? L.T("HDR で表示（NVIDIA RTX）") : mode == "simple" ? L.T("HDR で表示（簡易）") : L.T("オフ")));
+    }
+
+    /// <summary>映像 &gt; HDR 表示: off / RTX Video HDR / simple. The two HDR items need Windows HDR on for the monitor the window is on.</summary>
+    private ToolStripMenuItem BuildHdrSubmenu()
+    {
+        var m = new ToolStripMenuItem(L.T("HDR 表示"));
+        foreach (var (mode, label) in new[] { ("off", L.T("オフ")), ("rtx", L.T("HDR で表示（NVIDIA RTX）")), ("simple", L.T("HDR で表示（簡易）")) })
+        {
+            string md = mode;
+            var item = new ToolStripMenuItem(label, null, (_, _) => SetHdrMode(md)) { Tag = md };
+            _hdrItems.Add(item);
+            m.DropDownItems.Add(item);
+        }
+        m.DropDownOpening += (_, _) => UpdateHdrMenu();
+        _hdrRoots.Add(m);
+        return m;
+    }
+
+    private bool MonitorHdrOn()
+    {
+        try
+        {
+            string dev = Displays.DeviceNameOfWindow(_canvas.Handle);
+            return Program.QueryOutputsHdr().Any(o => o.HdrOn && string.Equals(o.DeviceName, dev, StringComparison.OrdinalIgnoreCase));
+        }
+        catch { return false; }
+    }
+
+    private void UpdateHdrMenu()
+    {
+        bool supported = _video.SupportsScalingQuality;
+        bool hdr = supported && MonitorHdrOn();
+        bool rtx = hdr && D3DRenderer.NvAdapterPresent();
+        string hint = !supported ? L.T("Direct3D 描画のときに使えます（映像 → 描画方式）")
+            : !hdr ? L.T("Windows の設定でこのモニターの HDR をオンにしてください") : string.Empty;
+        foreach (var root in _hdrRoots) { root.Enabled = supported; root.ToolTipText = hint; }
+        foreach (var item in _hdrItems)
+        {
+            string md = (string)item.Tag!;
+            item.Checked = md == _settings.HdrMode;
+            item.Enabled = md == "off" || (md == "rtx" ? rtx : hdr);
+            item.ToolTipText = md == "off" ? string.Empty : md == "rtx" && hdr && !rtx ? L.T("NVIDIA の GPU で使えます") : hint;
+        }
+    }
+
+    private void GuardOsdTick()
+    {
+        NvHdrOsdTick();
+        long s = _video.GuardSerial;
+        if (s == _guardSerialSeen) return;
+        _guardSerialSeen = s;
+        if (_testRunning || Environment.TickCount64 - _lastUserChangeTick > 20000) return;
+        ShowOsd(_video.GuardStatus is { } t ? t : L.T("負荷が下がったため、元の画質に戻しました"));
+    }
+
+    private void ToggleRestore()
+    {
+        _settings.RestoreMode = _settings.RestoreMode == "on" ? "off" : "on";
+        MarkSettingsDirty();
+        ApplyRenderOptions();
+        UpdateChecks();
+        ShowOsd(L.F("ぼやけを取ってから拡大: {0}", _settings.RestoreMode == "on" ? L.T("オン") : L.T("オフ")));
+    }
 
     private void SetNativeRes(string key)
     {
@@ -3465,6 +3617,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         string? i = InterpMetric(out string it), sc = ScaleMetric(out string st), cr = CrispMetric(out string ct);
         Set(_lblInterp, i == null ? null : L.F("補間 {0}", i), it); Set(_lblScale, sc, st); Set(_lblCrisp, cr == null ? null : L.F("くっきり {0}", cr), ct);
+        UpdateTrainLabel();
     }
 
     private string InterpolationInfoText()
@@ -3583,8 +3736,22 @@ public sealed partial class MainForm : Form, IMessageFilter
             root.Enabled = supported && !pixelPerfect;
             root.ToolTipText = tip;
         }
-        foreach (var item in _qualityItems) item.Checked = (string)item.Tag! == quality;
+        foreach (var item in _qualityItems)
+        {
+            item.Checked = (string)item.Tag! == quality && !((string)item.Tag! == "anime4k" && UserModelActive);
+            if ((string)item.Tag! == "nvrtx")
+            {
+                bool nvOk = _video.NvRtxSupported;
+                item.Enabled = nvOk;
+                item.ToolTipText = nvOk ? L.T("NVIDIA の RTX ビデオ超解像（VSR）で拡大します。NVIDIA コントロールパネルの「RTX ビデオ強調」をオンにしてください。")
+                    : L.T("NVIDIA の GPU（Direct3D 描画）で使えます");
+            }
+        }
+        UpdateUserModelChecks();
+        foreach (var item in _hdrItems) item.Checked = (string)item.Tag! == _settings.HdrMode;
         foreach (var item in _nativeResItems) item.Checked = (string)item.Tag! == _settings.NativeResScale;
+        foreach (var item in _chromaItems) item.Checked = _settings.ChromaGuided;
+        foreach (var item in _restoreItems) { item.Checked = _settings.RestoreMode == "on"; item.Enabled = quality is "fsr" or "anime4k"; }
         foreach (var item in _sharpnessItems)
         {
             item.Checked = (int)item.Tag! == _settings.FsrSharpness;
@@ -4445,6 +4612,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (_video.Stats is { } st)
                 _lblVideo.ToolTipText += "\n" + L.F("入力 {0:0}fps / 表示 {1:0}fps / 欠落 {2}",
                     st.InputFps, st.PresentedFps, st.DroppedFrames);
+            if (_video.GuardStatus is { } guardTip) _lblVideo.ToolTipText += "\n" + guardTip;
         }
         else
         {
@@ -4960,9 +5128,10 @@ public sealed partial class MainForm : Form, IMessageFilter
             L.T("色調整") + ": " + color,
             L.T("音ズレ補正") + ": " + AvInfoText(),
             L.T("補間") + ": " + (InterpMetric(out _) ?? InterpolationInfoText()),
+            L.T("動き検出") + ": " + (_settings.Interpolation && _video.SupportsInterpolation ? (D3DRenderer.MotionLabel.StartsWith("NVIDIA", StringComparison.Ordinal) ? L.T("NVIDIA OFA（専用回路）") : L.T("ブロックマッチング（GPU）")) : "—"),
             L.T("元の細かさ") + ": " + NativeResInfoText(),
             L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
-        }));
+        }) + (_video.GuardStatus is { } guardNote ? "\n" + guardNote : string.Empty));
         PositionInfo();
     }
 
@@ -4970,6 +5139,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         if (disposing)
         {
+            _trainCap?.Dispose();
             _video.Dispose();
             _audio.Dispose();
             _osdTimer.Dispose();

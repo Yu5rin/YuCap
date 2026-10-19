@@ -13,7 +13,15 @@ internal sealed partial class D3DRenderer
     /// constant buffer and 8-bit target as the live picture) with <paramref name="adj"/>, read back. The live frame textures are
     /// not touched. Must run on the render thread.</summary>
     internal Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj)
+        => ConvertSynthetic(luma, chroma, w, h, adj, new YuvInfo(1, true), -1, 0, out _);
+
+    /// <summary>The same with a chosen colour description (<paramref name="yuv"/>: matrix 1 = BT.709, 2 = BT.601; limited or full range),
+    /// a forced chroma upsampling mode (<paramref name="chromaMode"/>, -1 = as set) and, with <paramref name="benchFrames"/> &gt; 0, the GPU
+    /// milliseconds of that many convert draws of this picture.</summary>
+    internal Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj, YuvInfo yuv, int chromaMode,
+        int benchFrames, out double[] ms)
     {
+        ms = Array.Empty<double>();
         if (_psConvert == null || w < 2 || h < 2 || (w & 1) != 0 || (h & 1) != 0) return null;
         if (luma.Length < w * h || chroma.Length < w * h / 2) return null;
         lock (FrameLock)
@@ -48,13 +56,16 @@ internal sealed partial class D3DRenderer
             using ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(target);
 
             // ConvertInto reads the frame textures and their colour description from the fields: lend it ours for this one draw.
-            var saveY = _srvY; var saveUV = _srvUV; var saveGpu = _gpuFrame; var saveYuv = _yuv;
+            var saveY = _srvY; var saveUV = _srvUV; var saveGpu = _gpuFrame; var saveYuv = _yuv; int saveMode = ChromaModeOverride;
             try
             {
-                _srvY = sy; _srvUV = suv; _gpuFrame = false; _yuv = new YuvInfo(1, true);
+                _srvY = sy; _srvUV = suv; _gpuFrame = false; _yuv = yuv;
+                ChromaModeOverride = chromaMode;
                 ConvertInto(rtv, size, new Rectangle(Point.Empty, size), size, 0, false, adj);
+                if (benchFrames > 0)
+                    ms = TimeGpu(() => ConvertInto(rtv, size, new Rectangle(Point.Empty, size), size, 0, false, adj), benchFrames);
             }
-            finally { _srvY = saveY; _srvUV = saveUV; _gpuFrame = saveGpu; _yuv = saveYuv; }
+            finally { _srvY = saveY; _srvUV = saveUV; _gpuFrame = saveGpu; _yuv = saveYuv; ChromaModeOverride = saveMode; }
             Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
             return ReadBack(target, new Rectangle(Point.Empty, size));
         }

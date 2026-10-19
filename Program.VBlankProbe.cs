@@ -149,7 +149,7 @@ internal static partial class Program
         log.Add("--- swap chain present rate per display (3 s each, sync interval 1, Present on every latency-waitable signal) ---");
         foreach (DisplayInfo d in displays)
         {
-            foreach (string kind in new[] { "composition", "hwnd", "composition+overlay", "hwnd+overlay", "composition,child", "hwnd,child", "composition,beat", "composition,child,beat" })
+            foreach (string kind in new[] { "composition", "hwnd", "composition+overlay", "hwnd+overlay", "composition,child", "hwnd,child", "composition,beat", "composition,child,beat", "composition,hdr10", "composition,scrgb", "composition,rgb10sdr", "composition,hdr10,child", "hwnd,hdr10" })
             {
                 try { log.Add(ProbePresent(d, kind)); }
                 catch (Exception ex) { log.Add($"{d.DeviceName} {kind}: failed {ex.GetType().Name}: {ex.Message.Split('\n')[0]}"); }
@@ -201,7 +201,8 @@ internal static partial class Program
             using IDXGIFactory2 fac = ad.GetParent<IDXGIFactory2>();
             var desc = new SwapChainDescription1
             {
-                Width = (uint)cs.Width, Height = (uint)cs.Height, Format = Format.B8G8R8A8_UNorm,
+                Width = (uint)cs.Width, Height = (uint)cs.Height,
+                Format = kind.Contains(",hdr10") || kind.Contains(",rgb10sdr") ? Format.R10G10B10A2_UNorm : kind.Contains(",scrgb") ? Format.R16G16B16A16_Float : Format.B8G8R8A8_UNorm,
                 SampleDescription = new SampleDescription(1, 0), BufferUsage = Usage.RenderTargetOutput,
                 BufferCount = 3, Scaling = Scaling.Stretch, SwapEffect = SwapEffect.FlipDiscard,
                 AlphaMode = AlphaMode.Ignore, Flags = SwapChainFlags.FrameLatencyWaitableObject,
@@ -222,6 +223,12 @@ internal static partial class Program
 
             using (sc)
             {
+                if (kind.Contains(",hdr10") || kind.Contains(",scrgb"))
+                {
+                    using IDXGISwapChain3 sc3 = sc.QueryInterface<IDXGISwapChain3>();
+                    ColorSpaceType cst = kind.Contains(",scrgb") ? ColorSpaceType.RgbFullG10NoneP709 : ColorSpaceType.RgbFullG2084NoneP2020;
+                    sc3.SetColorSpace1(cst);
+                }
                 using IDXGISwapChain2 sc2 = sc.QueryInterface<IDXGISwapChain2>();
                 sc2.MaximumFrameLatency = 1;
                 IntPtr waitable = sc2.FrameLatencyWaitableObject;
@@ -274,7 +281,7 @@ internal static partial class Program
                 vis?.Dispose(); tg?.Dispose(); dc?.Dispose();
                 double fps = res[1] > 0 ? res[0] / res[1] : 0;
                 double refreshHz = res[1] > 0 ? res[3] / res[1] : 0;
-                return $"{disp.DeviceName} {kind,-19}: {res[0]:0} presents in {res[1]:0.00} s = {fps:0.0} fps; SyncRefreshCount delta {res[3]:0} = {refreshHz:0.0} Hz, PresentRefreshCount delta {res[2]:0}";
+                return $"{disp.DeviceName} {kind,-23}: {res[0]:0} presents in {res[1]:0.00} s = {fps:0.0} fps; SyncRefreshCount delta {res[3]:0} = {refreshHz:0.0} Hz, PresentRefreshCount delta {res[2]:0}";
             }
         }
     }

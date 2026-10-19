@@ -102,6 +102,8 @@ public sealed partial class MainForm
                 .Num("動かし方", $"全体を右へ {InterpCheck.GlobalDx}・上へ {-InterpCheck.GlobalDy} ピクセル、四角い部分だけ左へ {-InterpCheck.BlockDx}・下へ {InterpCheck.BlockDy} ピクセル")
                 .Num("背景の PSNR（補間 / 重ねただけ）", $"{r.BgPsnr:0.0} dB / {r.BgBlend:0.0} dB")
                 .Num("動く四角の PSNR（補間 / 重ねただけ）", $"{r.BlkPsnr:0.0} dB / {blkBlend:0.0} dB")
+                .Num("四角の縁（外側・内側 10 ピクセル）の PSNR（補間 / 重ねただけ）", $"{r.BdPsnr:0.0} dB / {r.BdBlend:0.0} dB")
+                .Num("動きの検出に使われたもの", D3DRenderer.MotionLabel)
                 .Num("動きの向きが合っていた割合（背景）", $"{Pct(vecFrac)}（{vecOk}/{vecN} ブロック、誤差 1 ピクセル以内。" + (texOk ? "模様のある所だけ" : "全部") + $"。全ブロックでは {r.BgOk}/{r.BgN}）")
                 .Num("動きの向きが合っていた割合（四角）", $"{Pct(r.BlkN > 0 ? (double)r.BlkOk / r.BlkN : 0)}（{r.BlkOk}/{r.BlkN} ブロック、平均の誤差 {r.BlkErr:0.00} ピクセル）")
                 .Num("真っ黒になったブロック / 異常な値の動き", $"{r.BadBlocks} 個 / {r.BadVectors} 個");
@@ -110,6 +112,11 @@ public sealed partial class MainForm
             item.Num("場面が切り替わったとき（無関係な 2 コマ）", cut.Ok
                 ? $"{(cut.Detected ? "切り替わりを検出" : "切り替わりを検出できず")}（うまく合わなかったブロックの割合 {Pct(cut.Share)}）。出力は 2 コマの重ね合わせと{(cut.Clean ? "同じ" : "違う")}（平均の差 {cut.ErrNearA:0.00} / {cut.ErrNearB:0.00}）。動く絵では誤検出 {(r.CutShare < 0.07 ? "なし" : "あり")}（{Pct(r.CutShare)}）"
                 : "試せませんでした: " + cut.Failure);
+            InterpHudCheck.Result hud = await Task.Run(() => InterpHudCheck.RunSynthetic(eng, null));
+            bool hudOk = hud.Ok && hud.HudPsnr >= 40;
+            item.Num("動かない表示（HUD・文字）の保護（背景が動く絵の上に固定の枠と文字）", hud.Ok
+                ? $"枠と文字の PSNR {hud.HudPsnr:0.0} dB（重ねただけ {hud.HudBlend:0.0} dB）、枠のまわり {hud.RingPsnr:0.0} dB（重ねただけ {hud.RingBlend:0.0} dB）、文字のくっきり度 {hud.HudSharp:0.00}（1 が元通り）"
+                : "試せませんでした: " + hud.Failure);
             item.Images.Add(file);
             if (noDetail) item.Num("（参考）映像から取った絵での結果", _probeCardMessage ? "映像がカード自身のメッセージ画面だったため、映像からは取りませんでした" : "映像が真っ黒（または一色）だったため、映像からは取りませんでした");
             if (rs is { Ok: true })
@@ -133,6 +140,8 @@ public sealed partial class MainForm
             if (r.BlkPsnr < blkBlend) why.Add("動く四角の部分が「重ねただけ」より悪くなっています。");
             else if (r.BlkPsnr < blkBlend + 3) why.Add("動く四角の部分の改善が小さいです。");
             if (vecFrac < 0.85) why.Add($"動きの向きが合っていた割合が {Pct(vecFrac)} で、85% に届いていません。");
+            if (!hudOk && v == Verdict.Ok) v = Verdict.Warn;
+            if (!hudOk) why.Add("動かない表示（枠や文字）が、背景の動きに引きずられてにじんでいます。");
             if (!cutOk && v == Verdict.Ok) v = Verdict.Warn;
             if (!cutOk) why.Add("場面の切り替わり（まったく違う 2 コマ）で、2 コマの重ね合わせを出す動きになっていません。");
             if (v == Verdict.Ok) why.Insert(0, "背景も動く四角も、正解に近い絵を作れています。");

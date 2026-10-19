@@ -20,6 +20,8 @@ public enum ScalingQuality
     Fsr,
     /// <summary>Anime4K CNN upscaler (x2 per stage), then RCAS / bilinear to the exact size: 「くっきり（アニメ・イラスト向け）」.</summary>
     Anime4K,
+    /// <summary>NVIDIA RTX Video Super Resolution through the D3D11 video processor: 「AI 拡大（NVIDIA RTX）」. FSR where it cannot run.</summary>
+    NvRtx,
 }
 
 /// <summary>
@@ -232,6 +234,39 @@ public interface IVideoEngine : IDisposable
     /// <summary>"元の細かさに合わせて拡大" (Direct3D only): shrink the picture to the resolution its detail really has
     /// (a game drawn at 720p and enlarged to 1080p by the console) before scaling, so FSR enlarges from the true size.
     /// "off", "auto" (judged from the picture) or a fixed height such as "720".</summary>
+    /// <summary>色のにじみを抑える: luma-guided chroma upsampling in the convert pass (Direct3D only).</summary>
+    bool ChromaGuided { get => false; set { } }
+    /// <summary>GPU budget guard: the notice of the active downgrade (null = full quality), a counter that moves when it changes, and its decision log.</summary>
+    string? GuardStatus => null;
+    long GuardSerial => 0;
+    System.Collections.Generic.IReadOnlyList<string> GuardLog => System.Array.Empty<string>();
+    /// <summary>ぼやけを取ってから拡大: "off" | "on" (Direct3D only).</summary>
+    string RestoreMode { get => "off"; set { } }
+    /// <summary>NVIDIA RTX scaler (Direct3D on an NVIDIA GPU) usable / measured not to change the picture (the control panel setting is off) / why it fell back to FSR.</summary>
+    bool NvRtxSupported => false;
+    bool NvRtxIneffective => false;
+    string? NvRtxBrokenWhy => null;
+    /// <summary>HDR display: "off" | "rtx" | "simple" (the request); <see cref="HdrKind"/> is what is shown now (0 SDR, 1 RTX Video HDR, 2 simple).</summary>
+    string HdrMode { get => "off"; set { } }
+    int HdrKind => 0;
+    string? HdrNote => null;
+    /// <summary>Test mode: the live HDR path on grey bars (sRGB codes) -> nits of each bar read back from the HDR10 back buffer; null when the display is not in HDR.</summary>
+    float[]? HdrLiveCheck(int[] codes, out int kind, out string why) { kind = 0; why = "Direct3D 描画ではありません"; return null; }
+    /// <summary>The swap chain format and colour space in use (Direct3D); empty otherwise.</summary>
+    string SwapFormat => string.Empty;
+    /// <summary>The picture is presented through a 10-bit SDR swap chain because the monitor is in Windows HDR mode (a B8G8R8A8 one is held to the primary's refresh rate there).</summary>
+    bool WideSdrActive => false;
+    /// <summary>Test mode: grey bars (sRGB codes) through the 10-bit SDR path, read back as 8-bit codes; null when that path is not in use.</summary>
+    float[]? WideLiveCheck(int[] codes, out string why) { why = "Direct3D 描画ではありません"; return null; }
+    /// <summary>Test mode: VSR on versus off on a test picture, mean absolute difference (0..255); negative when it could not run.</summary>
+    double MeasureVsr() => -1;
+    /// <summary>Test mode: a synthetic NV12 picture through the real convert pass with a chosen colour description and chroma mode
+    /// (-1 = as set); <paramref name="benchFrames"/> &gt; 0 also times that many draws.</summary>
+    Bitmap? ConvertSynthetic(byte[] luma, byte[] chroma, int w, int h, VideoAdjustments adj, int matrix, bool fullRange, int chromaMode, int benchFrames, out double[] ms)
+    { ms = Array.Empty<double>(); return null; }
+    /// <summary>自分専用モデル: a copy (24-bit, owned by the caller) of the current picture before any scaling - rotation / crop applied - or null.
+    /// The render thread only queues a GPU copy; the pixels are read on the calling thread, so call it from a background thread.</summary>
+    Bitmap? GrabOrientedFrame() => null;
     bool SupportsNativeRes => false;
     string NativeResScale { get => "off"; set { } }
     NativeResStatus? NativeResState => null;

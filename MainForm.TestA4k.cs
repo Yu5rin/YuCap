@@ -24,9 +24,14 @@ public sealed partial class MainForm
         var itemSynth = new TestItem { Name = "くっきり（Anime4K）の効果（既知の絵: 720p を 1080p に引き伸ばしたもの → 4K）" };
         var itemLive = new TestItem { Name = "くっきり（Anime4K）の効果（実際の映像）" };
         var itemGpu = new TestItem { Name = "くっきり（Anime4K）の GPU 時間（4K 出力）" };
+        var itemNv = new TestItem { Name = "AI 拡大（NVIDIA RTX）が働いているか（VSR あり / なし）" };
         var itemRec = new TestItem { Name = "おすすめの拡大設定（この映像・このモニター）" };
-        sec.Items.Add(itemSynth); sec.Items.Add(itemLive); sec.Items.Add(itemGpu); sec.Items.Add(itemRec);
-        var all = new[] { itemSynth, itemLive, itemGpu, itemRec };
+        sec.Items.Add(itemSynth); sec.Items.Add(itemLive); sec.Items.Add(itemGpu); sec.Items.Add(itemNv); sec.Items.Add(itemRec);
+        // 自分専用モデル: only when the user has one (the setting's model, else the newest). Its rows join the comparisons below.
+        string? userModel = UserModels.Resolve(_settings.A4kModel) ?? UserModels.List().Select(UserModels.Resolve).FirstOrDefault(x => x != null);
+        TestItem? itemUser = userModel == null ? null : new TestItem { Name = "自分専用モデルの効果（学習に使っていない実際の絵）" };
+        if (itemUser != null) sec.Items.Insert(sec.Items.IndexOf(itemLive) + 1, itemUser);
+        var all = itemUser == null ? new[] { itemSynth, itemLive, itemGpu, itemNv, itemRec } : new[] { itemSynth, itemLive, itemUser, itemGpu, itemNv, itemRec };
         if (mode == null)
         {
             foreach (TestItem it in all) it.Summary = "映像のモードがありません";
@@ -47,19 +52,64 @@ public sealed partial class MainForm
 
         Bitmap? console = null;
         var rec = new A4kRecommendation();
+        string? keepCustom = D3DRenderer.A4kCustomPath;
         try
         {
+            A4kTest.UserModelPath = userModel;
             console = await A4kSynthetic(itemSynth, rec);
             await A4kLive(itemLive, rec);
+            if (itemUser != null) await A4kUser(itemUser, userModel!);
             await A4kGpu(itemGpu, mode, console, rec);
+            await NvVsrCheck(itemNv, rec);
             A4kRecommend(itemRec, rec);
         }
-        finally { console?.Dispose(); }
+        finally { console?.Dispose(); A4kTest.UserModelPath = null; D3DRenderer.SetA4kCustom(keepCustom); }
+    }
+
+    /// <summary>自分専用モデル against the built-in network on the held-out frames of its training (never seen by the training), by the real GPU pipeline.
+    /// "Better" only when both SSIM and PSNR are higher than くっきり's; otherwise it says it is not.</summary>
+    private async Task A4kUser(TestItem item, string modelPath)
+    {
+        try
+        {
+            string name = Path.GetFileNameWithoutExtension(modelPath);
+            NativeResTest.RenderFn render = TestRender();
+            var sw = Stopwatch.StartNew();
+            int n = _tQuick ? 4 : 10;
+            List<A4kUserTest.ValRow> rows = await Task.Run(() => A4kUserTest.Validation(render, modelPath, n, null));
+            item.Num("モデル", name);
+            if (rows.Count == 0)
+            {
+                item.Verdict = Verdict.Info;
+                item.Summary = "[情報] 学習に使っていない絵の一覧がモデルにないため、比べられません";
+                item.Explanation = "モデルの .json に val_frames（学習に使わなかった絵）が書かれていると比べられます。tools/train_upscaler.py で学習すると自動で書かれます。";
+                return;
+            }
+            foreach (A4kUserTest.ValRow r in rows) item.Num(r.Name, A4kUserTest.RowText(r));
+            bool better = A4kUserTest.Better(rows, out A4kUserTest.ValRow? u, out A4kUserTest.ValRow? b);
+            if (u == null || b == null) { item.Verdict = Verdict.Info; item.Summary = "[情報] 比較の絵を作れませんでした"; return; }
+            item.Verdict = better ? Verdict.Ok : Verdict.Info;
+            string diff = $"SSIM {b.Ssim:0.0000} → {u.Ssim:0.0000}、PSNR {b.Psnr:0.00} → {u.Psnr:0.00} dB";
+            item.Summary = better
+                ? $"自分専用モデルは、学習に使っていない絵で くっきり（Anime4K）より数字の上で上回りました（{diff}）"
+                : $"自分専用モデルは、学習に使っていない絵で くっきり（Anime4K）を数字の上では上回りませんでした（{diff}）";
+            item.Explanation = "学習に使わなかった本物の絵（元の大きさ）を半分に縮め、YuCap の実際の GPU 処理で 2 倍に拡大して、元の絵と比べています。SSIM と PSNR のどちらも上回ったときだけ「上回った」と書きます。" +
+                "学習に使った絵と同じゲーム・同じ場面の続きで比べているため、別のゲームでも同じだけ良くなるとは限りません。絵が少ないと、上回らないか、場面が違うと悪くなることがあります（集めた絵を増やして学習し直してください）。" +
+                $"（所要 {sw.Elapsed.TotalSeconds:0} 秒）";
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            item.Verdict = Verdict.Info; item.Summary = "この項目は実行できませんでした。"; item.Explanation = "理由: " + ex.Message;
+        }
     }
 
     private sealed class A4kRecommendation
     {
-        public double SsimStd, SsimFsr, SsimNative, SsimA4k, SsimNativeA4k;
+        public double SsimStd, SsimFsr, SsimNative, SsimA4k, SsimNativeA4k, SsimRestFsr, SsimRestA4k;
+        public double GpuRestoreMs;
+        public double SsimNv = -1, GpuNvMs;
+        public bool NvEffectiveKnown, NvEffective;
         public string Winner = "";
         public bool Synth;
         public int EstimatedHeight, SourceHeight;
@@ -106,6 +156,8 @@ public sealed partial class MainForm
                 rec.Synth = true;
                 rec.SsimStd = std!.Ssim; rec.SsimFsr = fsr!.Ssim; rec.SsimNative = nat!.Ssim; rec.SsimA4k = a4k!.Ssim; rec.SsimNativeA4k = natA!.Ssim;
                 rec.Winner = win?.Name ?? "";
+                rec.SsimNv = Find(bil, "AI 拡大（NVIDIA RTX）")?.Ssim ?? -1;
+                rec.SsimRestFsr = Find(bil, "ぼやけ取り + FSR")?.Ssim ?? 0; rec.SsimRestA4k = Find(bil, "ぼやけ取り + くっきり")?.Ssim ?? 0;
                 if (cub != null)
                 {
                     A4kTest.MethodRow? cf = Find(cub, "FSR"), ca = Find(cub, "くっきり（Anime4K）");
@@ -245,10 +297,18 @@ public sealed partial class MainForm
             {
                 ("標準", ScalingQuality.Standard, 0), ("FSR", ScalingQuality.Fsr, 0),
                 ("くっきり", ScalingQuality.Anime4K, 0), ("元の細かさ（720p）+ くっきり", ScalingQuality.Anime4K, 720),
+                ("ぼやけ取り + くっきり", ScalingQuality.Anime4K, -1),
             };
+            if (_video.NvRtxSupported) cases = cases.Append(("AI 拡大（NVIDIA RTX）", ScalingQuality.NvRtx, 0)).ToArray();
+            if (A4kTest.UserModelPath != null) cases = cases.Append(("自分専用モデル", ScalingQuality.Anime4K, 0)).ToArray();
             var avgNew = new Dictionary<string, double>();
-            foreach ((string name, ScalingQuality q, int nh) in cases)
+            foreach ((string name, ScalingQuality q, int nh0) in cases)
             {
+                int nh = Math.Max(0, nh0);
+                bool userCase = name == "自分専用モデル";
+                D3DRenderer.SetA4kCustom(userCase ? A4kTest.UserModelPath : null);
+                D3DRenderer.RestoreForce = nh0 < 0;
+                try {
                 double[] fresh = Array.Empty<double>(), same = Array.Empty<double>(), ip = Array.Empty<double>();
                 bool ok = await Task.Run(() => _video.BenchQuality(console, null, out4k, q, nh, frames, false, out fresh));
                 if (!ok || fresh.Length == 0)
@@ -263,12 +323,15 @@ public sealed partial class MainForm
                 if (same.Length > 0) item.Num($"{name}: 同じ絵の再表示（くっきりの結果を使い回し）", P(same));
                 if (ip.Length > 0) item.Num($"{name}: フレーム補間オン（毎回新しい絵）", P(ip));
                 avgNew[name] = fresh.Average();
-                if (q == ScalingQuality.Anime4K && nh == 0)
+                if (q == ScalingQuality.NvRtx) rec.GpuNvMs = fresh.Average();
+                if (nh0 < 0) rec.GpuRestoreMs = fresh.Average() - avgNew.GetValueOrDefault("くっきり");
+                if (q == ScalingQuality.Anime4K && nh == 0 && !userCase)
                 {
                     rec.Gpu = true; rec.GpuAvg = fresh.Average(); rec.GpuMax = fresh.Max();
                     if (ip.Length > 0) { rec.GpuInterpAvg = ip.Average(); rec.GpuInterpMax = ip.Max(); }
                     rec.BudgetMs = budget;
                 }
+                } finally { D3DRenderer.RestoreForce = false; }
             }
             item.Num("出力", "3840x2160 / 映像 1080p の絵（変換の時間は含みません）")
                 .Num($"画面の 1 回の更新（{refresh:0}Hz）", $"{budget:0.0} ms");
@@ -308,8 +371,19 @@ public sealed partial class MainForm
             ? $"。GPU は 1 コマ平均 {Math.Max(r.GpuAvg, r.GpuInterpAvg):0.0} ms で、更新 1 回の {r.BudgetMs:0.0} ms に対して" + (Math.Max(r.GpuMax, r.GpuInterpMax) <= r.BudgetMs * 0.6 ? "余裕があります" : "余裕が少なめです")
             : string.Empty;
         string sharp = r.Live && r.LiveRingA4k > r.LiveRingFsr + 2.0 ? "。輪（白や黒の縁取り）が気になるときは、シャープさを下げてください" : string.Empty;
+        string rest = r.SsimRestA4k > 0
+            ? $"。「ぼやけを取ってから拡大」は、既知の絵で FSR の SSIM {r.SsimFsr:0.0000} → {r.SsimRestFsr:0.0000}、くっきりの SSIM {r.SsimA4k:0.0000} → {r.SsimRestA4k:0.0000} と上がりますが、GPU が 1 コマ約 {r.GpuRestoreMs:0.0} ms 増え、縁に輪が出やすく、実際の映像では輪の出た画素が増えるため、既定はオフです（元の細かさに合わせて拡大が働くときは使いません）"
+            : string.Empty;
+        string nv = string.Empty;
+        if (r.SsimNv >= 0)
+        {
+            double bestOther = Math.Max(r.SsimFsr, r.SsimA4k);
+            nv = $"。AI 拡大（NVIDIA RTX）は SSIM {r.SsimNv:0.0000}" + (r.NvEffectiveKnown && !r.NvEffective ? "（ただし VSR が働いていないため、ふつうの拡大と同じ結果です。NVIDIA コントロールパネルの「RTX ビデオ強調」をオンにしてください）"
+                : r.SsimNv > bestOther + 0.0005 ? $"で、数字の上では FSR・くっきりより上です" : $"で、FSR・くっきりを上回りません（FSR {r.SsimFsr:0.0000}、くっきり {r.SsimA4k:0.0000}）")
+                + (r.GpuNvMs > 0 ? $"。GPU は 1 コマ平均 {r.GpuNvMs:0.0} ms" : string.Empty);
+        }
         item.Verdict = Verdict.Info;
-        item.Summary = "[おすすめ] " + det + "。" + pick + cost + sharp;
+        item.Summary = "[おすすめ] " + det + "。" + pick + nv + cost + sharp + rest;
         item.Explanation = "比べた 5 通り（標準 / FSR / 元の細かさ + FSR / くっきり / 元の細かさ + くっきり）のうち、正解の絵に一番近い（SSIM が最大で、同点なら輪が少ない）ものを選んでいます。" +
             "好みや、ゲームごとの絵柄（写実的な絵では差が小さい）は数字に出ないため、最後は画像を見て決めてください。";
     }

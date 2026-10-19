@@ -172,11 +172,44 @@ internal static partial class Program
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i].Equals("--frames", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) akFrames = args[++i];
+                else if (args[i].Equals("--model", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    string mv = args[++i];
+                    A4kTest.UserModelPath = File.Exists(mv) ? Path.GetFullPath(mv) : UserModels.Resolve(mv);   // a model name, or a model file
+                }
                 else if (!args[i].StartsWith("--", StringComparison.Ordinal)) akOut = args[i];
             }
             Directory.CreateDirectory(akOut);
             string akText = A4kTest.HeadlessCheck(akOut, akFrames.Length > 0 ? akFrames : null);
             File.WriteAllText(Path.Combine(akOut, "report.txt"), akText, new System.Text.UTF8Encoding(true));
+            return;
+        }
+        if (args.Length > 3 && args[0] == "--a4k-run")
+        {
+            // Headless (GPU only): the raw float32 x2 output of one network for one picture, for the comparison with PyTorch.
+            //   --a4k-run <S|M|L|model.hlsl> <picture.png> <out.f32> [--half]   (--half: float16 intermediates as in the viewer; default float32)
+            File.WriteAllText(args[3] + ".txt", A4kUserTest.DumpRaw(args[1], args[2], args[3], args.Length > 4 && args[4] == "--half"), new System.Text.UTF8Encoding(true));
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--chroma-check")
+        {
+            // Headless (GPU only): chroma upsampling of the convert pass against a synthetic ground truth. --frames <dir> = real frames.
+            string chOut = Path.Combine(Path.GetTempPath(), "yucap_chroma_check"), chFrames = ""; bool chSweep = args.Contains("--sweep");
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("--frames", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) chFrames = args[++i];
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal)) chOut = args[i];
+            }
+            Directory.CreateDirectory(chOut);
+            string chText = ChromaTest.HeadlessCheck(chOut, chFrames.Length > 0 ? chFrames : null, chSweep);
+            File.WriteAllText(Path.Combine(chOut, "report.txt"), chText, new System.Text.UTF8Encoding(true));
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--guard-check")
+        {
+            string gcText = QualityGuard.SelfCheck();
+            Console.WriteLine(gcText);
+            if (args.Length > 1) File.WriteAllText(args[1], gcText);
             return;
         }
         if (args.Length > 0 && args[0] == "--refresh-hz-check")
@@ -189,8 +222,26 @@ internal static partial class Program
         // Calibration of the picture-detail estimator on synthetic enlarged pictures (no device, no window).
         if (args.Length > 0 && args[0] == "--res-estimate-check")
         {
-            string reOut = args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_res_estimate_check.txt");
+            string reOut = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_res_estimate_check.txt");
+            int ix = Array.IndexOf(args, "--index");
+            if (ix >= 0 && ix + 1 < args.Length)
+            {
+                // --res-estimate-check [out] --index <folder>: write index.jsonl (native-resolution estimate per picture) for a folder of PNGs, for 自分専用モデル training
+                int added = TrainCapture.IndexFolder(args[ix + 1]);
+                File.WriteAllText(reOut, $"index.jsonl in {args[ix + 1]}: {added} picture(s) added\n", new System.Text.UTF8Encoding(true));
+                return;
+            }
             File.WriteAllText(reOut, ResEstimate.SelfCheck());
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--nvrtx-probe")
+        {
+            RunNvRtxProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_nvrtx_probe.txt"));
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--nvof-probe")
+        {
+            RunNvofProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_nvof_probe.txt"));
             return;
         }
         if (args.Length > 0 && args[0] == "--interp-synth")
@@ -237,6 +288,18 @@ internal static partial class Program
             }
             _probeDisplay = dpDisp.Length > 0 ? dpDisp : null;
             RunDupProbe(dpOut, dpSec, dpInterp, dpOff);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--train-capture-probe")
+        {
+            int tpSec = 40; string tpDisp = "HISENSE";
+            string tpDir = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_train_probe");
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--seconds" && i + 1 < args.Length) int.TryParse(args[++i], out tpSec);
+                else if (args[i] == "--display" && i + 1 < args.Length) tpDisp = args[++i];
+            }
+            RunTrainCaptureProbe(tpDir, tpSec, tpDisp);
             return;
         }
         if (args.Length > 0 && args[0] == "--interp-seq-capture")
@@ -464,8 +527,8 @@ internal static partial class Program
     private static readonly HashSet<string> DiagnosticModes = new(StringComparer.Ordinal)
     {
         "--list-formats", "--dump-menus", "--check-update", "--selftest", "--restart-stress", "--gpu-bench",
-        "--live-triple-check", "--native-res-check", "--a4k-check", "--refresh-hz-check", "--res-estimate-check",
-        "--interp-synth", "--interp-capture", "--dup-probe", "--interp-seq-capture", "--interp-seq-eval", "--interp-eval",
+        "--live-triple-check", "--native-res-check", "--a4k-check", "--a4k-run", "--chroma-check", "--guard-check", "--refresh-hz-check", "--res-estimate-check",
+        "--nvof-probe", "--nvrtx-probe", "--interp-synth", "--interp-capture", "--dup-probe", "--interp-seq-capture", "--train-capture-probe", "--interp-seq-eval", "--interp-eval",
         "--interp-probe", "--vblank-probe", "--audio-probe", "--hdr-probe", "--render-test",
     };
 

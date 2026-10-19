@@ -139,9 +139,77 @@ internal static class A4kTest
         return result;
     }
 
-    public static string? FindGlsl(char variant)
+    /// <summary>The Restore network as written in Anime4K_Restore_CNN_<V>.glsl: all conv layers (clamp-to-edge, CReLU), the last one adds the
+    /// source picture. Returns w*h*3 floats (not clamped).</summary>
+    public static float[] ReferenceRestore(string glslPath, float[] rgb, int w, int h)
     {
-        string name = $"Anime4K_Upscale_CNN_x2_{variant}.glsl";
+        List<GPass> passes = ParseGlsl(File.ReadAllText(glslPath));
+        var tex = new Dictionary<string, float[]>();
+        var main = new float[w * h * 4];
+        for (int i = 0; i < w * h; i++) { main[i * 4] = rgb[i * 3]; main[i * 4 + 1] = rgb[i * 3 + 1]; main[i * 4 + 2] = rgb[i * 3 + 2]; main[i * 4 + 3] = 1f; }
+        tex["MAIN"] = main;
+        var res = new float[w * h * 3];
+        for (int pi = 0; pi < passes.Count; pi++)
+        {
+            GPass p = passes[pi];
+            bool last = pi == passes.Count - 1;
+            var o = new float[w * h * 4];
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    float r0 = p.Bias[0], r1 = p.Bias[1], r2 = p.Bias[2], r3 = p.Bias[3];
+                    foreach (Term t in p.Terms)
+                    {
+                        float[] src = tex[t.Tex];
+                        int sx = Math.Clamp(x + t.Dx, 0, w - 1), sy = Math.Clamp(y + t.Dy, 0, h - 1);
+                        int si = (sy * w + sx) * 4;
+                        for (int j = 0; j < 4; j++)
+                        {
+                            float v = src[si + j];
+                            if (t.Mode == 1) v = Math.Max(v, 0f); else if (t.Mode == -1) v = Math.Max(-v, 0f);
+                            r0 += t.M[4 * j] * v; r1 += t.M[4 * j + 1] * v; r2 += t.M[4 * j + 2] * v; r3 += t.M[4 * j + 3] * v;
+                        }
+                    }
+                    int oi = (y * w + x) * 4;
+                    o[oi] = r0; o[oi + 1] = r1; o[oi + 2] = r2; o[oi + 3] = r3;
+                    if (last)
+                    {
+                        res[(y * w + x) * 3] = r0 + main[oi]; res[(y * w + x) * 3 + 1] = r1 + main[oi + 1]; res[(y * w + x) * 3 + 2] = r2 + main[oi + 2];
+                    }
+                }
+            if (!last) tex[p.Save] = o;
+        }
+        return res;
+    }
+
+    internal static EquivResult? EquivalenceRestore(D3DRenderer r, char variant, Bitmap crop, string label, bool half)
+    {
+        string? glsl = FindGlsl(variant, "Restore");
+        if (glsl == null) return null;
+        bool keepHalf = D3DRenderer.A4kHalf; char keepV = D3DRenderer.RestoreVariantLetter;
+        D3DRenderer.A4kHalf = half; D3DRenderer.RestoreVariantLetter = variant;
+        try
+        {
+            float[]? gpu = r.RestoreReadRaw(crop, out Size sz);
+            if (gpu == null) return null;
+            float[] cur = ReferenceRestore(glsl, RgbOf(crop), crop.Width, crop.Height);
+            if (sz != crop.Size) return null;
+            int w = crop.Width, h = crop.Height;
+            double max = 0, sum = 0, mref = 0;
+            for (int i = 0; i < w * h; i++)
+                for (int k = 0; k < 3; k++)
+                {
+                    double d = Math.Abs(gpu[i * 4 + k] - cur[i * 3 + k]);
+                    max = Math.Max(max, d); sum += d; mref = Math.Max(mref, Math.Abs(cur[i * 3 + k]));
+                }
+            return new EquivResult(variant, 0, label, max, sum / (w * h * 3), mref, half);
+        }
+        finally { D3DRenderer.A4kHalf = keepHalf; D3DRenderer.RestoreVariantLetter = keepV; }
+    }
+
+    public static string? FindGlsl(char variant, string kind = "Upscale")
+    {
+        string name = kind == "Restore" ? $"Anime4K_Restore_CNN_{variant}.glsl" : $"Anime4K_Upscale_CNN_x2_{variant}.glsl";
         string? env = Environment.GetEnvironmentVariable("YUCAP_A4K_DIR");
         if (!string.IsNullOrEmpty(env) && File.Exists(Path.Combine(env, name))) return Path.Combine(env, name);
         for (string? d = AppContext.BaseDirectory; !string.IsNullOrEmpty(d); d = Path.GetDirectoryName(d))
@@ -238,6 +306,13 @@ internal static class A4kTest
     public static string RowText(MethodRow r) =>
         $"PSNR {r.Psnr:0.00} dB / SSIM {r.Ssim:0.0000} / 輪郭の強さ {r.GradRatio:0.000}×（正解=1） / 輪郭の幅 {r.EdgeWidth:0.00}px / 行き過ぎ {r.StepOvershoot:0.0}% / 輪の出た画素 {r.RingPct:0.00}%";
 
+    /// <summary>自分専用モデル: the model file whose rows are added to the comparisons below (null = none). The built-in rows always run with the
+    /// built-in network: <see cref="Synthetic"/> and <see cref="Live"/> switch the user model off for them and back on afterwards.</summary>
+    public static string? UserModelPath;
+
+    /// <summary>The NVIDIA RTX scaler can be compared (an NVIDIA GPU and it did not fail so far).</summary>
+    private static bool NvOn => D3DRenderer.NvAdapterPresent() && !D3DRenderer.NvVsrBroken;
+
     /// <summary>Synthetic ground truth: 4K truth -> 720p game -> 1080p console (<paramref name="upscaler"/>) -> 4K by each method.
     /// The caller disposes the rows' images.</summary>
     internal static List<MethodRow> Synthetic(NativeResTest.RenderFn render, Bitmap truth, Bitmap? console, NativeResTest.Kernel upscaler, out Bitmap console1080, bool withIdeal = true)
@@ -248,23 +323,46 @@ internal static class A4kTest
         float[] tl = NativeResTest.Luma(truth);
         double tg = ResEstimate.MeanGradient(tl, 3840, 2160);
         var rows = new List<MethodRow>();
-        (string, Bitmap?, ScalingQuality, int)[] specs =
+        (string, Bitmap?, ScalingQuality, int, bool)[] specs =
         {
-            ("標準（バイリニア）", console1080, ScalingQuality.Standard, 0),
-            ("FSR", console1080, ScalingQuality.Fsr, 0),
-            ("元の細かさ + FSR", console1080, ScalingQuality.Fsr, 720),
-            ("くっきり（Anime4K）", console1080, ScalingQuality.Anime4K, 0),
-            ("元の細かさ + くっきり", console1080, ScalingQuality.Anime4K, 720),
-            ("【参考】本物の 720p から FSR", withIdeal ? game : null, ScalingQuality.Fsr, 0),
-            ("【参考】本物の 720p から くっきり", withIdeal ? game : null, ScalingQuality.Anime4K, 0),
+            ("標準（バイリニア）", console1080, ScalingQuality.Standard, 0, false),
+            ("FSR", console1080, ScalingQuality.Fsr, 0, false),
+            ("AI 拡大（NVIDIA RTX）", NvOn ? console1080 : null, ScalingQuality.NvRtx, 0, false),
+            ("元の細かさ + FSR", console1080, ScalingQuality.Fsr, 720, false),
+            ("くっきり（Anime4K）", console1080, ScalingQuality.Anime4K, 0, false),
+            ("元の細かさ + くっきり", console1080, ScalingQuality.Anime4K, 720, false),
+            ("ぼやけ取り + FSR", console1080, ScalingQuality.Fsr, 0, true),
+            ("元の細かさ + ぼやけ取り + FSR", console1080, ScalingQuality.Fsr, 720, true),
+            ("ぼやけ取り + くっきり", console1080, ScalingQuality.Anime4K, 0, true),
+            ("元の細かさ + ぼやけ取り + くっきり", console1080, ScalingQuality.Anime4K, 720, true),
+            ("【参考】本物の 720p から FSR", withIdeal ? game : null, ScalingQuality.Fsr, 0, false),
+            ("【参考】本物の 720p から くっきり", withIdeal ? game : null, ScalingQuality.Anime4K, 0, false),
         };
-        foreach (var (name, src, q, nh) in specs)
+        string? keepCustom = D3DRenderer.A4kCustomPath;
+        try
         {
-            if (src == null) continue;
-            Bitmap? img = render(src, out4k, q, nh, -1);
-            if (img == null) continue;
-            rows.Add(Evaluate(name, img, tl, tg));
+            D3DRenderer.SetA4kCustom(null);
+            foreach (var (name, src, q, nh, restore) in specs)
+            {
+                if (src == null) continue;
+                D3DRenderer.RestoreForce = restore;
+                Bitmap? img;
+                try { img = render(src, out4k, q, nh, -1); }
+                finally { D3DRenderer.RestoreForce = false; }
+                if (img == null) continue;
+                rows.Add(Evaluate(name, img, tl, tg));
+            }
+            if (UserModelPath != null)
+            {
+                D3DRenderer.SetA4kCustom(UserModelPath);
+                foreach (var (name, nh) in new[] { ("自分専用モデル", 0), ("元の細かさ + 自分専用モデル", 720) })
+                {
+                    Bitmap? img = render(console1080, out4k, ScalingQuality.Anime4K, nh, -1);
+                    if (img != null) rows.Add(Evaluate(name, img, tl, tg));
+                }
+            }
         }
+        finally { D3DRenderer.SetA4kCustom(keepCustom); }
         return rows;
     }
 
@@ -290,25 +388,44 @@ internal static class A4kTest
     internal static List<LiveRow> Live(NativeResTest.RenderFn render, Bitmap source, Size output, int estV)
     {
         var rows = new List<LiveRow>();
-        var specs = new List<(string, ScalingQuality, int)>
+        var specs = new List<(string, ScalingQuality, int, bool)>
         {
-            ("標準", ScalingQuality.Standard, 0), ("FSR", ScalingQuality.Fsr, 0), ("くっきり", ScalingQuality.Anime4K, 0),
+            ("標準", ScalingQuality.Standard, 0, false), ("FSR", ScalingQuality.Fsr, 0, false), ("くっきり", ScalingQuality.Anime4K, 0, false),
         };
         if (estV > 0 && estV < source.Height)
         {
-            specs.Add(($"{ResEstimate.Name(estV)} に縮めて FSR", ScalingQuality.Fsr, estV));
-            specs.Add(($"{ResEstimate.Name(estV)} に縮めて くっきり", ScalingQuality.Anime4K, estV));
+            specs.Add(($"{ResEstimate.Name(estV)} に縮めて FSR", ScalingQuality.Fsr, estV, false));
+            specs.Add(($"{ResEstimate.Name(estV)} に縮めて くっきり", ScalingQuality.Anime4K, estV, false));
+        }
+        specs.Add(("ぼやけ取り + FSR", ScalingQuality.Fsr, 0, true));
+        specs.Add(("ぼやけ取り + くっきり", ScalingQuality.Anime4K, 0, true));
+        if (estV > 0 && estV < source.Height)
+            specs.Add(($"{ResEstimate.Name(estV)} に縮めて ぼやけ取り + くっきり", ScalingQuality.Anime4K, estV, true));
+        if (NvOn) specs.Add(("AI 拡大（NVIDIA RTX）", ScalingQuality.NvRtx, 0, false));   // last: the rows above are addressed by index
+        if (UserModelPath != null)
+        {
+            specs.Add(("自分専用モデル", ScalingQuality.Anime4K, 0, false));
+            if (estV > 0 && estV < source.Height) specs.Add(($"{ResEstimate.Name(estV)} に縮めて 自分専用モデル", ScalingQuality.Anime4K, estV, false));
         }
         float[]? plain = null;
-        foreach (var (name, q, nh) in specs)
+        string? keepCustom = D3DRenderer.A4kCustomPath;
+        try
         {
-            Bitmap? img = render(source, output, q, nh, -1);
-            if (img == null) continue;
-            float[] l = NativeResTest.Luma(img);
-            plain ??= l;
-            (double rp, double rx) = NativeResTest.Ringing(l, plain, output.Width, output.Height);
-            rows.Add(new LiveRow { Name = name, Image = img, Grad = ResEstimate.MeanGradient(l, output.Width, output.Height), RingPct = rp, RingExcess = rx });
+            foreach (var (name, q, nh, restore) in specs)
+            {
+                D3DRenderer.SetA4kCustom(name.Contains("自分専用モデル") ? UserModelPath : null);
+                D3DRenderer.RestoreForce = restore;
+                Bitmap? img;
+                try { img = render(source, output, q, nh, -1); }
+                finally { D3DRenderer.RestoreForce = false; }
+                if (img == null) continue;
+                float[] l = NativeResTest.Luma(img);
+                plain ??= l;
+                (double rp, double rx) = NativeResTest.Ringing(l, plain, output.Width, output.Height);
+                rows.Add(new LiveRow { Name = name, Image = img, Grad = ResEstimate.MeanGradient(l, output.Width, output.Height), RingPct = rp, RingExcess = rx });
+            }
         }
+        finally { D3DRenderer.SetA4kCustom(keepCustom); }
         return rows;
     }
 
@@ -369,8 +486,43 @@ internal static class A4kTest
                     if (e != null) sb.AppendLine($"  M / {(half ? "float16" : "float32")} / two stages (32x32 -> 128x128) : max diff {e.MaxDiff:0.0e+0}, mean {e.MeanDiff:0.0e+0}");
                 }
             sb.AppendLine($"  -> float32 worst case over all {(worst32 < 1e-3 ? "PASS" : "FAIL")} (limit 1e-3): {worst32:0.0e+0}");
+            sb.AppendLine();
+            sb.AppendLine("=== 1b. equivalence of the Restore networks (Anime4K_Restore_CNN_{S,M,L}.glsl, same size in and out; max |GPU - CPU| over RGB) ===");
+            double worstR = 0;
+            foreach (char v in "SML")
+                foreach (var (label, crop) in crops)
+                    foreach (bool half in new[] { false, true })
+                    {
+                        EquivResult? e = EquivalenceRestore(r, v, crop, label, half);
+                        if (e == null) { sb.AppendLine($"  Restore {v} {label}: not run (GLSL file or GPU unavailable)"); continue; }
+                        if (!half) worstR = Math.Max(worstR, e.MaxDiff);
+                        sb.AppendLine($"  Restore {v} / {(half ? "float16" : "float32")} intermediates / {label}: max diff {e.MaxDiff:0.0e+0}, mean diff {e.MeanDiff:0.0e+0} (largest value {e.MaxRef:0.00})");
+                    }
+            sb.AppendLine($"  -> Restore float32 worst case over all {(worstR < 1e-3 ? "PASS" : "FAIL")} (limit 1e-3): {worstR:0.0e+0}");
             foreach (var (_, c) in crops) c.Dispose();
             real?.Dispose();
+
+            // ---------------- 2R. Restore on the synthetic truth ----------------
+            foreach (char rv in "SML")
+                foreach (var (up, nm) in new[] { (NativeResTest.Kernel.Bilinear, "bilinear"), (NativeResTest.Kernel.CatmullRom, "bicubic") })
+                {
+                    D3DRenderer.RestoreVariantLetter = rv;
+                    sb.AppendLine();
+                    sb.AppendLine($"=== 2R. Restore {rv}: 4K truth -> 720p -> 1080p console ({nm}) -> 4K; Anime4K upscaler M ===");
+                    var rows = Synthetic(render, truth, null, up, out Bitmap con, false);
+                    foreach (MethodRow row in rows) sb.AppendLine($"  {row.Name,-34}: {RowText(row)}");
+                    if (rv == 'S' && up == NativeResTest.Kernel.Bilinear)
+                    {
+                        var (t1, t2) = NativeResTest.Tiles(truth);
+                        SaveRestoreStrip(rows, truth, t1, Path.Combine(outDir, "restore_text.png"));
+                        SaveRestoreStrip(rows, truth, t2, Path.Combine(outDir, "restore_edges.png"));
+                    }
+                    MethodRow? w = Winner(rows);
+                    sb.AppendLine($"  -> best by SSIM: {w?.Name}");
+                    foreach (MethodRow row in rows) row.Image?.Dispose();
+                    con.Dispose();
+                }
+            D3DRenderer.RestoreVariantLetter = 'S';
 
             // ---------------- 2. synthetic comparison ----------------
             foreach (char v in "SML")
@@ -496,9 +648,13 @@ internal static class A4kTest
                         ("標準", ScalingQuality.Standard, 0, 'M'), ("FSR", ScalingQuality.Fsr, 0, 'M'),
                         ("くっきり S", ScalingQuality.Anime4K, 0, 'S'), ("くっきり M", ScalingQuality.Anime4K, 0, 'M'), ("くっきり L", ScalingQuality.Anime4K, 0, 'L'),
                         ("元の細かさ + くっきり M (720p)", ScalingQuality.Anime4K, 720, 'M'),
+                        ("ぼやけ取り S + FSR", ScalingQuality.Fsr, 0, 'r'), ("ぼやけ取り S + くっきり M", ScalingQuality.Anime4K, 0, 'R'),
+                        ("ぼやけ取り M + くっきり M", ScalingQuality.Anime4K, 0, 'Q'),
                     })
                     {
-                        D3DRenderer.A4kVariantLetter = ch;
+                        D3DRenderer.RestoreForce = ch is 'r' or 'R' or 'Q';
+                        if (ch == 'r' || ch == 'R') D3DRenderer.RestoreVariantLetter = 'S'; else if (ch == 'Q') D3DRenderer.RestoreVariantLetter = 'M';
+                        D3DRenderer.A4kVariantLetter = ch is 'S' or 'L' ? ch : 'M';
                         double[] fresh = r.QualityBench(a, null, o4k, q, 0.5f, nh, 300, false);
                         double[] rep = q == ScalingQuality.Anime4K ? r.QualityBench(a, null, o4k, q, 0.5f, nh, 300, true) : fresh;
                         sb.AppendLine($"  {name,-32} new frame : {Avg(fresh)}");
@@ -509,16 +665,68 @@ internal static class A4kTest
                             sb.AppendLine($"  {"",-32} interpolation on, every refresh a new synthesised picture: {Avg(ip)}");
                         }
                     }
-                    D3DRenderer.A4kVariantLetter = 'M';
+                    D3DRenderer.A4kVariantLetter = 'M'; D3DRenderer.RestoreForce = false; D3DRenderer.RestoreVariantLetter = 'S';
+                    // the Restore pass alone
+                    r.RestoreBenchSetup(a);
+                    foreach (char rv in "SML") { D3DRenderer.RestoreVariantLetter = rv; sb.AppendLine($"  Restore {rv} pass alone, 1080p: {Avg(r.RestoreBench(a.Size, 300))}"); }
+                    D3DRenderer.RestoreVariantLetter = 'S';
                     b?.Dispose();
                     sb.AppendLine("  (144 Hz = 6.94 ms per refresh; 60 fps source = 16.7 ms per source frame)");
                 }
             }
             else sb.AppendLine("\n(no --frames directory: real-picture comparison and GPU timing skipped)");
+
+            // ---------------- 6. user-trained model (--model <name|file>) ----------------
+            string? um = UserModelPath;
+            if (um != null)
+            {
+                sb.AppendLine();
+                sb.AppendLine($"=== 6. user model {Path.GetFileNameWithoutExtension(um)}: held-out real frames (not used in training) -> half size -> x2 by the real GPU pipeline -> compared with the original frame ===");
+                var vlog = new StringBuilder();
+                List<A4kUserTest.ValRow> vrows = A4kUserTest.Validation(render, um, 12, vlog);
+                sb.Append(vlog);
+                foreach (A4kUserTest.ValRow vr in vrows) sb.AppendLine($"  {vr.Name,-22}: {A4kUserTest.RowText(vr)}");
+                bool better = A4kUserTest.Better(vrows, out A4kUserTest.ValRow? u, out A4kUserTest.ValRow? b0);
+                if (u != null && b0 != null)
+                    sb.AppendLine($"  -> user model vs built-in Anime4K M: SSIM {u.Ssim - b0.Ssim:+0.0000;-0.0000}, PSNR {u.Psnr - b0.Psnr:+0.00;-0.00} dB: " + (better ? "BETTER on held-out frames" : "NOT clearly better on held-out frames"));
+                else sb.AppendLine("  (no held-out frames listed in the model's .json, or the render failed)");
+                string? vf = A4kUserTest.ValFrames(um).FirstOrDefault();
+                if (vf != null)
+                {
+                    using var vr0 = new Bitmap(vf);
+                    using var va = new Bitmap(vr0.Width, vr0.Height, PixelFormat.Format32bppArgb);
+                    using (Graphics g = Graphics.FromImage(va)) g.DrawImage(vr0, 0, 0, vr0.Width, vr0.Height);
+                    var o4 = new Size(3840, 2160);
+                    foreach (var (nm, path) in new[] { ("built-in M", (string?)null), ("user model", um) })
+                    {
+                        D3DRenderer.SetA4kCustom(path);
+                        double[] ms = r.QualityBench(va, null, o4, ScalingQuality.Anime4K, 0.5f, 0, 300, false);
+                        sb.AppendLine($"  GPU {nm,-10} 1080p -> 4K, new frame: " + (ms.Length == 0 ? "n/a" : $"avg {ms.Average():0.00} ms, max {ms.Max():0.00} ms"));
+                    }
+                    D3DRenderer.SetA4kCustom(null);
+                }
+            }
+
+            // ---------------- 7. training-picture collector: selection logic and size cap (synthetic pictures, no GPU) ----------------
+            sb.AppendLine();
+            sb.AppendLine("=== 7. training-picture collector self-check ===");
+            sb.Append(TrainCapture.SelfCheck(Path.Combine(outDir, "traincap")));
         }
         catch (Exception ex) { sb.AppendLine("FAILED: " + ex); }
         finally { try { r?.DisposeAll(true); } catch { } }
         return sb.ToString();
+    }
+
+    private static void SaveRestoreStrip(List<MethodRow> rows, Bitmap truth, Rectangle tile, string path)
+    {
+        var panels = new List<Bitmap>(); var labels = new List<string>();
+        foreach (var (name, key) in new[] { ("FSR", "FSR"), ("Restore+FSR", "ぼやけ取り + FSR"), ("Crisp", "くっきり（Anime4K）"), ("Restore+Crisp", "ぼやけ取り + くっきり") })
+        {
+            MethodRow? m = rows.FirstOrDefault(x => x.Name == key);
+            if (m?.Image != null) { panels.Add(m.Image); labels.Add(name); }
+        }
+        panels.Add(truth); labels.Add("truth 4K");
+        TestProbes.SaveStrip(panels.ToArray(), labels.ToArray(), tile, path);
     }
 
     private static void SaveStrip(List<MethodRow> rows, Bitmap truth, Rectangle tile, string path)

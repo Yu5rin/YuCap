@@ -153,7 +153,7 @@ internal sealed partial class D3DRenderer
         long t0 = Stopwatch.GetTimestamp();
         try
         {
-            if (quality == ScalingQuality.Anime4K) quality = ScalingQuality.Fsr;
+            if (quality is ScalingQuality.Anime4K or ScalingQuality.NvRtx) quality = ScalingQuality.Fsr;
             Rectangle dst = StreamFit(o, _sSize, pixelPerfect);
             using (ID3D11Texture2D bb = sw.GetBuffer<ID3D11Texture2D>(0))
             using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))

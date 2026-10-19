@@ -36,9 +36,16 @@ internal static class D3DShaders
         public byte[] Me = Array.Empty<byte>(), MeCost = Array.Empty<byte>(), CutStat = Array.Empty<byte>();
         public byte[] Med = Array.Empty<byte>();
         public byte[] Synth = Array.Empty<byte>();
+        public bool OfaOk;
+        public byte[] OfConv = Array.Empty<byte>(), SynthOf = Array.Empty<byte>(), OfDown = Array.Empty<byte>();
+        public bool HudOk;
+        public byte[] Hud = Array.Empty<byte>();
         // Same-picture detection (Shaders/dup.hlsl, a compute shader). A failure only disables the game frame rate reading.
         public bool DupOk;
         public byte[] Dup = Array.Empty<byte>();
+        // SDR -> HDR10 (Shaders/hdr.hlsl). A failure only disables the HDR display.
+        public bool HdrOk;
+        public byte[] Hdr = Array.Empty<byte>(), HdrOverlay = Array.Empty<byte>(), HdrCopy = Array.Empty<byte>();
     }
 
     private static readonly object Gate = new();
@@ -86,6 +93,16 @@ internal static class D3DShaders
                 b.Med = Compile(interp, "med", "interp.hlsl", "ps_5_0");
                 b.Synth = Compile(interp, "synth", "interp.hlsl", "ps_5_0");
                 b.InterpOk = true;
+                try { b.Hud = Compile(interp, "hudupd", "interp.hlsl", "ps_5_0"); b.HudOk = true; }
+                catch (Exception ex) { Log.Info("D3D: HUD shader unavailable: " + ex.Message.Split((char)10)[0]); }
+                try
+                {
+                    b.OfConv = Compile(interp, "ofconv", "interp.hlsl", "ps_5_0");
+                    b.SynthOf = Compile(interp, "synthof", "interp.hlsl", "ps_5_0");
+                    b.OfDown = Compile(interp, "ofdown", "interp.hlsl", "ps_5_0");
+                    b.OfaOk = true;
+                }
+                catch (Exception ex) { Log.Info("D3D: optical-flow shaders unavailable - the block matcher is used: " + ex.Message.Split((char)10)[0]); }
             }
             catch (Exception ex)
             {
@@ -99,6 +116,18 @@ internal static class D3DShaders
             catch (Exception ex)
             {
                 Log.Info("D3D: same-picture shader unavailable - the game frame rate is not measured: " + ex.Message.Split((char)10)[0]);
+            }
+            try
+            {
+                string hdr = Resource("hdr.hlsl");
+                b.Hdr = Compile(hdr, "main", "hdr.hlsl", "ps_5_0");
+                b.HdrOverlay = Compile(hdr, "overlay", "hdr.hlsl", "ps_5_0");
+                b.HdrCopy = Compile(hdr, "copy", "hdr.hlsl", "ps_5_0");
+                b.HdrOk = true;
+            }
+            catch (Exception ex)
+            {
+                Log.Info("D3D: HDR shader unavailable - the HDR display is disabled: " + ex.Message.Split((char)10)[0]);
             }
             Log.Info($"D3D: shaders compiled in {sw.ElapsedMilliseconds}ms");
             _cached = b;
@@ -123,6 +152,51 @@ internal static class D3DShaders
             for (int i = 0; i < passes.Length; i++) code[i] = Compile(src, passes[i].Entry, file, "ps_5_0");
             Log.Info($"D3D: Anime4K {variant} shaders compiled in {sw.ElapsedMilliseconds}ms");
             A4kCode[variant] = code;
+            return code;
+        }
+    }
+
+    private static readonly Dictionary<string, byte[][]> A4kCustomCode = new();
+
+    /// <summary>Bytecode of the passes of a user-trained network (a model file written by tools/train_upscaler.py: the layout of Anime4K M,
+    /// so the passes and entry points are those of <c>A4kModels.PassesM</c>), compiled from the file on disk. Cached per file and modification
+    /// time, so a retrained model that replaces the file is picked up without a rebuild. Throws if the file or the compile fails.</summary>
+    public static byte[][] GetA4kCustom(string path)
+    {
+        lock (Gate)
+        {
+            string key = path + "|" + File.GetLastWriteTimeUtc(path).Ticks;
+            if (A4kCustomCode.TryGetValue(key, out byte[][]? have)) return have;
+            var sw = Stopwatch.StartNew();
+            string src = File.ReadAllText(path, Encoding.UTF8);
+            string label = Path.GetFileName(path);
+            A4kPassInfo[] passes = A4kModels.PassesM;
+            var code = new byte[passes.Length][];
+            for (int i = 0; i < passes.Length; i++) code[i] = Compile(src, passes[i].Entry, label, "ps_5_0");
+            Log.Info($"D3D: Anime4K user model {label} compiled in {sw.ElapsedMilliseconds}ms");
+            A4kCustomCode.Clear();
+            A4kCustomCode[key] = code;
+            return code;
+        }
+    }
+
+    private static readonly Dictionary<char, byte[][]> RestoreCode = new();
+
+    /// <summary>Bytecode of every pass of the Anime4K Restore network <paramref name="variant"/> (S, M or L), in the order of
+    /// <c>A4kModels.RestorePasses*</c>. Compiled on first use; throws if the compile fails.</summary>
+    public static byte[][] GetRestore(char variant)
+    {
+        lock (Gate)
+        {
+            if (RestoreCode.TryGetValue(variant, out byte[][]? have)) return have;
+            var sw = Stopwatch.StartNew();
+            string file = $"a4k_restore_{char.ToLowerInvariant(variant)}.hlsl";
+            string src = Resource(file);
+            A4kPassInfo[] passes = variant switch { 'S' => A4kModels.RestorePassesS, 'L' => A4kModels.RestorePassesL, _ => A4kModels.RestorePassesM };
+            var code = new byte[passes.Length][];
+            for (int i = 0; i < passes.Length; i++) code[i] = Compile(src, passes[i].Entry, file, "ps_5_0");
+            Log.Info($"D3D: Anime4K Restore {variant} shaders compiled in {sw.ElapsedMilliseconds}ms");
+            RestoreCode[variant] = code;
             return code;
         }
     }

@@ -304,6 +304,7 @@ public sealed partial class MainForm
     {
         if (_testRunning) return;
         _testRunning = true;
+        D3DRenderer.SetA4kCustom(null);   // the test's くっきり rows are the built-in network; 自分専用モデル rows switch it on for themselves
         _testCts = new CancellationTokenSource();
         _topt = o;
         _testStep = 0;
@@ -416,6 +417,7 @@ public sealed partial class MainForm
         TopMost = _isFullscreen || _isPip || _alwaysOnTop;
 
         _testRunning = false;   // from here on settings may be saved again
+        ApplyTrainFeatures();   // the user model and the picture collector come back as the user had them
         LayoutCanvas(ModeChangeSettleMs);
         UpdateChecks();
         UpdateStatus();
@@ -488,10 +490,12 @@ public sealed partial class MainForm
                 steps.Add((L.F("表示の計測: {0}", cc.Label), secRender, () => RenderStep(secRender, cc, vrrNotes)));
             }
             steps.Add((L.F("表示の計測: {0}", L.T("まとめ")), secRender, () => { VrrSummary(secRender, vrrNotes); return Task.CompletedTask; }));
+            steps.Add((L.F("表示の計測: {0}", L.T("負荷の自動調整")), secRender, () => GuardStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（既知の動き）")), secRender, () => InterpSynthStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（実際の映像）")), secRender, () => InterpLiveStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("ゲームのコマ数に合わせた補間")), secRender, () => InterpCadenceStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("重ねた表示による更新の低下")), secRender, () => OverlayCapStep(secRender, modes)));
+            steps.Add((L.F("表示の計測: {0}", L.T("HDR モニターでの出力形式と更新")), secRender, () => WideSdrStep(secRender, modes)));
 
             // 4. notices, with low latency off and on
             CaptureMode? m1080 = PickMode(modes, 1920, 1080, maxFps: 60) ?? PickMode(modes, 1920, 1080, 0);
@@ -517,9 +521,11 @@ public sealed partial class MainForm
 
             steps.Add((L.F("FSR の見え方: {0}", L.T("元の細かさに合わせた拡大")), secFsr, () => NativeResStep(secFsr, modes)));
             steps.Add((L.F("FSR の見え方: {0}", L.T("くっきり（Anime4K）")), secFsr, () => A4kStep(secFsr, modes)));
+            steps.Add((L.F("FSR の見え方: {0}", L.T("色の境目")), secFsr, () => ChromaStep(secFsr, modes)));
 
             // 6. HDR
             steps.Add((L.T("HDR の確認"), secHdr, () => HdrStep(secHdr, modes)));
+            steps.Add((L.T("HDR の確認"), secHdr, () => HdrDisplayStep(secHdr, modes)));
 
             // 7. features
             CaptureMode? mFeat = PickMode(modes, 1920, 1080, maxFps: 60) ?? modes.FirstOrDefault();
@@ -1071,6 +1077,8 @@ public sealed partial class MainForm
             return;
         }
         await Wait(SettleMs);
+        // 負荷の自動調整: the GPU budget guard needs about 2 s of overload to step the scaling down; measure after it has settled
+        if (c.Quality == ScalingQuality.Anime4K) await Wait(4000);
         // Right after a mode switch the card often runs below its rate for a second or two. Measure only once the
         // capture rate has settled (within 10% of the named rate); if it never does, that is the card's doing and
         // is reported as such below instead of as a display fault.
@@ -1112,6 +1120,9 @@ public sealed partial class MainForm
 
         Verdict v = Verdict.Ok;
         var why = new List<string>();
+
+        if (_video.GuardLog.Count > 0 || _video.GuardStatus != null)
+            item.Num("負荷の自動調整", (_video.GuardStatus != null ? "働いています（" + _video.GuardStatus + "）: " : "働きました（今は元の画質）: ") + string.Join(" / ", _video.GuardLog));
 
         if (c.Interp)
         {

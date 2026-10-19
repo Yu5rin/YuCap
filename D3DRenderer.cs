@@ -197,11 +197,12 @@ internal sealed partial class D3DRenderer : IDisposable
         _blendOver = Device.CreateBlendState(new BlendDescription(Blend.One, Blend.InverseSourceAlpha));
         _psEasu = Device.CreatePixelShader(b.Easu);
         _psRcas = Device.CreatePixelShader(b.Rcas);
+        CreateHdrShaders(b);
 
         _linear = Device.CreateSamplerState(new SamplerDescription(Filter.MinMagMipLinear, TextureAddressMode.Clamp));
         _point = Device.CreateSamplerState(new SamplerDescription(Filter.MinMagMipPoint, TextureAddressMode.Clamp));
         _raster = Device.CreateRasterizerState(new RasterizerDescription(CullMode.None, FillMode.Solid));
-        _cbConvert = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
+        _cbConvert = Device.CreateBuffer(new BufferDescription(112, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbScale = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbEasu = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
         _cbRcas = Device.CreateBuffer(new BufferDescription(96, BindFlags.ConstantBuffer, ResourceUsage.Default));
@@ -232,6 +233,8 @@ internal sealed partial class D3DRenderer : IDisposable
                 _psMed = Device.CreatePixelShader(b.Med);
                 _psSynth = Device.CreatePixelShader(b.Synth);
                 _cbInterp = Device.CreateBuffer(new BufferDescription(64, BindFlags.ConstantBuffer, ResourceUsage.Default));
+                CreateOfaShaders(b);
+                CreateHudShader(b);
             }
             catch (Exception ex)
             {
@@ -295,6 +298,7 @@ internal sealed partial class D3DRenderer : IDisposable
     public void CreatePresentation(IntPtr hwnd, Size client, bool lowLatency = false)
     {
         _swapSize = client;
+        _presentHwnd = hwnd;
         using IDXGIDevice1 dxgiDevice = Device.QueryInterface<IDXGIDevice1>();
         using IDXGIAdapter adapter = dxgiDevice.GetAdapter();
         using IDXGIFactory2 factory = adapter.GetParent<IDXGIFactory2>();
@@ -728,7 +732,8 @@ internal sealed partial class D3DRenderer : IDisposable
         public Vector4 Coef;
         public Vector4 Range;
         public Vector4 Adj;
-        public int CropL, CropT, CropR, CropB;
+        public int CropL, CropT, CropR, CropB;   // CropR/CropB: chroma upsampling mode / variant (convert.hlsl crop.z / crop.w)
+        public Vector4 Tune;
     }
 
     private void SetupTriangle(ID3D11RenderTargetView rtv, Rectangle viewport)
@@ -804,7 +809,7 @@ internal sealed partial class D3DRenderer : IDisposable
             P0 = adj.IsNeutral ? 0 : 1,   // orient.z: adjustments on
             P1 = Math.Clamp(adj.Shadow, 0, VideoAdjustments.MaxShadow),   // orient.w: shadow boost level
             Adj = new Vector4(adj.Brightness, adj.Contrast, 1f / adj.Gamma, adj.Saturation),
-            CropL = keep.X, CropT = keep.Y,
+            CropL = keep.X, CropT = keep.Y, CropR = ChromaModeNow, CropB = ChromaVariant, Tune = ChromaTune,
         });
 
         Ctx.PSSetShaderResource(0, null!);
@@ -853,20 +858,35 @@ internal sealed partial class D3DRenderer : IDisposable
         // that is still current (same picture, same settings) is reused, which also spares the prescale pass.
         int a4kStages = quality == ScalingQuality.Anime4K && !pixelPerfect && interRtv != null && interSrv != null
             ? A4kPlan(effSrc, dst.Size) : 0;
-        bool a4kHit = false;
+        // 「ぼやけを取ってから拡大」: the Restore CNN runs on the (shrunk) picture before FSR / the Anime4K upscaler, at the picture's own size
+        bool restore = !pixelPerfect && interRtv != null && dst.Width > effSrc.Width && dst.Height > effSrc.Height
+            && quality != ScalingQuality.NvRtx && RestoreWanted(quality, preDo) && (a4kStages > 0 || quality != ScalingQuality.Anime4K);
+        bool a4kHit = false, restHit = false;
         A4kKey a4kKey = default;
+        RestoreKey restKey = default;
+        int pf = preDo ? (filter < 0 ? PrescaleFilter : filter) : 0;
+        if (restore)
+        {
+            restKey = new RestoreKey(_orientedVer, preDo ? nativeH : 0, pf, preDo ? BackProjectionIterations : 0, preDo ? BackProjectionClamp : 0f, RestoreVariantLetter, A4kHalf);
+            restHit = !A4kNoCache && _restOut != null && _restHaveKey && _restKey == restKey;
+        }
         if (a4kStages > 0)
         {
-            a4kKey = new A4kKey(_orientedVer, preDo ? nativeH : 0, preDo ? (filter < 0 ? PrescaleFilter : filter) : 0,
-                preDo ? BackProjectionIterations : 0, preDo ? BackProjectionClamp : 0f, A4kVariantLetter, a4kStages, A4kHalf);
+            a4kKey = new A4kKey(_orientedVer, preDo ? nativeH : 0, pf,
+                preDo ? BackProjectionIterations : 0, preDo ? BackProjectionClamp : 0f, A4kVariantNow, a4kStages, A4kHalf,
+                restore ? RestoreVariantLetter : '\0', A4kVariantNow == 'C' ? A4kCustomEpoch : 0);
             a4kHit = !A4kNoCache && _a4kResult != null && _a4kHaveKey && _a4kKey == a4kKey;
         }
         if (preDo)
         {
-            if (!a4kHit) DrawPrescale(src, preTo, filter);
+            if (!a4kHit && !restHit) DrawPrescale(src, preTo, filter);
             src = preTo;
             srcSrv = _preSrv!;
             _prescaleActiveH = nativeH;
+        }
+        if (restore && !a4kHit)
+        {
+            if (restHit || RestoreRun(srcSrv, src, restKey)) srcSrv = _restOut!.Srv;
         }
         if (a4kStages > 0)
         {
@@ -882,8 +902,17 @@ internal sealed partial class D3DRenderer : IDisposable
             }
         }
 
+        // 「AI 拡大（NVIDIA RTX）」: the video processor's super resolution scales the (prescaled) oriented picture to the destination size;
+        // when it cannot run (not NVIDIA / failure) this is FSR
+        bool nvOk = false;
+        if (quality == ScalingQuality.NvRtx && !pixelPerfect && _oriented != null && dst.Width > src.Width && dst.Height > src.Height)
+        {
+            ID3D11Texture2D nvSrc = preDo ? _pre! : _oriented;
+            if (NvScale(nvSrc, src, dst.Size, out ID3D11ShaderResourceView? nvSrv) && nvSrv != null) { nvOk = true; src = dst.Size; srcSrv = nvSrv; }
+        }
+
         bool a4k = a4kStages > 0 && a4kHit;
-        bool fsr = (quality == ScalingQuality.Fsr || (quality == ScalingQuality.Anime4K && !a4k && A4kFallbackFsr))
+        bool fsr = (quality == ScalingQuality.Fsr || (quality == ScalingQuality.NvRtx && !nvOk) || (quality == ScalingQuality.Anime4K && !a4k && A4kFallbackFsr))
                    && !pixelPerfect && interRtv != null && interSrv != null
                    && dst.Width > src.Width && dst.Height > src.Height;
         // after the CNN: EASU only for a (still) larger destination and only when asked for; the exact size needs no resampling
@@ -1091,6 +1120,7 @@ internal sealed partial class D3DRenderer : IDisposable
         {
             Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
             Ctx.ClearState();
+            _nvH?.DropViews();
             Ctx.Flush();
         }
         _swap.ResizeBuffers(0, (uint)client.Width, (uint)client.Height, Format.Unknown,
@@ -1105,6 +1135,8 @@ internal sealed partial class D3DRenderer : IDisposable
     {
         if (_swap == null) { _gpu?.Cancel(); return Result.Fail; }
         EnsureClientTextures(_swapSize);
+        HdrUpdate();     // the swap chain follows the HDR request / the monitor's HDR state
+        if (_hdrKind != 0 || _wideSdr) return PresentFrameHdr(dst, quality, pixelPerfect, sharpness, nativeH, overlays);
         _gpu?.Begin();   // no-op when the render loop already opened the span before Convert
         using (ID3D11Texture2D bb = _swap.GetBuffer<ID3D11Texture2D>(0))
         using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))
@@ -1180,7 +1212,7 @@ internal sealed partial class D3DRenderer : IDisposable
             if (!any)
             {
                 Ctx.OMSetBlendState(_blendOver);
-                Ctx.PSSetShader(_psOverlay);
+                Ctx.PSSetShader(_overlayPq && _psOverlayPq != null ? _psOverlayPq : _psOverlay);
                 Ctx.PSSetConstantBuffer(0, _cbScale);
                 any = true;
             }
@@ -1339,9 +1371,17 @@ internal sealed partial class D3DRenderer : IDisposable
         public readonly ID3D11ShaderResourceView[] LumaSrv = new ID3D11ShaderResourceView[4];
         public readonly ID3D11RenderTargetView[] LumaRtv = new ID3D11RenderTargetView[4];
         public readonly Size[] LumaSize = new Size[4];
+        public NvOfSession? OfaOwner;                     // the optical-flow session the texture below (or Tex) is registered with
+        public IntPtr OfaReg;
+        public ID3D11Texture2D? OfaTex;                   // the picture shrunk for the optical-flow engine (big sources only)
+        public ID3D11ShaderResourceView? OfaSrv;
+        public ID3D11RenderTargetView? OfaRtv;
+        public long OfaSeq;                               // the Seq OfaTex was made from (0 = stale)
 
         public void Dispose()
         {
+            OfaOwner?.Unregister(OfaReg); OfaOwner = null; OfaReg = IntPtr.Zero;
+            OfaRtv?.Dispose(); OfaSrv?.Dispose(); OfaTex?.Dispose(); OfaRtv = null; OfaSrv = null; OfaTex = null; OfaSeq = 0;
             for (int i = 0; i < 4; i++)
             {
                 LumaRtv[i]?.Dispose(); LumaSrv[i]?.Dispose(); Luma[i]?.Dispose();
@@ -1419,6 +1459,8 @@ internal sealed partial class D3DRenderer : IDisposable
     {
         _oriA?.Dispose(); _oriA = null;
         _oriB?.Dispose(); _oriB = null;
+        DisposeOfa();
+        FreeHud();
         if (_fields != null) foreach (FieldLevel f in _fields) f.Dispose();
         _fields = null;
         _costVolRtv?.Dispose(); _costVolSrv?.Dispose(); _costVol?.Dispose();
@@ -1531,12 +1573,22 @@ internal sealed partial class D3DRenderer : IDisposable
         }
     }
 
-    /// <summary>Hierarchical symmetric block matching of A against B, coarse (1/16) to fine (1/2).</summary>
+    /// <summary>Motion of the pair: the hardware optical flow when it is available (the block matcher then only runs
+    /// its coarsest level, for the scene-cut statistics), otherwise the block matcher.</summary>
     private void EstimateMotion(OriFrame a, OriFrame b)
+    {
+        if (TryOfaMotion(a, b)) { _fieldIsOfa = true; MotionLabel = "NVIDIA OFA（専用回路）"; EstimateBlocks(a, b, 3); return; }
+        _fieldIsOfa = false;
+        MotionLabel = "ブロックマッチング（GPU）";
+        EstimateBlocks(a, b, 0);
+    }
+
+    /// <summary>Hierarchical symmetric block matching of A against B, coarse (1/16) down to level <paramref name="finest"/> (0 = 1/2).</summary>
+    private void EstimateBlocks(OriFrame a, OriFrame b, int finest)
     {
         EnsureFields(a);
         FieldLevel[] fields = _fields!;
-        for (int k = 3; k >= 0; k--)
+        for (int k = 3; k >= finest; k--)
         {
             FieldLevel fl = fields[k];
             Size ls = a.LumaSize[k];
@@ -1606,6 +1658,7 @@ internal sealed partial class D3DRenderer : IDisposable
 
     private void Synthesize(OriFrame a, OriFrame b, float alpha)
     {
+        if (_fieldIsOfa) { SynthesizeOf(a, b, alpha); return; }
         FieldLevel f1 = _fields![0];
         Size o = _orientedSize;
         WriteCb(_cbInterp!, new InterpCb
@@ -1623,8 +1676,9 @@ internal sealed partial class D3DRenderer : IDisposable
         Ctx.PSSetShaderResource(1, b.Srv);
         Ctx.PSSetShaderResource(2, f1.FinSrv);
         Ctx.PSSetShaderResource(4, _cutSrv!);
+        Ctx.PSSetShaderResource(8, HudSrv());
         Ctx.Draw(3, 0);
-        Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!); Ctx.PSSetShaderResource(2, null!); Ctx.PSSetShaderResource(4, null!);
+        Ctx.PSSetShaderResource(0, null!); Ctx.PSSetShaderResource(1, null!); Ctx.PSSetShaderResource(2, null!); Ctx.PSSetShaderResource(4, null!); Ctx.PSSetShaderResource(8, null!);
     }
 
     /// <summary>Debug: the scene-cut statistics of the last motion search (mean cost, share of blocks above 0.04 / 0.08 / 0.15).</summary>
@@ -1686,9 +1740,14 @@ internal sealed partial class D3DRenderer : IDisposable
             DebugCutStats = ReadCutStats();
             mid = ReadBack(_oriented!, new Rectangle(Point.Empty, o));
 
-            FieldLevel f1 = _fields![0];
-            fieldSize = f1.Size;
-            fieldXy = ReadField(f1);
+            if (_fieldIsOfa) { fieldXy = ReadFieldOfa(out fieldSize); DebugFieldPx = _ofa!.Grid * _ofaScale; }
+            else
+            {
+                FieldLevel f1 = _fields![0];
+                fieldSize = f1.Size;
+                fieldXy = ReadField(f1);
+                DebugFieldPx = InterpBlockPx(o);
+            }
 
             if (benchFrames > 0)
             {
@@ -1697,6 +1756,7 @@ internal sealed partial class D3DRenderer : IDisposable
                 double[] syn = TimeGpu(() => Synthesize(fa!, fb!, (float)alpha), benchFrames);
                 string Fmt(double[] v) => v.Length == 0 ? "n/a" : $"avg {v.Average():0.00} ms (max {v.Max():0.00})";
                 timing = $"convert-less pyramid {Fmt(pyr)}; motion search {Fmt(me)}; synthesis {Fmt(syn)}";
+                if (_fieldIsOfa) timing += $"; optical-flow engine {OfaBenchMs(fa!, fb!, benchFrames):0.00} ms per pair (wall, both directions)";
             }
             Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
             fa!.Dispose(); fb!.Dispose();
@@ -1966,6 +2026,7 @@ internal sealed partial class D3DRenderer : IDisposable
             {
                 _gpu?.Begin();
                 EstimateMotion(_oriA!, _oriB!);
+                HudUpdate(_oriA!, _oriB!, a.Seq, bSeq);
                 _meA = a.Seq; _meB = bSeq;
             }
 
@@ -2330,7 +2391,7 @@ internal sealed partial class D3DRenderer : IDisposable
         Beat.Dispose();
         InterpFree();
         A4kFree();
-        FreeOverlays(); FreeCrisp(); StreamFree();
+        FreeOverlays(); FreeCrisp(); StreamFree(); FreeHdrTextures(); _hdrKind = 0; _wideSdr = false; _monHdr = null; _hdrCheckAt = 0;
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
         _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();
@@ -2344,6 +2405,7 @@ internal sealed partial class D3DRenderer : IDisposable
 
         lock (FrameLock) { FreeRing(); DisposeFrameTextures(); DupFree(); }
         _gpu?.Dispose(); _gpu = null;
+        DisposeNv();
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psOverlay?.Dispose(); _blendOver?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
         _psPre?.Dispose(); _psIbp?.Dispose(); _cbPre?.Dispose();
         for (int i = 0; i < 2; i++) { _pfRtv[i]?.Dispose(); _pfSrv[i]?.Dispose(); _pf[i]?.Dispose(); }

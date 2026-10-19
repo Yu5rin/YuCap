@@ -40,4 +40,37 @@ internal static partial class A4kModels
         new("d2s", new[] { -1, 6, 7, 8 }, -2),
     };
     internal const int TexturesL = 9;
+    internal static readonly A4kPassInfo[] RestorePassesS =
+    {
+        new("l0", new[] { -1 }, 0),
+        new("l1", new[] { 0 }, 1),
+        new("l2", new[] { 1 }, 2),
+        new("fin", new[] { -1, 2 }, -2),
+    };
+    internal const int RestoreTexturesS = 3;
+    internal static readonly A4kPassInfo[] RestorePassesM =
+    {
+        new("l0", new[] { -1 }, 0),
+        new("l1", new[] { 0 }, 1),
+        new("l2", new[] { 1 }, 2),
+        new("l3", new[] { 2 }, 3),
+        new("l4", new[] { 3 }, 4),
+        new("l5", new[] { 4 }, 5),
+        new("l6", new[] { 5 }, 6),
+        new("fin", new[] { -1, 0, 1, 2, 3, 4, 5, 6 }, -2),
+    };
+    internal const int RestoreTexturesM = 7;
+    internal static readonly A4kPassInfo[] RestorePassesL =
+    {
+        new("l0", new[] { -1 }, 0),
+        new("l1", new[] { -1 }, 1),
+        new("l2", new[] { 0, 1 }, 2),
+        new("l3", new[] { 0, 1 }, 3),
+        new("l4", new[] { 2, 3 }, 4),
+        new("l5", new[] { 2, 3 }, 5),
+        new("l6", new[] { 4, 5 }, 6),
+        new("l7", new[] { 4, 5 }, 7),
+        new("fin", new[] { -1, 6, 7 }, -2),
+    };
+    internal const int RestoreTexturesL = 8;
 }

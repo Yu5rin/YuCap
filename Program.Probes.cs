@@ -388,7 +388,7 @@ internal static partial class Program
 
                     // the field: block centres at bp*fx + bp/2 (source pixels; bp = 8, or 16 for a wide source)
                     int nBg = 0, okBg = 0, nBk = 0, okBk = 0; double eBg = 0, eBk = 0;
-                    int bp = D3DRenderer.InterpBlockPx(new Size(w, h));
+                    int bp = D3DRenderer.DebugFieldPx > 0 ? D3DRenderer.DebugFieldPx : D3DRenderer.InterpBlockPx(new Size(w, h));
                     for (int fy = 0; fy < fs.Height; fy++)
                         for (int fx = 0; fx < fs.Width; fx++)
                         {

@@ -162,7 +162,8 @@ internal static partial class Program
                 log.Add("variant | moving px PSNR interp/blend/repeat | MAE interp/blend/repeat | whole PSNR interp/blend/repeat | synth bg/block dB (blend) | GPU 1080p / 4K synth ms");
                 foreach (EvalVariant v in variants)
                 {
-                    
+                    D3DRenderer.InterpOpt = InterpOptions.Parse(v.Name);
+                    log.Add("== variant " + v.Name + " : " + D3DRenderer.InterpOpt);
                     var used = new List<InterpCheck.Triple>();
                     var perTriple = new List<string>();
                     int bestIdx = -1; double bestMov = 0;
@@ -195,6 +196,11 @@ internal static partial class Program
                     string Avg(Func<InterpCheck.Triple, double> f) => used.Count == 0 ? "n/a" : used.Average(f).ToString("0.0");
 
                     var syn = InterpCheck.RunSynthetic(engine, null, Path.Combine(outDir, v.Name + "_synth.png"));
+                    var hudS = InterpHudCheck.RunSynthetic(engine, Path.Combine(outDir, v.Name + "_hud.png"));
+                    string hudSeq = Path.Combine(dir, "..", "seq1");
+                    var hudR = Directory.Exists(hudSeq) ? InterpHudCheck.RunReal(engine, hudSeq, 12) : new InterpHudCheck.Result { Failure = "no seq1" };
+                    log.Add($"  HUD synthetic: ok={hudS.Ok} {hudS.Failure} overlay PSNR {hudS.HudPsnr:0.0} (blend {hudS.HudBlend:0.0}) ring {hudS.RingPsnr:0.0} (blend {hudS.RingBlend:0.0}) sharpness {hudS.HudSharp:0.00}");
+                    log.Add($"  HUD real (seq1, n={hudR.N}): ok={hudR.Ok} {hudR.Failure} static-edge px PSNR {hudR.HudPsnr:0.0} (blend {hudR.HudBlend:0.0}) sharpness {hudR.HudSharp:0.00}");
                     var cutRes = InterpCheck.RunSceneCut(engine);
                     log.Add($"  scene cut (two unrelated patterns): ok={cutRes.Ok} share>0.08={cutRes.Share:0.00} detected={cutRes.Detected} output vs blend MAE {cutRes.ErrNearA:0.00}/{cutRes.ErrNearB:0.00} clean={cutRes.Clean}; moving-pattern share {syn.CutShare:0.00}");
                     string timing = "n/a";
@@ -211,7 +217,8 @@ internal static partial class Program
                             // "convert-less pyramid avg x; motion search avg y; synthesis avg z"
                             var mt = System.Text.RegularExpressions.Regex.Match(tm, @"motion search avg ([\d.]+).*synthesis avg ([\d.]+)");
                             var pt = System.Text.RegularExpressions.Regex.Match(tm, @"pyramid avg ([\d.]+)");
-                            return mt.Success ? $"pyr {pt.Groups[1].Value} me {mt.Groups[1].Value} synth {mt.Groups[2].Value}" : tm;
+                            var ot = System.Text.RegularExpressions.Regex.Match(tm, @"optical-flow engine ([\d.]+)");
+                            return mt.Success ? $"pyr {pt.Groups[1].Value} me {mt.Groups[1].Value} synth {mt.Groups[2].Value}" + (ot.Success ? $" ofa-hw {ot.Groups[1].Value}" : "") : tm;
                         }
                         timing = T(1920, 1080) + " | " + T(3840, 2160);
                         if (trip.Count > 0)
@@ -221,7 +228,8 @@ internal static partial class Program
                                 if (!engine.DebugInterpSynthetic(a, b, 0.5, 80, out Bitmap? m2, out _, out _, out string tm)) return "failed";
                                 m2?.Dispose();
                                 var mt = System.Text.RegularExpressions.Regex.Match(tm, @"motion search avg ([\d.]+).*synthesis avg ([\d.]+)");
-                                return mt.Success ? $"me {mt.Groups[1].Value} synth {mt.Groups[2].Value}" : tm;
+                                var ot2 = System.Text.RegularExpressions.Regex.Match(tm, @"optical-flow engine ([\d.]+)");
+                                return mt.Success ? $"me {mt.Groups[1].Value} synth {mt.Groups[2].Value}" + (ot2.Success ? $" ofa-hw {ot2.Groups[1].Value}" : "") : tm;
                             }
                             Bitmap Up(Bitmap src)
                             {
@@ -240,7 +248,7 @@ internal static partial class Program
                         }
                     }
                     log.Add($"{v.Name} n={used.Count} | median {Med(t => t.InterpPsnr)}/{Med(t => t.BlendPsnr)}/{Med(t => t.RepeatPsnr)} (mean {Avg(t => t.InterpPsnr)}/{Avg(t => t.BlendPsnr)}/{Avg(t => t.RepeatPsnr)}) | MAE med {Med(t => t.InterpMae)}/{Med(t => t.BlendMae)}/{Med(t => t.RepeatMae)} | whole {Med(t => t.InterpAll)}/{Med(t => t.BlendAll)}/{Med(t => t.RepeatAll)} | " +
-                            $"synth bg {syn.BgPsnr:0.0} ({syn.BgBlend:0.0}) block {syn.BlkPsnr:0.0} ({syn.BlkBlend:0.0}) vec bg {syn.BgOk}/{syn.BgN} blk {syn.BlkOk}/{syn.BlkN} | {timing}");
+                            $"synth bg {syn.BgPsnr:0.0} ({syn.BgBlend:0.0}) block {syn.BlkPsnr:0.0} ({syn.BlkBlend:0.0}) edge {syn.BdPsnr:0.0} ({syn.BdBlend:0.0}) vec bg {syn.BgOk}/{syn.BgN} blk {syn.BlkOk}/{syn.BlkN} | {timing}");
                     foreach (string l in perTriple) log.Add(l);
                 }
                                 foreach (var t in trip) { t.F0.Dispose(); t.F1.Dispose(); t.F2.Dispose(); }
@@ -267,7 +275,9 @@ internal static partial class Program
             if (args[i] == "--out" && i + 1 < args.Length) outPath = args[++i];
             else if (args[i] == "--quick") quick = true;
             else if (args[i] == "--show" && i + 1 < args.Length) show = args[++i].Split(',');
+            else if (args[i] == "--variants" && i + 1 < args.Length)
+                foreach (string v in args[++i].Split(';', StringSplitOptions.RemoveEmptyEntries)) variants.Add(new EvalVariant(v));
         }
-        if (variants.Count == 0) variants.Add(new EvalVariant("current"));
+        if (variants.Count == 0) variants.Add(new EvalVariant(Environment.GetEnvironmentVariable("YUCAP_INTERP") ?? "default"));
     }
 }

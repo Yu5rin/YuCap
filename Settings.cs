@@ -52,9 +52,17 @@ public sealed class AppSettings
     // "d3d" is our own Direct3D 11 swap chain, which is what makes FSR upscaling
     // possible. It is opt-in (映像 → 描画方式) until verified on a 4K monitor.
     public string Renderer { get; set; } = "mf";            // "mf" | "d3d"
-    public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" | "anime4k" (d3d only)
+    public string ScalingQuality { get; set; } = "fsr";     // "standard" | "fsr" | "anime4k" | "nvrtx" (d3d only; nvrtx = NVIDIA RTX Video Super Resolution)
+    public string HdrMode { get; set; } = "off";            // "off" | "rtx" | "simple" (d3d only): show on an HDR10 swap chain when Windows HDR is on for the monitor
     public int FsrSharpness { get; set; } = 50;              // 0..100 (d3d + fsr only)
     public string NativeResScale { get; set; } = "off";      // "off" | "auto" | "480".."1440" (d3d only): shrink to the picture's real detail before scaling
+    public bool ChromaGuided { get; set; } = true;
+    /// <summary>自分専用モデル: the name of a trained model (%LOCALAPPDATA%\YuCapTrain\models\&lt;name&gt;.hlsl) that くっきり uses instead of the built-in network; "" = the built-in one.</summary>
+    public string A4kModel { get; set; } = "";
+    /// <summary>学習用の絵を集める: save full-size source frames while playing (off by default), and the size cap of the folder in GB.</summary>
+    public bool TrainCapture { get; set; }
+    public int TrainCapGb { get; set; } = 5;
+    public string RestoreMode { get; set; } = "off";         // "off" | "on" (d3d only): Anime4K Restore (ぼやけ取り) before upscaling           // 色のにじみを抑える (d3d only): luma-guided chroma upsampling in the convert pass
 
     // Picture adjustments (Direct3D renderer only), in slider units; the defaults are neutral.
     public int AdjBrightness { get; set; }                   // -100..100 (0 = unchanged)
@@ -243,8 +251,13 @@ public sealed class AppSettings
         StreamWindowSize = StreamSizes.Normalize(StreamWindowSize);
         Renderer = NormalizeRenderer(Renderer);
         ScalingQuality = NormalizeQuality(ScalingQuality);
+        A4kModel = (A4kModel ?? "").Trim();
+        if (A4kModel != Path.GetFileName(A4kModel)) A4kModel = "";        // a name, never a path
+        TrainCapGb = Math.Clamp(TrainCapGb, 1, 500);
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
         NativeResScale = NormalizeNativeRes(NativeResScale);
+        RestoreMode = NormalizeRestore(RestoreMode);
+        HdrMode = NormalizeHdr(HdrMode);
 
         // Out-of-range picture adjustments (hand edit, newer build) are clamped, never reset:
         // a clamped value is still close to what was meant, and every range ends at a safe
@@ -292,6 +305,10 @@ public sealed class AppSettings
 
     public static readonly string[] NativeResValues = { "off", "auto", "480", "576", "720", "900", "1080", "1440" };
 
+    internal static string NormalizeRestore(string? v) => v is "on" ? v : "off";
+
+    internal static string NormalizeHdr(string? v) => v is "rtx" or "simple" ? v : "off";
+
     internal static string NormalizeNativeRes(string? v)
     {
         string t = (v ?? "").Trim().ToLowerInvariant();
@@ -301,7 +318,7 @@ public sealed class AppSettings
     internal static string NormalizeQuality(string? v)
     {
         v = (v ?? "fsr").Trim().ToLowerInvariant();
-        return v is "standard" or "fsr" or "anime4k" ? v : "fsr";
+        return v is "standard" or "fsr" or "anime4k" or "nvrtx" ? v : "fsr";
     }
 
     internal static int SnapAvOffset(int ms) => (int)Math.Round(Math.Clamp(ms, -300, 300) / 10.0) * 10;

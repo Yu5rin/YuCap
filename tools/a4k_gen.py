@@ -130,8 +130,18 @@ SamplerState lin : register(s0);
 
 def generate(letter):
     src = f"Anime4K_Upscale_CNN_x2_{letter}.glsl"
-    passes = parse(os.path.join(SRC, src))
-    out = [HEAD.format(src=src)]
+    return emit_upscale(parse(os.path.join(SRC, src)), src, os.path.join(OUT_SH, f"a4k_{letter.lower()}.hlsl"))
+
+
+def emit_upscale(passes, src, out_path, user=False):
+    """HLSL of an Anime4K x2 network given as parsed passes (parse() output, or the same structure with other weights).
+    user=True: the weights are a user-trained model (header says so); `src` is then a free-text label."""
+    head = HEAD.format(src=src)
+    if user:
+        head = head.replace("from third_party/Anime4K/" + src + " - do not edit.", "(" + src + ") by tools/train_upscaler.py - do not edit.")
+        head = head.replace("Anime4K (c) 2019-2021 bloc97, MIT License (third_party/Anime4K/LICENSE). Weights are copied verbatim.",
+                            "Network layout (c) 2019-2021 bloc97 (Anime4K, MIT); the weights are the user's own training result.")
+    out = [head]
     tex_index = {"MAIN": -1}   # GLSL name -> intermediate texture index (-1 source)
     n_tex = 0
     model = []                 # (entry, [input indices], output index or -2 for final)
@@ -186,7 +196,45 @@ def generate(letter):
     out.append("}")
     text = "\n".join(out) + "\n"
     text.encode("ascii")
-    with open(os.path.join(OUT_SH, f"a4k_{letter.lower()}.hlsl"), "w", encoding="ascii", newline="\n") as f:
+    with open(out_path, "w", encoding="ascii", newline="\n") as f:
+        f.write(text)
+    return model, n_tex
+
+
+def generate_restore(letter):
+    """Anime4K Restore CNN: the same conv layers, but the last pass (3x3 or 1x1 over the layers) adds its 3 outputs to the
+    source picture (return result + MAIN_tex(MAIN_pos)) and writes a picture of the SAME size: there is no depth-to-space."""
+    src = f"Anime4K_Restore_CNN_{letter}.glsl"
+    passes = parse(os.path.join(SRC, src))
+    head = HEAD.format(src=src).replace("then depth-to-space\n// plus residual onto the bilinear-upscaled base.", "then the last layer's result\n// is added to the source picture (same size, no scaling).")
+    out = [head]
+    tex_index = {"MAIN": -1}
+    n_tex = 0
+    model = []
+    for p in passes[:-1]:
+        tex_index[p["save"]] = n_tex
+        n_tex += 1
+    for i, p in enumerate(passes):
+        final = p is passes[-1]
+        assert p["kind"] == "conv" and (p["save"] == "MAIN") == final
+        slot = {name: f"t{k}" for k, name in enumerate(p["binds"])}
+        entry = "fin" if final else f"l{i}"
+        out.append(f"\n// {p['desc']}" + (" (+ the source picture)" if final else ""))
+        out.append(f"float4 {entry}(float4 sv : SV_Position) : SV_Target")
+        out.append("{")
+        out.append("    int2 q = int2(sv.xy);")
+        out += emit_conv_body(p, slot)
+        if final:
+            assert p["binds"][0] == "MAIN"
+            out.append("    return float4(r.rgb + t0.Load(int3(q, 0)).rgb, 1.0);")
+            model.append((entry, [tex_index[b] for b in p["binds"]], -2))
+        else:
+            out.append("    return r;")
+            model.append((entry, [tex_index[b] for b in p["binds"]], tex_index[p["save"]]))
+        out.append("}")
+    text = "\n".join(out) + "\n"
+    text.encode("ascii")
+    with open(os.path.join(OUT_SH, f"a4k_restore_{letter.lower()}.hlsl"), "w", encoding="ascii", newline="\n") as f:
         f.write(text)
     return model, n_tex
 
@@ -205,6 +253,14 @@ def main():
             cs.append(f"        new(\"{entry}\", new[] {{ {', '.join(str(i) for i in ins)} }}, {o}),")
         cs.append("    };")
         cs.append(f"    internal const int Textures{letter} = {n};")
+    for letter in "SML":
+        model, n = generate_restore(letter)
+        cs.append(f"    internal static readonly A4kPassInfo[] RestorePasses{letter} =")
+        cs.append("    {")
+        for entry, ins, o in model:
+            cs.append(f"        new(\"{entry}\", new[] {{ {', '.join(str(i) for i in ins)} }}, {o}),")
+        cs.append("    };")
+        cs.append(f"    internal const int RestoreTextures{letter} = {n};")
     cs.append("}")
     with open(os.path.join(ROOT, "A4kModels.g.cs"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(cs) + "\n")
