@@ -249,6 +249,8 @@ internal static class L
         ["映像が入力されていません"] = "No video input",
         ["接続しています..."] = "Connecting...",
         ["接続しています: {0}"] = "Connecting: {0}",
+        ["映像を準備しています…"] = "Preparing the video…",
+        ["映像を準備中です"] = "The video is getting ready",
         ["優先デバイス: {0}"] = "Preferred device: {0}",
         ["優先デバイスを「{0}」に設定しました"] = "Preferred device set to \"{0}\"",
         ["キャプチャデバイスを接続すると自動的に表示されます"] =

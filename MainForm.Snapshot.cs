@@ -30,6 +30,8 @@ public sealed partial class MainForm
     /// </summary>
     private Bitmap? GrabFrame()
     {
+        if (_busyText != null && !_frozen) return null;   // the video is being (re)started: there is no picture to take, and a screen copy would catch the waiting message
+
         if (_osd.Showing)
         {
             _osdTimer.Stop();
@@ -115,7 +117,7 @@ public sealed partial class MainForm
             // The screen-copy fallback now refuses (and explains why) when
             // YuCap is minimized or covered by another window — surface that
             // specific reason instead of a generic "no video" message.
-            error = _video.LastSnapshotError ?? L.T("映像がありません");
+            error = _video.LastSnapshotError ?? NoVideoText;
             return false;
         }
 
@@ -181,7 +183,7 @@ public sealed partial class MainForm
         using Bitmap? frame = GrabFrame();
         if (frame == null)
         {
-            ShowOsd(L.T("映像がありません"));
+            ShowOsd(NoVideoText);
             return;
         }
         try

@@ -168,14 +168,16 @@ public sealed partial class MainForm
         _cliMode = null;   // an explicit choice overrides the --mode switch, as for a menu pick
     }
 
-    private void ApplyProfile(VideoProfile profile)
+    private async void ApplyProfile(VideoProfile profile)
     {
+        if (_engineSwapping) return;
         _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
-        try { ApplyProfileCore(profile); }
+        try { await ApplyProfileCoreAsync(profile); }
+        catch (Exception ex) { Log.Info("ApplyProfile: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private void ApplyProfileCore(VideoProfile profile)
+    private async Task ApplyProfileCoreAsync(VideoProfile profile)
     {
         VideoProfile before = CaptureProfile(string.Empty);   // to go back to if the new one cannot start
         bool rendererDiffers = profile.Renderer != _settings.Renderer;
@@ -191,13 +193,13 @@ public sealed partial class MainForm
         if (rendererDiffers || (hasDevice && latencyDiffers))
         {
             // A new engine on a fresh window: the renderer switch path, with its failure fallback.
-            Exception? failure = ReplaceEngine(profile.Renderer);
+            Exception? failure = await ReplaceEngineAsync(profile.Renderer);
             if (failure != null)
             {
                 failed = true;
                 string reason = Errors.Describe(failure);
                 LoadProfileValues(before);
-                Exception? back = ReplaceEngine(before.Renderer);
+                Exception? back = await ReplaceEngineAsync(before.Renderer);
                 _videoError = back != null ? Errors.Describe(back) : null;
                 MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
@@ -206,16 +208,17 @@ public sealed partial class MainForm
         {
             try
             {
-                RunDeviceStart(_currentVideoInfo!.Name, () => _video.Start(_currentVideoInfo, _savedMode));
+                await StartVideoAsync(_currentVideoInfo!, _savedMode);
                 _videoError = null;
             }
+            catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
             catch (Exception ex)
             {
                 failed = true;
                 MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
                     "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 LoadProfileValues(before);
-                RecoverVideo();
+                await RecoverVideoAsync();
             }
         }
 
@@ -502,14 +505,16 @@ public sealed partial class MainForm
     /// the engine starts, so the switch is a restart on a fresh window - the same path as changing
     /// the renderer, including falling back when the new mode cannot start.
     /// </summary>
-    private void ToggleLowLatency()
+    private async void ToggleLowLatency()
     {
+        if (_engineSwapping) return;
         _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
-        try { ToggleLowLatencyCore(); }
+        try { await ToggleLowLatencyCoreAsync(); }
+        catch (Exception ex) { Log.Info("ToggleLowLatency: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private void ToggleLowLatencyCore()
+    private async Task ToggleLowLatencyCoreAsync()
     {
         if (!_video.SupportsLowLatency) return;
         bool on = !_settings.LowLatency;
@@ -518,12 +523,12 @@ public sealed partial class MainForm
 
         if (_currentVideoInfo != null)
         {
-            Exception? failure = ReplaceEngine(_settings.Renderer);
+            Exception? failure = await ReplaceEngineAsync(_settings.Renderer);
             if (failure != null)
             {
                 string reason = Errors.Describe(failure);
                 _settings.LowLatency = !on;
-                Exception? back = ReplaceEngine(_settings.Renderer);
+                Exception? back = await ReplaceEngineAsync(_settings.Renderer);
                 _videoError = back != null ? Errors.Describe(back) : null;
                 LayoutCanvas();
                 UpdateChecks();

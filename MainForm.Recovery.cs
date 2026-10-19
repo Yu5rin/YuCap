@@ -144,17 +144,9 @@ public sealed partial class MainForm
         if (now < _vNextMs) return;
 
         _vRetry++;
-        bool ok = TryReconnectVideo();
-        if (ok)
-        {
-            _videoWasRunning = true;
-            _vOkSince = now;
-            ShowOsd(L.T("映像をつなぎ直しました"));
-            Log.Info("video reconnected automatically");
-        }
-        else if (_vRetry >= RecoveryBackoffMs.Length) GiveUpVideo();
-        else _vNextMs = now + RecoveryBackoffMs[Math.Min(_vRetry, RecoveryBackoffMs.Length - 1)];
-        UpdateStatus();
+        // The attempt runs without holding the UI thread; a start in progress is not a failure - the result (and so the
+        // decision to give up) is handled when the attempt completes.
+        _ = VideoReconnectAttemptAsync();
     }
 
     private void GiveUpVideo()
@@ -162,39 +154,13 @@ public sealed partial class MainForm
         _vGaveUp = true;
         _vRecovering = false;
         _videoWasRunning = false;
-        try { _video.Stop(); } catch { /* already dead */ }
+        StopVideo();
         _recoveryMain = L.T("映像が止まり、つなぎ直せませんでした");
         _videoError = L.T("ケーブルとキャプチャーボードを確かめてください。抜き差しすると自動で再開します。「デバイス」メニューから選び直すこともできます");
         Log.Info("video: gave up reconnecting");
         ShowOsd(L.T("映像をつなぎ直せませんでした"), OsdLongMilliseconds);
         _canvas.Invalidate();
         UpdateStatus();
-    }
-
-    /// <summary>One reconnection attempt for the video. False when the device is not there or does not start.</summary>
-    private bool TryReconnectVideo()
-    {
-        _devOpBusy++;
-        try
-        {
-            var devices = VideoEngine.EnumerateDevices();
-            VideoDeviceInfo? cur = _currentVideoInfo;
-            VideoDeviceInfo? pick = (cur != null ? devices.FirstOrDefault(d => d.Id == cur.Id) : null)
-                ?? ChooseVideoDevice(devices, _settings.VideoDeviceId, _settings.DeviceKeyword);
-            if (pick == null) return false;
-            try { _video.Stop(); } catch { /* ignore */ }
-            RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
-            _currentVideoInfo = pick;
-            ClearNoCaptureDeviceState();
-            LayoutCanvas();
-            return _video.IsRunning;
-        }
-        catch (Exception ex)
-        {
-            Log.Info("video reconnect failed: " + ex.Message);
-            return false;
-        }
-        finally { _devOpBusy--; }
     }
 
     private void CheckAudioHealth(long now)

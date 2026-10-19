@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace YuCap;
@@ -95,6 +96,18 @@ public interface IVideoEngine : IDisposable
     /// for our own messages) on failure; the engine is left stopped.</summary>
     void Start(VideoDeviceInfo info, CaptureMode? mode = null);
     void Stop();
+    /// <summary><see cref="Start"/> that does not hold the caller while the device opens (a capture card can need seconds).
+    /// Completes when the picture runs, faults with the start error, or is cancelled (<see cref="OperationCanceledException"/>)
+    /// when <see cref="Stop"/> was called meanwhile. Engines that cannot leave the UI thread run it synchronously.</summary>
+    Task StartAsync(VideoDeviceInfo info, CaptureMode? mode = null)
+    {
+        try { Start(info, mode); return Task.CompletedTask; }
+        catch (Exception ex) { return Task.FromException(ex); }
+    }
+    /// <summary>Stop and complete once the old session has released the window (so a new one can take it).</summary>
+    Task StopAsync() { Stop(); return Task.CompletedTask; }
+    /// <summary>True when <see cref="StartAsync"/> really runs off the UI thread.</summary>
+    bool StartsOffUiThread => false;
     bool IsRunning { get; }
     /// <summary>The running session stopped by itself (device lost, present failure, stream end/error), not via <see cref="Stop"/>.</summary>
     bool EndedUnexpectedly => false;

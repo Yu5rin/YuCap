@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using SharpGen.Runtime;
 using Vortice.Direct3D11;
@@ -288,47 +289,104 @@ public sealed class D3DVideoEngine : IVideoEngine
     /// <summary>Longest a Stop() waits: above the render thread's worst teardown (capture join 800 + source shutdown 1000 + join 1200 + disposal).</summary>
     internal const int ShutdownBudgetMs = 6000;
 
-    public void Start(VideoDeviceInfo info, CaptureMode? mode = null)
+    // Start-up takes seconds (a card needs ~4 s after a replug) and teardown can take up to ShutdownBudgetMs. Neither may
+    // run on the UI thread: StartAsync runs the whole start on a worker (this engine only needs the HWND, which its own
+    // render thread uses anyway), and Stop() only detaches the session - the join happens in the background. A new
+    // Start waits for that join first, so the window's DirectComposition target is free again.
+    private readonly object _startLock = new();
+    private readonly object _sLock = new();
+    private readonly object _shutdownLock = new();
+    private Task _shutdownTask = Task.CompletedTask;
+    private int _stopEpoch;   // bumped by every external Stop(): a Start in flight sees it and gives up
+
+    /// <summary>Start without blocking the caller; completes when the picture runs, faults with the start error, or is
+    /// cancelled when Stop() was called meanwhile.</summary>
+    public bool StartsOffUiThread => true;
+
+    public Task StartAsync(VideoDeviceInfo info, CaptureMode? mode = null) => Task.Run(() => Start(info, mode));
+
+    /// <summary>Stop and wait (off the UI thread) until the old session has really released the window.</summary>
+    public Task StopAsync()
     {
-        Log.Info($"D3D: Start {info.Name} mode={(mode == null ? "auto" : $"{mode.Compression} {mode.Width}x{mode.Height}@{mode.Fps}")}");
         Stop();
-        if (_hwnd == IntPtr.Zero)
-            throw new UserFacingException(L.T("表示ウィンドウが設定されていません。"));
-
-        var s = new Session(this, _hwnd, info, mode);
-        s.Begin();
-        // The render thread's own deadline (device + shaders + capture open) is StartBudgetMs; wait a little longer
-        // than that so its specific error wins over a bare timeout here.
-        if (!s.Started.Wait(StartBudgetMs + 1500))
-        {
-            Log.Info("D3D: Start timed out — abandoning the threads");
-            s.RequestStop("start timeout");
-            throw new UserFacingException(L.T("映像の開始がタイムアウトしました。"));
-        }
-        if (s.StartError != null)
-        {
-            s.JoinRender(3500);   // let it release the window's composition target before a retry
-            ExceptionDispatchInfo.Capture(s.StartError).Throw();
-        }
-
-        _s = s;
-        CurrentDeviceName = info.Name;
-        _resolution = s.Resolution;
-        _mode = s.Mode;
-        NegotiatedFps = s.Fps;
-        _modes = s.Modes;
-        Log.Info($"D3D: running {_resolution.Width}x{_resolution.Height}@{NegotiatedFps} ({s.Mode?.Compression})");
+        return Task.Run(() => WaitShutdown(ShutdownBudgetMs + 1000));
     }
 
-    public void Stop()
+    private void WaitShutdown(int ms)
     {
-        Session? s = _s;
-        _s = null;
+        Task t;
+        lock (_shutdownLock) t = _shutdownTask;
+        try { t.Wait(ms); } catch { /* the shutdown logs its own problems */ }
+    }
+
+    public void Start(VideoDeviceInfo info, CaptureMode? mode = null)
+    {
+        lock (_startLock)
+        {
+            Log.Info($"D3D: Start {info.Name} mode={(mode == null ? "auto" : $"{mode.Compression} {mode.Width}x{mode.Height}@{mode.Fps}")}");
+            int epoch;
+            lock (_sLock) epoch = _stopEpoch;
+            StopCore(external: false, wait: true);
+            if (_hwnd == IntPtr.Zero)
+                throw new UserFacingException(L.T("表示ウィンドウが設定されていません。"));
+
+            var s = new Session(this, _hwnd, info, mode);
+            s.Begin();
+            // The render thread's own deadline (device + shaders + capture open) is StartBudgetMs; wait a little longer
+            // than that so its specific error wins over a bare timeout here.
+            if (!s.Started.Wait(StartBudgetMs + 1500))
+            {
+                Log.Info("D3D: Start timed out — abandoning the threads");
+                s.RequestStop("start timeout");
+                throw new UserFacingException(L.T("映像の開始がタイムアウトしました。"));
+            }
+            if (s.StartError != null)
+            {
+                s.JoinRender(3500);   // let it release the window's composition target before a retry
+                ExceptionDispatchInfo.Capture(s.StartError).Throw();
+            }
+
+            lock (_sLock)
+            {
+                if (_stopEpoch != epoch)
+                {
+                    // Stop() was called while we were starting: the caller no longer wants this picture.
+                    Log.Info("D3D: Start cancelled by Stop()");
+                    var dead = s;
+                    Task t = Task.Run(() => dead.Shutdown(ShutdownBudgetMs));
+                    lock (_shutdownLock) _shutdownTask = Task.WhenAll(_shutdownTask, t);
+                    throw new OperationCanceledException();
+                }
+                _s = s;
+            }
+            CurrentDeviceName = info.Name;
+            _resolution = s.Resolution;
+            _mode = s.Mode;
+            NegotiatedFps = s.Fps;
+            _modes = s.Modes;
+            Log.Info($"D3D: running {_resolution.Width}x{_resolution.Height}@{NegotiatedFps} ({s.Mode?.Compression})");
+        }
+    }
+
+    /// <summary>Detach the session and shut it down in the background (never blocks the caller for the join).</summary>
+    public void Stop() => StopCore(external: true, wait: false);
+
+    private void StopCore(bool external, bool wait)
+    {
+        Session? s;
+        lock (_sLock)
+        {
+            if (external) _stopEpoch++;
+            s = _s;
+            _s = null;
+        }
         if (s != null)
         {
             Log.Info("D3D: Stop");
-            s.Shutdown(ShutdownBudgetMs);
+            Task t = Task.Run(() => s.Shutdown(ShutdownBudgetMs));
+            lock (_shutdownLock) _shutdownTask = Task.WhenAll(_shutdownTask, t);
         }
+        if (wait) WaitShutdown(ShutdownBudgetMs + 1000);
         CurrentDeviceName = null;
         _resolution = Size.Empty;
         _mode = null;
@@ -336,7 +394,8 @@ public sealed class D3DVideoEngine : IVideoEngine
         _modes = new();
     }
 
-    public void Dispose() => Stop();
+    public void Dispose() { StopCore(external: true, wait: true); }
+
 
     // =====================================================================
     //  Stills

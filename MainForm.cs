@@ -352,7 +352,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // Device arrivals come in bursts; settle before re-enumerating.
         _devTimer.Interval = 900;
-        _devTimer.Tick += (_, _) => { _devTimer.Stop(); OnDeviceChange(); };
+        _devTimer.Tick += (_, _) => { _devTimer.Stop(); _ = OnDeviceChangeAsync(); };
 
         _burstTimer.Tick += (_, _) => BurstTick();
         _displayTimer.Tick += (_, _) => { _displayTimer.Stop(); OnDisplaysChanged(); };
@@ -383,7 +383,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // Devices often enumerate late after resume: if something is still not running, try again
         // (3 tries over about 6 s: after 2.5 s, +1.5 s, +2 s) before leaving it to the normal recovery.
         _resumeTimer.Interval = ResumeFirstMs;
-        _resumeTimer.Tick += (_, _) => OnResumeTick();
+        _resumeTimer.Tick += async (_, _) => { try { await OnResumeTickAsync(); } catch (Exception ex) { Log.Info("resume: " + ex.Message); } };
 
         // Interval 1: fires on the very next message-loop tick, i.e. after the
         // window has already been shown, rather than blocking OnLoad itself.
@@ -1374,14 +1374,22 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// Runs devices init once the window is already on screen. The resolution
     /// is only known after this completes, so PiP/layout are re-fit here too.
     /// </summary>
-    private void OnStartupTimerTick(object? sender, EventArgs e)
+    private async void OnStartupTimerTick(object? sender, EventArgs e)
     {
         _startupTimer.Stop();
         if (IsDisposed) return;
         _startingUp = false;
+        try { await StartupDevicesAsync(); }
+        catch (Exception ex) { Log.Info("startup: " + ex); }
+    }
 
-        InitVideo();
+    private async Task StartupDevicesAsync()
+    {
+        // The video opens in the background (a card can need seconds); the audio, which is quick, starts meanwhile.
+        Task video = InitVideoAsync();
         InitAudio();
+        await video;
+        if (IsDisposed) return;
         _audio.VolumePercent = _settings.Volume; // apply after the device starts
         if (Program.Options.Muted && _audio.IsRunning) _audio.Muted = true;
 
@@ -1571,7 +1579,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
-    private void InitVideo()
+    private async Task InitVideoAsync()
     {
         try
         {
@@ -1588,12 +1596,13 @@ public sealed partial class MainForm : Form, IMessageFilter
                 return;
             }
             LayoutCanvas();               // give the canvas a valid size before Start
-            RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
+            await StartVideoAsync(pick, _cliMode ?? _savedMode);
             _currentVideoInfo = pick;
             _videoError = null;
             _recoveryMain = null;
             LayoutCanvas();               // re-fit now that the resolution is known
         }
+        catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
             Log.Info("InitVideo failed: " + ex.Message);
@@ -1627,13 +1636,15 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     /// <summary>Debounced WM_DEVICECHANGE handler: restart engines when their
     /// device reappears, stop them cleanly when it is yanked, and follow the
-    /// system default audio output when it changes.</summary>
-    private void OnDeviceChange()
+    /// system default audio output when it changes. The video start runs in the
+    /// background (see MainForm.VideoStart.cs); this pass completes when it has.</summary>
+    private async Task OnDeviceChangeOnceAsync()
     {
         if (IsDisposed || _testRunning) return;
         Log.Info($"OnDeviceChange: videoRunning={_video.IsRunning} audioRunning={_audio.IsRunning}");
         ResetRecovery();   // a plug event is a new chance: the automatic retries may arm again
 
+        Task videoDone = Task.CompletedTask;
         try // ---- video ----
         {
             var devices = VideoEngine.EnumerateDevices();
@@ -1642,32 +1653,20 @@ public sealed partial class MainForm : Form, IMessageFilter
             {
                 if (_frozen) ToggleFreeze();
                 NoteVideoStopped();
-                _video.Stop();
+                StopVideo();
                 _canvas.Invalidate();
                 ShowOsd(L.T("映像デバイスが切断されました"), OsdLongMilliseconds);
             }
             else if (_video.IsRunning && _video.EndedUnexpectedly)
             {
                 NoteVideoStopped();
-                _video.Stop();   // dead already: the branch below reopens it
+                StopVideo();   // dead already: the branch below reopens it
             }
             if (!_video.IsRunning)
             {
                 var pick = (present ? _currentVideoInfo : null)
                     ?? ChooseVideoDevice(devices, _settings.VideoDeviceId, _settings.DeviceKeyword);
-                if (pick != null)
-                {
-                    try
-                    {
-                        RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
-                        _currentVideoInfo = pick;
-                        _videoError = null;
-                        _recoveryMain = null;
-                        LayoutCanvas();
-                        Log.Info($"video reconnected: {pick.Name}");
-                    }
-                    catch (Exception ex) { Log.Info("video reconnect (device change) failed: " + ex.Message); /* device still settling — the next change event retries */ }
-                }
+                if (pick != null) videoDone = ReconnectVideoOnDeviceChangeAsync(pick);
                 else if (_currentVideoInfo == null || !present)
                 {
                     SetNoCaptureDeviceState(devices.Count > 0);
@@ -1717,11 +1716,30 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         UpdateStatus();
         UpdateChecks();
+        await videoDone;   // the audio above did not wait for the (slow) video start
+        if (IsDisposed) return;
+        UpdateStatus();
+        UpdateChecks();
+    }
+
+    private async Task ReconnectVideoOnDeviceChangeAsync(VideoDeviceInfo pick)
+    {
+        try
+        {
+            await StartVideoAsync(pick, _cliMode ?? _savedMode);
+            _currentVideoInfo = pick;
+            _videoError = null;
+            _recoveryMain = null;
+            LayoutCanvas();
+            Log.Info($"video reconnected: {pick.Name}");
+        }
+        catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
+        catch (Exception ex) { Log.Info("video reconnect (device change) failed: " + ex.Message); /* device still settling — the next change event retries */ }
     }
 
     /// <summary>Post-resume restart: the first pass restarts both engines from scratch (a wedged Media Foundation
     /// pipeline is common after sleep); later passes only retry what still is not running.</summary>
-    private void OnResumeTick()
+    private async Task OnResumeTickAsync()
     {
         _resumeTimer.Stop();
         if (IsDisposed) return;
@@ -1730,10 +1748,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_resumeTries == 1)
         {
             NoteVideoStopped(); NoteAudioStopped();
-            try { _video.Stop(); } catch { /* ignore */ }
+            StopVideo();
             try { _audio.Stop(); } catch { /* ignore */ }
         }
-        if (!_testRunning) OnDeviceChange();   // re-opens video + audio with the saved device/mode
+        if (!_testRunning) await OnDeviceChangeAsync();   // re-opens video + audio with the saved device/mode
+        if (IsDisposed) return;
 
         bool missing = (_resumeWantVideo && !_video.IsRunning) || (_resumeWantAudio && !_audio.IsRunning);
         if (missing && _resumeTries < 3 && !_testRunning)
@@ -2525,7 +2544,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 still = _video.Snapshot(cropToVideo: false); // fallback: includes letterbox → 1:1 overlay
             if (still == null)
             {
-                ShowOsd(_video.LastSnapshotError ?? L.T("映像がありません"), OsdLongMilliseconds);
+                ShowOsd(_video.LastSnapshotError ?? NoVideoText, OsdLongMilliseconds);
                 return;
             }
             _freezeImage = still;
@@ -3328,25 +3347,27 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
-    private void SwitchRenderer(string renderer)
+    private async void SwitchRenderer(string renderer)
     {
+        if (_engineSwapping) return;
         _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
-        try { SwitchRendererCore(renderer); }
+        try { await SwitchRendererCoreAsync(renderer); }
+        catch (Exception ex) { Log.Info("SwitchRenderer: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private void SwitchRendererCore(string renderer)
+    private async Task SwitchRendererCoreAsync(string renderer)
     {
         if (renderer == _settings.Renderer) { UpdateChecks(); return; }
         string previous = _settings.Renderer;
         if (_frozen) ToggleFreeze();
 
-        Exception? failure = ReplaceEngine(renderer);
+        Exception? failure = await ReplaceEngineAsync(renderer);
         if (failure != null)
         {
             // Fall back to the engine that was working, the same way.
             string reason = Errors.Describe(failure);
-            Exception? back = ReplaceEngine(previous);
+            Exception? back = await ReplaceEngineAsync(previous);
             _videoError = back != null ? Errors.Describe(back) : null;
             LayoutCanvas();
             UpdateStatus();
@@ -3750,19 +3771,21 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateStatus();
     }
 
-    private void SwitchVideoDevice(VideoDeviceInfo info)
+    private async void SwitchVideoDevice(VideoDeviceInfo info)
     {
+        if (_engineSwapping) return;
         _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
-        try { SwitchVideoDeviceCore(info); }
+        try { await SwitchVideoDeviceCoreAsync(info); }
+        catch (Exception ex) { Log.Info("SwitchVideoDevice: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private void SwitchVideoDeviceCore(VideoDeviceInfo info)
+    private async Task SwitchVideoDeviceCoreAsync(VideoDeviceInfo info)
     {
         if (_frozen) ToggleFreeze();
         try
         {
-            RunDeviceStart(info.Name, () => _video.Start(info, _savedMode));
+            await StartVideoAsync(info, _savedMode);
             _currentVideoInfo = info;
             _videoError = null;
             _recoveryMain = null;
@@ -3772,23 +3795,24 @@ public sealed partial class MainForm : Form, IMessageFilter
             LayoutCanvas();
             ShowOsd(L.F("映像: {0}", info.Name));
         }
+        catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
             MessageBox.Show(this, L.F("映像デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            RecoverVideo(); // best-effort: bring the previous device back
+            await RecoverVideoAsync(); // best-effort: bring the previous device back
         }
         UpdateStatus();
     }
 
     /// <summary>After a failed switch (Start() stops the engine first), try to
     /// restart the last-known-good device so the preview doesn't stay dead.</summary>
-    private void RecoverVideo()
+    private async Task RecoverVideoAsync()
     {
         if (_currentVideoInfo == null || _video.IsRunning) return;
         try
         {
-            RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, _savedMode));
+            await StartVideoAsync(_currentVideoInfo, _savedMode);
             LayoutCanvas();
         }
         catch { /* the error was already reported; leave the empty canvas */ }
@@ -3851,14 +3875,16 @@ public sealed partial class MainForm : Form, IMessageFilter
         return hasComp ? $"{m.Width}x{m.Height} {m.Fps}fps{L.Par(m.Compression)}" : $"{m.Width}x{m.Height} {m.Fps}fps";
     }
 
-    private void ApplyVideoMode(CaptureMode mode)
+    private async void ApplyVideoMode(CaptureMode mode)
     {
+        if (_engineSwapping) return;
         _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
-        try { ApplyVideoModeCore(mode); }
+        try { await ApplyVideoModeCoreAsync(mode); }
+        catch (Exception ex) { Log.Info("ApplyVideoMode: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private void ApplyVideoModeCore(CaptureMode mode)
+    private async Task ApplyVideoModeCoreAsync(CaptureMode mode)
     {
         if (_currentVideoInfo == null)
         {
@@ -3869,30 +3895,33 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cliMode = null; // an explicit choice overrides the --mode switch
         try
         {
-            RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, mode));
+            await StartVideoAsync(_currentVideoInfo, mode);
             _videoError = null;
             _savedMode = _video.CurrentMode;
             SaveSettings();
             LayoutCanvas();
             ShowOsd(ModeLabel(mode));
         }
+        catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
             MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            RecoverVideo();
+            await RecoverVideoAsync();
         }
         UpdateStatus();
     }
 
-    private void ClearModePreference()
+    private async void ClearModePreference()
     {
+        if (_engineSwapping) return;
         _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
-        try { ClearModePreferenceCore(); }
+        try { await ClearModePreferenceCoreAsync(); }
+        catch (Exception ex) { Log.Info("ClearModePreference: " + ex); }
         finally { _devOpBusy--; }
     }
 
-    private void ClearModePreferenceCore()
+    private async Task ClearModePreferenceCoreAsync()
     {
         _savedMode = null;
         _cliMode = null;
@@ -3901,16 +3930,17 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_frozen) ToggleFreeze();
         try
         {
-            RunDeviceStart(_currentVideoInfo.Name, () => _video.Start(_currentVideoInfo, null));
+            await StartVideoAsync(_currentVideoInfo, null);
             _videoError = null;
             LayoutCanvas();
             ShowOsd(L.T("映像モード: 自動"));
         }
+        catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
             MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            RecoverVideo();
+            await RecoverVideoAsync();
         }
         UpdateStatus();
     }
@@ -4050,7 +4080,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 _resumeWantAudio = _audio.IsRunning || _audioWasRunning;
                 _suspended = true;
                 NoteVideoStopped(); NoteAudioStopped();
-                try { _video.Stop(); } catch { /* ignore */ }
+                StopVideo();
                 try { _audio.Stop(); } catch { /* ignore */ }
                 _canvas.Invalidate();
             }
