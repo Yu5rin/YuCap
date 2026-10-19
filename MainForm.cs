@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -72,7 +73,10 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly ToolStripStatusLabel _lblVolume = new();
     private readonly ToolStripStatusLabel _lblState = new();
     private readonly ToolStripStatusLabel _lblInterp = new(), _lblScale = new(), _lblCrisp = new();
-    private readonly ContextMenuStrip _ctx = new();
+    // Replaced by a new instance whenever the display scaling changes (see RebuildMenus / OnCtxOpening).
+    private ContextMenuStrip _ctx = new();
+    private int _ctxDpi;               // the scaling _ctx was built for
+    private bool _ctxFixPending;       // a rebuild is queued
     private readonly System.Windows.Forms.Timer _osdTimer = new();
     private readonly System.Windows.Forms.Timer _uiTimer = new();
     private readonly System.Windows.Forms.Timer _fpsTimer = new() { Interval = 250 };   // FPS だけ: ~4 updates a second
@@ -464,6 +468,8 @@ public sealed partial class MainForm : Form, IMessageFilter
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] private static extern bool AdjustWindowRectExForDpi(ref Rect rc, int style, bool menu, int exStyle, uint dpi);
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromPoint(Point pt, uint flags);
+    [DllImport("shcore.dll")] private static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
     [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int index);
     private const int GwlStyle = -16, GwlExStyle = -20;
 
@@ -1117,9 +1123,60 @@ public sealed partial class MainForm : Form, IMessageFilter
         _status.SizingGrip = true;
     }
 
-    private void BuildContextMenu()
+    /// <summary>Scaling (dpi) of the monitor under a screen point; the form's own scaling when it cannot be asked.</summary>
+    internal int DpiAtPoint(Point screen)
     {
-        _ctx.Opening += (_, _) => UpdateChecks();
+        try
+        {
+            IntPtr mon = MonitorFromPoint(screen, 2);   // MONITOR_DEFAULTTONEAREST
+            if (mon != IntPtr.Zero && GetDpiForMonitor(mon, 0, out uint dx, out _) == 0 && dx > 0) return (int)dx;
+        }
+        catch { /* fall through */ }
+        return DeviceDpi;
+    }
+
+    /// <summary>
+    /// A ContextMenuStrip is not a child of the form, so WinForms does not rescale it (and its drop-downs) in step with
+    /// the window: a menu shown at 100% and later at 200% ends up with a sub-menu laid out for the other scaling, with
+    /// items half or twice as tall as the rest. A menu that only ever lives on one monitor scaling has no such problem,
+    /// so the whole menu is built anew for the scaling it is going to be shown at.
+    /// </summary>
+    private void OnCtxOpening(object? sender, CancelEventArgs e)
+    {
+        if (_testRunning && !_ctxAudit) { e.Cancel = true; return; }
+        if (!_ctxAudit)
+        {
+            int dpi = DpiAtPoint(Cursor.Position);
+            if (dpi != _ctxDpi)
+            {
+                // Too late to rebuild the menu that is opening: cancel, rebuild, and open the new one in the same place.
+                Log.Info($"context menu: built for {_ctxDpi} dpi, opening at {dpi} dpi - rebuilding");
+                e.Cancel = true;
+                Point at = Cursor.Position;
+                if (!_ctxFixPending && IsHandleCreated)
+                {
+                    _ctxFixPending = true;
+                    BeginInvoke(new Action(() =>
+                    {
+                        _ctxFixPending = false;
+                        RebuildMenus(dpi);
+                        _ctx.Show(at);
+                    }));
+                }
+                return;
+            }
+        }
+        UpdateChecks();
+    }
+
+    private void BuildContextMenu(int dpi = 0)
+    {
+        ContextMenuStrip old = _ctx;
+        _ctx = new ContextMenuStrip { Renderer = Ui.DarkRenderer };
+        _ctxDpi = dpi > 0 ? dpi : DeviceDpi;
+        _ctx.Opening += OnCtxOpening;
+        if (IsHandleCreated) BeginInvoke(new Action(old.Dispose));   // not while one of its own handlers may still be running
+        else old.Dispose();
 
         // 右クリックには、よく使うものだけ: 画面 → 再生 → 撮影 → 映像 → 表示・プロファイル → ウィンドウ → 終了
         _ctx.Items.Add(new ToolStripMenuItem(L.T("全画面表示"), null, (_, _) => ToggleFullscreen())
@@ -1170,6 +1227,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _ctx.Items.Add(new ToolStripSeparator());
         _ctx.Items.Add(new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close()));
         _canvas.ContextMenuStrip = _ctx;
+        _freezeView.ContextMenuStrip = _ctx;
     }
 
     // ---- Shortcuts help (F1) ----------------------------------------------
@@ -1726,6 +1784,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
+        // The context menu is laid out for one scaling only (see OnCtxOpening): make a new one for this monitor.
+        if (e.DeviceDpiNew != _ctxDpi && IsHandleCreated && !_ctxFixPending)
+        {
+            _ctxFixPending = true;
+            int dpiNew = e.DeviceDpiNew;
+            BeginInvoke(new Action(() => { _ctxFixPending = false; RebuildMenus(dpiNew); }));
+        }
         ApplyOverlayScale();
         PositionOsd();
         PositionInfo();
@@ -2526,15 +2591,15 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     /// <summary>Discard and re-create every menu so new-language text is used.</summary>
-    private void RebuildMenus()
+    private void RebuildMenus(int dpi = 0)
     {
         bool menuWasVisible = _menu.Visible;
+        if (_ctx.Visible) _ctx.Close();
 
         // The builders append to these collections, so clear them first —
         // otherwise every switch would leave the previous language's items
         // behind and the check-state lists would grow without bound.
         _menu.Items.Clear();
-        _ctx.Items.Clear();
         _aspectItems.Clear();
         _rotationItems.Clear();
         _pipIdleItems.Clear();
@@ -2552,7 +2617,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _nativeResItems.Clear();
 
         BuildMenu();
-        BuildContextMenu();
+        BuildContextMenu(dpi);
         MainMenuStrip = _menu;
         _menu.Visible = menuWasVisible;
 
@@ -2935,6 +3000,11 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// <summary>The info overlay's 補間 line.</summary>
     // ---- 補間 / 拡大 / くっきり度: status bar (windowed) and info overlay (also in fullscreen) ----
 
+    /// <summary>Whether frame interpolation is working right now. The status bar's 補間 label and the FPS だけ panel both use this,
+    /// so they cannot disagree.</summary>
+    private bool InterpolationRunning(InterpolationStatus? st) =>
+        st is { Active: true, Idle: InterpolationIdle.None } && _video.SupportsInterpolation && _settings.Interpolation && _video.IsRunning;
+
     /// <summary>"30→144 fps" while interpolating (measured source rate and the rate actually presented),
     /// "待機（理由）" when it is on but idle, null when off or unsupported.</summary>
     private string? InterpMetric(out string tip)
@@ -2943,12 +3013,12 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (!_video.SupportsInterpolation || !_settings.Interpolation || !_video.IsRunning) return null;
         InterpolationStatus? st = _video.InterpolationState;
         if (st == null) return null;
-        if (st.Idle == InterpolationIdle.None && st.Active)
+        if (InterpolationRunning(st))
         {
             double shown = _video.Stats?.PresentedFps ?? st.RefreshHz;
             double src = _video.GameFpsReliable && _video.GameFps > 0 ? _video.GameFps : st.SourceFps;
             tip = L.F("フレーム補間: 映像 {0:0.#} fps を、画面に実際に出ている {1:0.#} fps にしています（画面は {2:0.#} Hz）", src, shown, st.RefreshHz);
-            return $"{src:0}→{shown:0} fps";
+            return $"{src:0}→{shown.ToString("0")} fps";
         }
         string why = InterpolationInfoText();
         tip = L.F("フレーム補間は今は働いていません: {0}", why);
@@ -4290,25 +4360,49 @@ public sealed partial class MainForm : Form, IMessageFilter
         return string.Empty;
     }
 
+    /// <summary>What the FPS だけ panel shows right now (also used by the test mode).</summary>
+    internal void FpsPanelContent(out string big, out string small, out bool interpolating)
+    {
+        big = "—"; small = string.Empty; interpolating = false;
+        if (!_video.IsRunning || _video.Stats is not { } st) return;
+        bool gameKnown = _video.GameFpsReliable && _video.GameFps > 0;
+        InterpolationStatus? ist = _video.SupportsInterpolation && _settings.Interpolation ? _video.InterpolationState : null;
+        interpolating = InterpolationRunning(ist);
+        if (interpolating)
+        {
+            big = st.PresentedFps.ToString("0");
+            small = gameKnown ? L.F("ゲーム {0:0}", _video.GameFps)
+                : st.InputFps > 0 ? L.F("入力 {0:0}", st.InputFps) : string.Empty;
+            return;
+        }
+        if (_video.PictureStill) big = L.T("静止");
+        else if (gameKnown) big = _video.GameFps.ToString("0");
+        else big = st.InputFps.ToString("0");
+        // 補間 is on but waiting: say why under the number, or the bare game rate looks like a broken 補間
+        if (ist != null && !_video.PictureStill)
+            small = ist.Idle switch
+            {
+                InterpolationIdle.RefreshTooLow => L.F("補間待機 {0:0}Hz", ist.RefreshHz),
+                InterpolationIdle.LowLatency => L.T("補間待機 低遅延"),
+                InterpolationIdle.Unavailable => L.T("補間 使えません"),
+                _ => string.Empty,
+            };
+    }
+
+    private string _fpsLogKey = string.Empty;
+
     /// <summary>FPS だけ. Interpolation off: the game's real rate (unique pictures per second) alone; the input rate when the
-    /// game rate is unknown, 「静止」 for a still picture. Interpolation on: the pictures shown per second (each refresh is a
-    /// distinct interpolated picture) and 「ゲーム N」 under it.</summary>
+    /// game rate is unknown, 「静止」 for a still picture. Interpolation on and working: the pictures shown per second (each
+    /// refresh is a distinct interpolated picture) and 「ゲーム N」 under it. Interpolation on but idle: the game rate and why.</summary>
     private void UpdateFpsInfo()
     {
-        string big = "—", small = string.Empty;
-        if (_video.IsRunning && _video.Stats is { } st)
+        FpsPanelContent(out string big, out string small, out bool interp);
+        InterpolationStatus? ist = _video.InterpolationState;
+        string key = $"{interp}/{ist?.Idle}/{ist?.RefreshHz:0}/{_settings.Interpolation}";
+        if (key != _fpsLogKey)
         {
-            bool gameKnown = _video.GameFpsReliable && _video.GameFps > 0;
-            bool interp = _video.SupportsInterpolation && _settings.Interpolation && _video.InterpolationState is { Active: true };
-            if (interp)
-            {
-                big = Math.Round(st.PresentedFps).ToString("0");
-                small = gameKnown ? L.F("ゲーム {0:0}", _video.GameFps)
-                    : st.InputFps > 0 ? L.F("入力 {0:0}", st.InputFps) : string.Empty;
-            }
-            else if (_video.PictureStill) big = L.T("静止");
-            else if (gameKnown) big = Math.Round(_video.GameFps).ToString("0");
-            else big = Math.Round(st.InputFps).ToString("0");
+            _fpsLogKey = key;
+            Log.Info($"info panel (FPS): interpolation setting={_settings.Interpolation} state={(ist == null ? "none" : $"active={ist.Active} idle={ist.Idle} source={ist.SourceFps:0.0} refresh={ist.RefreshHz:0.0}")} -> shows {(interp ? "shown rate" : "game rate")} {big}");
         }
         string before = _info.Text;
         _info.SetFps(big, small);

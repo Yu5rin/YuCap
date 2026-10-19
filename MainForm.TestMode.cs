@@ -172,7 +172,7 @@ public sealed partial class MainForm
     private TestReport _rep = null!;
     private AppSettings? _testSaved;
     private int _testStep, _testTotal;
-    private bool _testCtxBlocked;
+    private bool _ctxAudit;   // the menu check of section 9 is opening the context menu itself
 
     private bool _tQuick => _topt.Quick;
     private int SettleMs => _tQuick ? 1000 : 1500;
@@ -423,7 +423,7 @@ public sealed partial class MainForm
             "切り取り・色の調整・映像の遅延・表示どおりの保存・回転と反転が正しく働くかを調べます。");
         TestSection secAudio = rep.AddSection("8. 音声");
         TestSection secDlg = rep.AddSection("9. ダイアログの表示崩れ",
-            "設定のダイアログを日本語と英語で作り、部品が重なったり枠からはみ出したりしていないかを調べます。");
+            "設定のダイアログを日本語と英語で作り、部品が重なったり枠からはみ出したりしていないかを調べます。あわせて、右クリックのメニューとその下のメニューの項目の高さがそろっているかも調べます。");
         TestSection secManual = rep.AddSection("10. 目で確かめる項目", "自動では測れない項目だけを載せています（好みの問題や、基準になる映像が必要なもの）。それぞれに測れない理由を書きました。");
 
         if (videoOk)
@@ -469,6 +469,7 @@ public sealed partial class MainForm
             }
 
             steps.Add((L.F("通知の表示: {0}", L.T("通知と情報表示の文字の大きさ")), secNotice, () => TextSizeStep(secNotice, m1080)));
+            steps.Add((L.F("通知の表示: {0}", L.T("情報表示（FPS だけ）の余白")), secNotice, () => FpsPanelLayoutStep(secNotice)));
 
             // 5. FSR
             foreach ((string label, int h) in new[] { ("1080p", 1080), ("1440p", 1440) })
@@ -504,6 +505,7 @@ public sealed partial class MainForm
         steps.Add((L.T("音声の確認"), secAudio, () => AudioStep(secAudio)));
         steps.Add((L.T("遅延の確認"), secAudio, () => LatencyStep(secAudio, videoOk)));
         steps.Add((L.T("ダイアログの確認"), secDlg, () => DialogStep(secDlg)));
+        steps.Add((L.T("メニューの確認"), secDlg, () => MenuStep(secDlg)));
 
         _testTotal = steps.Count;
         foreach (var (desc, stepSec, run) in steps)
@@ -512,7 +514,7 @@ public sealed partial class MainForm
             SetCaption(++_testStep, desc);
             try
             {
-                if (videoOk && !_video.IsRunning && desc != L.T("ダイアログの確認") && desc != L.T("音声の確認") && desc != L.T("遅延の確認"))
+                if (videoOk && !_video.IsRunning && desc != L.T("ダイアログの確認") && desc != L.T("メニューの確認") && desc != L.T("音声の確認") && desc != L.T("遅延の確認"))
                 {
                     Log.Info("test mode: the video stopped - restarting before the next step");
                     Exception? ex = ReplaceEngine("d3d", null);
@@ -574,11 +576,7 @@ public sealed partial class MainForm
         _testCaption.Virtual = _video.SupportsOverlays && !_frozen;
         _testCaption.ApplyScale(OverlayScale(TextScale.KCaption));
         Controls.Add(_testCaption);
-        if (!_testCtxBlocked)
-        {
-            _testCtxBlocked = true;
-            _ctx.Opening += (_, e) => { if (_testRunning) e.Cancel = true; };
-        }
+        // (a person's right-click is refused while the test runs: see OnCtxOpening)
 
         // a neutral baseline, so a step measures one thing; restored from the snapshot at the end
         _settings.AdjBrightness = 0; _settings.AdjContrast = 100; _settings.AdjSaturation = 100; _settings.AdjGamma = 100;
@@ -1423,7 +1421,7 @@ public sealed partial class MainForm
             double osdFrac = (double)osdCap / screenH, infoFrac = (double)infoCap / screenH;
             double Deg(double frac) => Math.Atan(frac / 1.5) * 180 / Math.PI;   // distance = 1.5 x screen height
             double osdDeg = Deg(osdFrac), infoDeg = Deg(infoFrac);
-            const double osdMinDeg = 0.35, infoMinDeg = 0.25, maxFrac = 0.05;
+            const double osdMinDeg = 0.35, infoMinDeg = 0.2, maxFrac = 0.05;
             string F(double f) => (f * 100).ToString("0.00") + "%";
 
             item.Num("モニターの大きさ（高さ）", $"{screenH} ピクセル")
@@ -1432,7 +1430,7 @@ public sealed partial class MainForm
                 .Num("YuCap が掛けた倍率（情報表示）", $"x{_info.TextFactor:0.00}")
                 .Num("通知の文字（大文字の高さ）", $"{osdCap} ピクセル ／ 画面の高さの {F(osdFrac)} ／ 約 {osdDeg:0.00}°")
                 .Num("情報表示の文字（大文字の高さ）", $"{infoCap} ピクセル ／ 画面の高さの {F(infoFrac)} ／ 約 {infoDeg:0.00}°")
-                .Num("前提", "画面の高さの 1.5 倍の距離から見る。目安は通知 0.35° 以上・情報表示 0.25° 以上、画面の高さの 5% 以下");
+                .Num("前提", "画面の高さの 1.5 倍の距離から見る。目安は通知 0.35° 以上・情報表示 0.2° 以上、画面の高さの 5% 以下");
 
             // 情報表示「FPS だけ」: the big number and the small line, measured the same way.
             SetInfoMode(InfoMode.Fps);

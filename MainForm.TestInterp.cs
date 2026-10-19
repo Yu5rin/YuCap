@@ -393,6 +393,26 @@ public sealed partial class MainForm
             double game = rates.Count > 0 ? InterpCheck.Median(rates) : 0;
             double margin = _video.VideoPacingMarginMs;
 
+            // FPS だけ must show the rate the interpolation really presents (not the game's own), and agree with the status bar.
+            {
+                var pit = new TestItem { Name = "FPS だけの数字（補間中）" };
+                FpsPanelContent(out string pBig, out string pSmall, out bool pInterp);
+                double presented = _video.Stats?.PresentedFps ?? 0;
+                string bar = InterpMetric(out _) ?? "";
+                pit.Num("パネルの数字", $"{pBig}（2行目: {(pSmall.Length == 0 ? "なし" : pSmall)}）")
+                   .Num("画面に出ているコマ数", $"{presented:0.0} fps").Num("ゲームのコマ数", game > 0 ? $"{game:0.0} fps" : "不明")
+                   .Num("ステータスバーの補間", bar.Length == 0 ? "（なし）" : bar);
+                bool numOk = double.TryParse(pBig, out double pv) && Math.Abs(pv - presented) <= Math.Max(2, presented * 0.03);
+                bool barOk = bar.Contains("→" + pBig);
+                if (pInterp && numOk && barOk) { pit.Verdict = Verdict.Ok; pit.Summary = "補間中は、画面に出ているコマ数が表示され、ステータスバーと一致しています"; }
+                else
+                {
+                    pit.Verdict = Verdict.Ng;
+                    pit.Summary = !pInterp ? "補間が働いているのに、パネルは補間中の表示になっていません" : !numOk ? "パネルの数字が、画面に出ているコマ数と一致しません" : "パネルとステータスバーの補間の数字が一致しません";
+                }
+                sec.Items.Add(pit);
+            }
+
             if (stillSamples * 2 > samples || rates.Count == 0)
             {
                 item.Verdict = Verdict.Info;

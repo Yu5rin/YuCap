@@ -69,6 +69,7 @@ internal sealed class VBlankBeat : IDisposable
         _out = null; _name = string.Empty; _failed = false; _verified = false; _fast = 0; _errors = 0;
         _monitor = monitor;
         Volatile.Write(ref _lastQpc, 0);   // the time since the last vblank of the old output says nothing here
+        Volatile.Write(ref _periodMs, 0);  // nor does the old output's period: 0 = unknown, callers use the display's reported rate
         old?.Dispose();
         Interlocked.Increment(ref _epoch);
         try
@@ -127,6 +128,7 @@ internal sealed class VBlankBeat : IDisposable
             return false;
         }
         Volatile.Write(ref _lastQpc, 0);   // this check blocked for a while: not a gap in the render loop
+        Volatile.Write(ref _periodMs, med);   // a first measurement of the new output, so the rate is right from the start
         Log1($"D3D: pacing beat verified - {med:0.00} ms per vblank ({1000.0 / med:0.0} Hz), display {hz} Hz");
         return true;
     }
