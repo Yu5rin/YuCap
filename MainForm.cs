@@ -3830,7 +3830,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             Size r = _video.CurrentResolution;
             string comp = _video.CurrentMode?.Compression ?? string.Empty;
-            string fps = _video.IsRunning ? $"  {_video.NegotiatedFps}fps" : string.Empty;
+            string fps = _video.IsRunning ? $"  {_video.NegotiatedFps}fps{GameFpsNote()}" : string.Empty;
             string shortName = Ellipsize(_video.CurrentDeviceName, 20);
             _lblVideo.Text = r.Width > 0
                 ? $"{vLabel}: {shortName}  {r.Width}x{r.Height} {comp}{fps}"
@@ -4185,12 +4185,22 @@ public sealed partial class MainForm : Form, IMessageFilter
         return L.T("標準") + " ×" + f;
     }
 
+    /// <summary>「（ゲーム 30 fps）」: the game's own frame rate (unique pictures per second) when it was measured; 「（静止）」 while the
+    /// picture does not change; empty when unknown (Media Foundation renderer, no frames yet).</summary>
+    private string GameFpsNote()
+    {
+        if (!_video.IsRunning) return string.Empty;
+        if (_video.GameFpsReliable && _video.GameFps > 0) return L.F("（ゲーム {0:0} fps）", _video.GameFps);
+        if (_video.PictureStill) return L.T("（静止）");
+        return string.Empty;
+    }
+
     private void UpdateInfo()
     {
         string renderer = _video.SupportsScalingQuality ? "Direct3D" : L.T("標準（Media Foundation）");
         string input = _video.CurrentMode is { } m ? ModeLabel(m) : "—";
         string fps = _video.Stats is { } st
-            ? L.F("入力 {0:0} / 表示 {1:0} / 欠落 {2}", st.InputFps, st.PresentedFps, st.DroppedFrames)
+            ? L.F("入力 {0:0} / 表示 {1:0} / 欠落 {2}", st.InputFps, st.PresentedFps, st.DroppedFrames) + GameFpsNote()
             : "—";
 
         string gpu = "—";

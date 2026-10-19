@@ -139,6 +139,13 @@ public interface IVideoEngine : IDisposable
     /// becomes an exact block, which is the point of that display mode.</summary>
     bool PixelPerfect { get => false; set { } }
     RenderStats? Stats => null;
+    /// <summary>Unique pictures per second over about the last second (the game's own frame rate, e.g. 30 for a 30 fps game
+    /// captured at 60 fps; Direct3D only). 0 = unknown, or the picture is still (see <see cref="PictureStill"/>).</summary>
+    double GameFps => 0;
+    /// <summary>A game frame rate was measured and the picture is moving (<see cref="GameFps"/> may be shown).</summary>
+    bool GameFpsReliable => false;
+    /// <summary>The picture did not change over the last second or so: there is no frame rate to show.</summary>
+    bool PictureStill => false;
     /// <summary>Exact cumulative count of frames received from the capture device since Start
     /// (0 when not applicable). Unlike <see cref="Stats"/> it is not a rolling average, so the
     /// caller can take deltas over any precise window.</summary>

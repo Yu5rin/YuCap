@@ -218,6 +218,56 @@ internal static partial class Program
             RunInterpCapture(capDir, capCount, capSec, capDisp, capMax);
             return;
         }
+        if (args.Length > 0 && args[0] == "--dup-probe")
+        {
+            int dpSec = 12; string dpOut = Path.Combine(Path.GetTempPath(), "yucap_dup_probe.csv"); string dpDisp = ""; bool dpInterp = false; bool dpOff = false;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--seconds" && i + 1 < args.Length) int.TryParse(args[++i], out dpSec);
+                else if (args[i] == "--display" && i + 1 < args.Length) dpDisp = args[++i];
+                else if (args[i] == "--interp") dpInterp = true;
+                else if (args[i] == "--off") dpOff = true;
+                else if (args[i] == "--comp" && i + 1 < args.Length) _dupProbeComp = args[++i];
+                else if (args[i] == "--mode" && i + 1 < args.Length) _dupProbeMode = ParseMode(args[++i]);
+                else if (!args[i].StartsWith("--", StringComparison.Ordinal)) dpOut = args[i];
+            }
+            _probeDisplay = dpDisp.Length > 0 ? dpDisp : null;
+            RunDupProbe(dpOut, dpSec, dpInterp, dpOff);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--interp-seq-capture")
+        {
+            int sqFrames = 120; string sqDisp = "HISENSE"; Size sqSize = new(960, 540);
+            string sqDir = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_seq");
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--frames" && i + 1 < args.Length) int.TryParse(args[++i], out sqFrames);
+                else if (args[i] == "--display" && i + 1 < args.Length) sqDisp = args[++i];
+                else if (args[i] == "--size" && i + 1 < args.Length)
+                {
+                    string[] wh = args[++i].Split('x');
+                    if (wh.Length == 2 && int.TryParse(wh[0], out int sw0) && int.TryParse(wh[1], out int sh0)) sqSize = new Size(sw0, sh0);
+                }
+            }
+            RunInterpSeqCapture(sqDir, sqFrames, sqDisp, sqSize);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--interp-seq-eval")
+        {
+            double evHz = 144, evMargin = 4; bool evTrace = false; string evOut = ""; string[] evPat = { "real", "2", "1+2", "1+1+2", "3", "1" };
+            string evDir = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_seq");
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--hz" && i + 1 < args.Length) double.TryParse(args[++i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out evHz);
+                else if (args[i] == "--margin" && i + 1 < args.Length) double.TryParse(args[++i], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out evMargin);
+                else if (args[i] == "--out" && i + 1 < args.Length) evOut = args[++i];
+                else if (args[i] == "--patterns" && i + 1 < args.Length) evPat = args[++i].Split(';');
+                else if (args[i] == "--trace") evTrace = true;
+            }
+            if (evOut.Length == 0) evOut = Path.Combine(evDir, "eval.txt");
+            RunInterpSeqEval(evDir, evHz, evMargin, evOut, evPat, evTrace ? Path.GetDirectoryName(Path.GetFullPath(evOut)) : null);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--interp-eval")
         {
             ParseInterpEvalArgs(args, out string evDir, out string evOut, out var evVariants, out bool evQuick, out string[] evShow);

@@ -453,6 +453,7 @@ public sealed partial class MainForm
             steps.Add((L.F("表示の計測: {0}", L.T("まとめ")), secRender, () => { VrrSummary(secRender, vrrNotes); return Task.CompletedTask; }));
             steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（既知の動き）")), secRender, () => InterpSynthStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（実際の映像）")), secRender, () => InterpLiveStep(secRender, modes)));
+            steps.Add((L.F("表示の計測: {0}", L.T("ゲームのコマ数に合わせた補間")), secRender, () => InterpCadenceStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("重ねた表示による更新の低下")), secRender, () => OverlayCapStep(secRender, modes)));
 
             // 4. notices, with low latency off and on

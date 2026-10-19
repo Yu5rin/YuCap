@@ -36,6 +36,9 @@ internal static class D3DShaders
         public byte[] Me = Array.Empty<byte>(), MeCost = Array.Empty<byte>(), CutStat = Array.Empty<byte>();
         public byte[] Med = Array.Empty<byte>();
         public byte[] Synth = Array.Empty<byte>();
+        // Same-picture detection (Shaders/dup.hlsl, a compute shader). A failure only disables the game frame rate reading.
+        public bool DupOk;
+        public byte[] Dup = Array.Empty<byte>();
     }
 
     private static readonly object Gate = new();
@@ -87,6 +90,15 @@ internal static class D3DShaders
             catch (Exception ex)
             {
                 Log.Info("D3D: interpolation shaders unavailable - frame interpolation is disabled: " + ex.Message.Split((char)10)[0]);
+            }
+            try
+            {
+                b.Dup = Compile(Resource("dup.hlsl"), "thumb", "dup.hlsl", "cs_5_0");
+                b.DupOk = true;
+            }
+            catch (Exception ex)
+            {
+                Log.Info("D3D: same-picture shader unavailable - the game frame rate is not measured: " + ex.Message.Split((char)10)[0]);
             }
             Log.Info($"D3D: shaders compiled in {sw.ElapsedMilliseconds}ms");
             _cached = b;

@@ -335,6 +335,128 @@ public sealed partial class MainForm
     }
 
     // =============================================================================================
+    //  A-3. Interpolation that follows the game's own frame rate
+    // =============================================================================================
+
+    private async Task InterpCadenceStep(TestSection sec, List<CaptureMode> modes)
+    {
+        var item = new TestItem { Name = "ゲームのコマ数に合わせた補間" };
+        double panel = _topt.Target.RefreshHz;
+        CaptureMode? mode = PickLiveInterpMode(modes, panel);
+        if (mode == null)
+        {
+            item.Summary = "このモニターではフレーム補間が使えないため試験しません";
+            item.Explanation = $"フレーム補間は、モニターの更新が映像のコマ数の 1.1 倍以上のときだけ働きます。このモニター（{panel:0} Hz）では、どの映像モードでも条件を満たしません。";
+            sec.Items.Add(item);
+            return;
+        }
+        if (_video is not D3DVideoEngine eng)
+        {
+            item.Summary = "Direct3D の映像ではないため確認できませんでした";
+            sec.Items.Add(item);
+            return;
+        }
+        if (_testCaption != null) _testCaption.Showing = false;
+        try
+        {
+            _settings.Interpolation = true;
+            EnsureEngine(false, mode);
+            await Wait(SettleMs + 500);
+            InterpolationStatus? st = _video.InterpolationState;
+            item.Num("映像", $"{ModeLabel(mode)}（モニターの更新 {panel:0} Hz）");
+            if (st is not { Active: true })
+            {
+                item.Summary = "フレーム補間が働かなかったため確認できませんでした";
+                item.Explanation = "理由: " + InterpIdleText(st);
+                sec.Items.Add(item);
+                return;
+            }
+
+            // 2 s of frames stay in the ring; the game's frame rate is read about 20 times in the meantime
+            double fps = _video.NegotiatedFps > 0 ? _video.NegotiatedFps : mode.Fps;
+            int keep = (int)Math.Min(120, Math.Ceiling(fps * 2.0));
+            eng.DebugSetRingExtra(keep + 4);
+            var rates = new List<double>();
+            int stillSamples = 0, samples = 0;
+            for (int i = 0; i < 12; i++)
+            {
+                await Wait(250);
+                if (i < 4) continue;
+                samples++;
+                if (_video.PictureStill) stillSamples++;
+                else if (_video.GameFpsReliable && _video.GameFps > 0) rates.Add(_video.GameFps);
+            }
+            var frames = new List<D3DRenderer.TimelineFrame>();
+            bool got = eng.DebugTimeline(keep, frames, out double nominalMs, out double periodMs, out double extraMs, out double latMs);
+            eng.DebugSetRingExtra(0);
+            double inputFps = _video.Stats?.InputFps ?? fps;
+            double game = rates.Count > 0 ? InterpCheck.Median(rates) : 0;
+            double margin = _video.VideoPacingMarginMs;
+
+            if (stillSamples * 2 > samples || rates.Count == 0)
+            {
+                item.Verdict = Verdict.Info;
+                item.Summary = "映像がほぼ止まっていたため、ゲームのコマ数を測れませんでした";
+                item.Num("ゲームのコマ数", "静止（絵が変わらない）");
+                item.Explanation = "約 2 秒の間、絵がほとんど変わりませんでした。ゲームなど動きのある映像を映して試験してください。";
+                sec.Items.Add(item);
+                return;
+            }
+            item.Num("映像が届く速さ", $"{inputFps:0.0} fps")
+                .Num("ゲームの実際のコマ数（新しい絵が出る速さ）", $"約 {game:0.0} fps（{rates.Count} 回の測定の中央値）");
+            if (!got || frames.Count < 30)
+            {
+                item.Summary = "ゲームのコマ数は測れましたが、補間の様子は調べられませんでした";
+                item.Explanation = "補間用の保管場所から十分な数のコマを取り出せませんでした。";
+                sec.Items.Add(item);
+                return;
+            }
+            item.Num("新しい絵の出方", CadenceCheck.DescribeCadence(frames, inputFps));
+
+            bool repeats = game < inputFps * 0.9;
+            CadenceCheck.SimResult oldR = CadenceCheck.Simulate(frames, panel, margin, nominalMs, extraMs, latMs, periodMs, false);
+            CadenceCheck.SimResult newR = CadenceCheck.Simulate(frames, panel, margin, nominalMs, extraMs, latMs, periodMs, true);
+            item.Num("繰り返しのコマ", $"{frames.Count(f => f.Dup)} / {frames.Count} コマ（直前と同じ絵）")
+                .Num("動きが止まる回（従来 / 新しい絵だけで補間）", $"{Pct(oldR.StallShare)} / {Pct(newR.StallShare)}（{oldR.Analysed} 回の更新のうち、絵の進みが平均の 20% 未満だった割合）")
+                .Num("絵の進みの不揃い（従来 / 新）", $"{oldR.Cv:0.00} / {newR.Cv:0.00}（更新ごとの進みの標準偏差 ÷ 平均、小さいほど滑らか）")
+                .Num("1 回の更新での最大の進み（平均に対して、従来 / 新）", $"{oldR.Jump:0.0} 倍 / {newR.Jump:0.0} 倍")
+                .Num("映像を保持する時間（従来 / 新）", $"{oldR.HoldMs:0} ms / {newR.HoldMs:0} ms（新しい絵 1 つ分の間隔と、繰り返しかどうかの判定を待つ分だけ長くなります）")
+                .Num("繰り返しの判定が出るまで", $"最大 {latMs:0} ms");
+
+            var why = new List<string>();
+            if (!repeats)
+            {
+                item.Verdict = Verdict.Info;
+                item.Summary = "ゲームが映像と同じコマ数で描画しているため、この補間は働きません";
+                why.Add($"映像は {inputFps:0} fps、ゲームの新しい絵は {game:0} fps で、繰り返しのコマはほとんどありません。このときの補間は従来と同じ動きで、確認する項目がありません。");
+                why.Add("30 fps や 40 fps で描画するゲームを 60 fps で取り込むと、同じ絵が続けて届きます。そのときにこの補間が働きます。");
+            }
+            else
+            {
+                Verdict v;
+                if (newR.StallShare <= 0.05 && newR.StallShare <= oldR.StallShare * 0.5 && newR.Starved <= 2) v = Verdict.Ok;
+                else if (newR.StallShare < oldR.StallShare) v = Verdict.Warn;
+                else v = Verdict.Ng;
+                item.Verdict = v;
+                item.Summary = v switch
+                {
+                    Verdict.Ok => $"動きの止まる回が {Pct(oldR.StallShare)} から {Pct(newR.StallShare)} に減りました",
+                    Verdict.Warn => $"動きの止まる回は減りましたが（{Pct(oldR.StallShare)} → {Pct(newR.StallShare)}）、まだ残っています",
+                    _ => $"動きの止まる回が減りませんでした（{Pct(oldR.StallShare)} → {Pct(newR.StallShare)}）",
+                };
+                why.Add($"ゲームは約 {game:0} fps で描画していて、映像（{inputFps:0} fps）には同じ絵が続けて届きます。従来の補間は「同じ絵と同じ絵」の間を補間してしまい、動きが止まったあとに一気に進みました。新しい補間は繰り返しのコマを飛ばし、新しい絵どうしを、一定の間隔で補間します。");
+                why.Add($"代わりに、新しい絵が次に届くまで待つ必要があるため、映像を保持する時間が {oldR.HoldMs:0} ms から {newR.HoldMs:0} ms に増えます（約 {newR.HoldMs - oldR.HoldMs:0} ms の遅れが増えます）。ゲームのコマ数が低いほど、増える分は大きくなります。");
+                if (newR.Starved > 2) why.Add($"次の新しい絵がまだ届いておらず、前の絵のまま待った更新が {newR.Starved} 回ありました。");
+            }
+            why.Add($"調べ方: 約 2 秒分の実際のコマ（届いた時刻と、直前と同じ絵かどうか）を記録し、{panel:0} Hz のモニターで更新のたびにどの絵とどの絵の間を表示するかを、実際の選び方のプログラムで再現しました。表示している位置を「新しい絵の通し番号 + 次の絵への進み具合」で表し、更新ごとの進みを比べています（絵の中身は使わないため、動きの大きさの違いに左右されません）。毎回同じだけ進めば理想です。" +
+                "OK は、動きの止まる回が 5% 以下で、従来の半分以下になったとき。注意は減ったがそれより多いとき。NG は減らなかったときです。");
+            item.Explanation = string.Join("\n", why);
+            sec.Items.Add(item);
+        }
+        finally { StopInterpForTest(); }
+    }
+
+    // =============================================================================================
     //  B. Updates lowered by something drawn over the video
     // =============================================================================================
 

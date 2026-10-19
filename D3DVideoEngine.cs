@@ -191,6 +191,9 @@ public sealed class D3DVideoEngine : IVideoEngine
     }
 
     public RenderStats? Stats => _s?.Stats;
+    public double GameFps => _s?.Renderer?.GameFps ?? 0;
+    public bool GameFpsReliable => _s?.Renderer?.GameFpsReliable ?? false;
+    public bool PictureStill => _s?.Renderer?.PictureStill ?? false;
     public long FramesReceived => _s?.FramesReceived ?? 0;
     public long FramesPresented => _s?.FramesPresented ?? 0;
     public long FramesDropped => _s?.FramesDropped ?? 0;
@@ -395,6 +398,26 @@ public sealed class D3DVideoEngine : IVideoEngine
         return ok;
     }
 
+    /// <summary>Test mode: the newest ring frames with their repeat flags and timeline (see <see cref="D3DRenderer.DebugTimeline"/>).</summary>
+    internal bool DebugTimeline(int count, List<D3DRenderer.TimelineFrame> into, out double nominalMs, out double periodMs, out double extraHoldMs, out double answerLatMs)
+    {
+        nominalMs = periodMs = extraHoldMs = answerLatMs = 0;
+        D3DRenderer? r = _s?.Renderer;
+        return r != null && r.DebugTimeline(count, into, out nominalMs, out periodMs, out extraHoldMs, out answerLatMs);
+    }
+
+    /// <summary>Developer probe (--interp-seq-capture): the newest ring frames, converted and shrunk, oldest first.</summary>
+    internal bool DebugInterpDump(int count, Size target, List<D3DRenderer.DumpFrame> into)
+    {
+        var got = new List<D3DRenderer.DumpFrame>();
+        bool ok = false;
+        Session? s = _s;
+        if (s != null && s.Alive)
+            s.Run(r => { ok = r.InterpDebugDump(count, target, got); return null; }, 30000, needFrame: false, out _);
+        into.AddRange(got);
+        return ok;
+    }
+
     /// <summary>Test mode: three chosen live frames plus the picture interpolated between the outer two.</summary>
     internal bool DebugInterpHoldout(long q0, long q1, long q2,
         out Bitmap? f0, out Bitmap? f1, out Bitmap? f2, out Bitmap? mid)
@@ -419,6 +442,9 @@ public sealed class D3DVideoEngine : IVideoEngine
         mid = rm; fieldXy = rf; fieldSize = rs; timing = rt;
         return ok;
     }
+
+    /// <summary>Developer probes (--dup-probe, --interp-seq-*): the running session's renderer.</summary>
+    internal D3DRenderer? DebugRenderer => _s?.Renderer;
 
     public string? SourceColorInfo => _s?.ColorInfo;
 
@@ -600,32 +626,10 @@ public sealed class D3DVideoEngine : IVideoEngine
 
         // Smoothed arrival timeline (capture thread): a phase-locked loop on the frame interval, so that
         // the few ms of USB / scheduling jitter in the raw arrival times do not wobble the interpolation phase.
-        private double _smoothTicks;
-        private bool _smoothValid;
+        private readonly ArrivalSmoother _smoother = new();
 
-        private long TrackSmooth(long arrival)
-        {
-            double nom = Volatile.Read(ref _nominalMs) * Stopwatch.Frequency / 1000.0;
-            double sm;
-            if (!_smoothValid || nom <= 0) sm = arrival;
-            else
-            {
-                double pred = _smoothTicks + nom;
-                double err = arrival - pred;
-                if (Math.Abs(err) > 6 * nom) sm = arrival;          // a long stall: start over
-                else
-                {
-                    double k = Math.Round(err / nom);                // dropped (k>0) or duplicated (k<0) frames
-                    pred += k * nom;
-                    err -= k * nom;
-                    sm = pred + 0.05 * err;
-                }
-                if (sm < _smoothTicks + 0.2 * nom) sm = _smoothTicks + 0.2 * nom;   // always moves forward
-            }
-            _smoothValid = true;
-            _smoothTicks = sm;
-            return (long)sm;
-        }
+        private long TrackSmooth(long arrival) =>
+            _smoother.Track(arrival, Volatile.Read(ref _nominalMs) * Stopwatch.Frequency / 1000.0);
 
         // ---- frame interpolation ----
         private volatile bool _interpActive;
@@ -996,6 +1000,8 @@ public sealed class D3DVideoEngine : IVideoEngine
             long interpEvalTick = 0;
             InterpolationIdle interpIdleLogged = (InterpolationIdle)(-1);
             double interpHoldMs = 0;
+            double cadHold = 0;          // extra hold-back while the game's pictures repeat (ms), see CadenceExtraHoldMs
+            var cadGov = new HoldGovernor();
             bool marginLogged = false;
             int iter = 0;
             bool dueLogged = false;
@@ -1105,7 +1111,12 @@ public sealed class D3DVideoEngine : IVideoEngine
                 // shown is that of time now - hold, made from the two frames around it.
                 bool interp = displayDriven && _interpActive;
                 double nominalNow = Volatile.Read(ref _nominalMs);
-                interpHoldMs = interp ? delayMs + nominalNow : 0;
+                // Pictures that repeat (a 30 fps game in a 60 fps stream) are skipped by the interpolation, so the next NEW
+                // picture is one picture interval away instead of one frame interval: the hold-back grows by the difference
+                // (plus the lateness of the evened-out timeline and of the repeat verdict). It rises quickly and falls slowly.
+                double cadWant = interp ? r.CadenceExtraHoldMs() : 0;
+                cadHold = cadGov.Step(cadWant, 1000.0 / Math.Max(1.0, ActualRefreshHz()));
+                interpHoldMs = interp ? delayMs + nominalNow + cadHold : 0;
                 int ringMs = interp ? (int)Math.Ceiling(interpHoldMs) : delayMs;
                 if (r.ConfigureRing(ringMs, Fps))
                 {
@@ -1359,6 +1370,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
                         Interlocked.Increment(ref _inFrames);
                         TrackArrival(arrival);
+                        r.SetNominalMs(_nominalMs);
                         SubmitSample(r, sample, width, height, yuv, arrival, TrackSmooth(arrival), ref texIid);
                         // With the ring active the render thread counts what the ring loses.
                         if (Interlocked.Exchange(ref _frameReady, 1) == 1 && !_ringActive) Interlocked.Increment(ref _dropped);

@@ -136,10 +136,15 @@ internal sealed partial class D3DRenderer : IDisposable
         public long Arrival;
         public long Smooth;                    // phase-locked arrival (Stopwatch ticks), see Session.TrackSmooth
         public long Seq;                       // 0 = empty
+        public ID3D11ShaderResourceView? YSrv; // luma view for the same-picture pass
+        public long FrameNo;                   // number the same-picture pass gave the frame (0 = none)
+        public bool Dup, Resolved;             // the frame repeats the picture before it / that is known
+        public long U;                         // time on the unique-picture timeline (= Smooth until resolved)
         public void Free()
         {
+            YSrv?.Dispose(); YSrv = null;
             Nv12?.Dispose(); Nv12 = null; Y?.Dispose(); Y = null; UV?.Dispose(); UV = null;
-            Seq = 0; W = H = 0;
+            Seq = 0; W = H = 0; FrameNo = 0; Dup = Resolved = false;
         }
     }
     private readonly List<Slot> _ring = new();
@@ -236,6 +241,8 @@ internal sealed partial class D3DRenderer : IDisposable
                 _cbInterp?.Dispose(); _cbInterp = null;
             }
         }
+
+        DupInit(b);
 
         try { _gpu = new GpuTimer(Device, Ctx); _gpu.StopCollecting(); }   // live: keep only the 1 s window
         catch (Exception ex) { Log.Info("D3D: GPU timestamp queries unavailable: " + ex.Message.Split('\n')[0]); }
@@ -467,17 +474,25 @@ internal sealed partial class D3DRenderer : IDisposable
     /// <summary>GPU path: copy the decoder/processor's NV12 texture into ours.</summary>
     public void SubmitGpuFrame(ID3D11Texture2D src, uint subresource, int w, int h, YuvInfo yuv, long arrival, long smooth)
     {
+        SubmitGpuFrameLocked(src, subresource, w, h, yuv, arrival, smooth);
+        DupFlush();
+    }
+
+    private void SubmitGpuFrameLocked(ID3D11Texture2D src, uint subresource, int w, int h, YuvInfo yuv, long arrival, long smooth)
+    {
         lock (FrameLock)
         {
             if (_ringNeed > 0)
             {
                 Slot s = AcquireSlot(w, h, gpu: true);
                 Ctx.CopySubresourceRegion(s.Nv12!, 0, 0, 0, 0, src, subresource, new Box(0, 0, 0, w, h, 1));
-                Stamp(s, yuv, arrival, smooth);
+                long fn = DupSubmit(s.YSrv, w, h, arrival, smooth);
+                Stamp(s, yuv, arrival, smooth, fn);
                 return;
             }
             EnsureFrameTextures(w, h, gpu: true);
             Ctx.CopySubresourceRegion(_nv12!, 0, 0, 0, 0, src, subresource, new Box(0, 0, 0, w, h, 1));
+            DupSubmit(_nv12Y, w, h, arrival, smooth);
             Volatile.Write(ref _latestArrival, arrival);
             _gpuFrame = true;
             _yuv = yuv;
@@ -488,6 +503,12 @@ internal sealed partial class D3DRenderer : IDisposable
     /// <summary>CPU path: upload NV12 from memory (Y plane, then the interleaved UV plane).</summary>
     public void SubmitCpuFrame(IntPtr scan0, int pitch, int w, int h, YuvInfo yuv, long arrival, long smooth)
     {
+        SubmitCpuFrameLocked(scan0, pitch, w, h, yuv, arrival, smooth);
+        DupFlush();
+    }
+
+    private void SubmitCpuFrameLocked(IntPtr scan0, int pitch, int w, int h, YuvInfo yuv, long arrival, long smooth)
+    {
         lock (FrameLock)
         {
             if (_ringNeed > 0)
@@ -495,12 +516,14 @@ internal sealed partial class D3DRenderer : IDisposable
                 Slot s = AcquireSlot(w, h, gpu: false);
                 Ctx.UpdateSubresource(s.Y!, 0, null, scan0, (uint)pitch, 0);
                 Ctx.UpdateSubresource(s.UV!, 0, null, scan0 + pitch * h, (uint)pitch, 0);
-                Stamp(s, yuv, arrival, smooth);
+                long fn = DupSubmit(s.YSrv, w, h, arrival, smooth);
+                Stamp(s, yuv, arrival, smooth, fn);
                 return;
             }
             EnsureFrameTextures(w, h, gpu: false);
             Ctx.UpdateSubresource(_texY!, 0, null, scan0, (uint)pitch, 0);
             Ctx.UpdateSubresource(_texUV!, 0, null, scan0 + pitch * h, (uint)pitch, 0);
+            DupSubmit(_srvY, w, h, arrival, smooth);
             Volatile.Write(ref _latestArrival, arrival);
             _gpuFrame = false;
             _yuv = yuv;
@@ -560,6 +583,7 @@ internal sealed partial class D3DRenderer : IDisposable
             foreach (Slot s in _ring) if (s.Seq < slot.Seq) slot = s;
             if (!_interpHold && slot.Seq > _shownSeq) _ringDropped++;   // overwritten before its turn (interpolation counts what it skipped itself)
         }
+        slot.FrameNo = 0; slot.Dup = slot.Resolved = false;          // the old picture's answer must not land on the new one
         if (slot.W != w || slot.H != h || slot.Gpu != gpu || (gpu ? slot.Nv12 : slot.Y) == null)
         {
             slot.Free();
@@ -571,6 +595,11 @@ internal sealed partial class D3DRenderer : IDisposable
                     Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
                     Format = Format.NV12, SampleDescription = new SampleDescription(1, 0),
                     Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+                });
+                slot.YSrv = Device.CreateShaderResourceView(slot.Nv12, new ShaderResourceViewDescription
+                {
+                    Format = Format.R8_UNorm, ViewDimension = ShaderResourceViewDimension.Texture2D,
+                    Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
                 });
             }
             else
@@ -587,16 +616,19 @@ internal sealed partial class D3DRenderer : IDisposable
                     Format = Format.R8G8_UNorm, SampleDescription = new SampleDescription(1, 0),
                     Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
                 });
+                slot.YSrv = Device.CreateShaderResourceView(slot.Y);
             }
         }
         return slot;
     }
 
-    private void Stamp(Slot s, YuvInfo yuv, long arrival, long smooth)
+    private void Stamp(Slot s, YuvInfo yuv, long arrival, long smooth, long frameNo)
     {
         s.Yuv = yuv;
         s.Arrival = arrival;
         s.Smooth = smooth;
+        s.U = smooth;                          // until the same-picture answer comes: a new picture at its own time
+        s.FrameNo = frameNo; s.Dup = s.Resolved = false;
         s.Seq = ++_ringSeq;
     }
 
@@ -1352,6 +1384,8 @@ internal sealed partial class D3DRenderer : IDisposable
     private FieldLevel[]? _fields;                      // index 0 = level 1 (1/2) ... 3 = level 4 (1/16)
     private InterpKey _interpKey;
     private bool _interpKeyValid;
+    private readonly List<Slot> _selSlots = new();       // scratch of the pair selection
+    private readonly List<TimelineEntry> _selEntries = new();
     private long _curA, _curB, _meA, _meB;              // the pair shown last / the pair the field belongs to
     private double _lastAlpha = -1;
     private long _interpMaxUsed;
@@ -1853,26 +1887,23 @@ internal sealed partial class D3DRenderer : IDisposable
         lock (FrameLock)
         {
             // ---- pick the pair ----
-            Slot? a = null, oldest = null;
+            // Frames the same-picture pass found to repeat the picture before them are skipped and the new pictures run on
+            // their own, evenly spaced timeline (PairSelect); a frame whose answer has not come yet counts as a new picture.
+            DupPoll();
+            bool uniqueAware = UniqueAware && DupAvailable;
+            _selSlots.Clear(); _selEntries.Clear();
             foreach (Slot s in _ring)
             {
                 if (s.Seq == 0) continue;
-                if (oldest == null || s.Seq < oldest.Seq) oldest = s;
-                if (s.Smooth <= t && (a == null || s.Seq > a.Seq)) a = s;
+                _selSlots.Add(s);
+                _selEntries.Add(new TimelineEntry(s.Seq, s.Smooth, s.U, s.Dup));
             }
-            a ??= oldest;                     // start-up: nothing is old enough yet - show the oldest
-            if (a == null) return _hasFrame && _oriented != null;
-
-            Slot? b = null;
-            double alpha = 0;
-            foreach (Slot s in _ring)
-                if (s.Seq == a.Seq + 1) { b = s; break; }
-            if (b != null && (b.W != a.W || b.H != a.H)) b = null;     // a mode change in between
-            if (b != null)
-            {
-                long span = b.Smooth - a.Smooth;
-                alpha = span > 0 ? Math.Clamp((double)(t - a.Smooth) / span, 0.0, 1.0) : (t >= b.Smooth ? 1.0 : 0.0);
-            }
+            double nomTicks = Volatile.Read(ref _nominalMs) * Stopwatch.Frequency / 1000.0;
+            int ia = PairSelect.Pick(_selEntries, t, uniqueAware, _uniq.Cadence ? _uniq.PeriodTicks : nomTicks, nomTicks, out int ib, out double alpha);
+            if (ia < 0) return _hasFrame && _oriented != null;
+            Slot a = _selSlots[ia];
+            Slot? b = ib >= 0 ? _selSlots[ib] : null;
+            if (b != null && (b.W != a.W || b.H != a.H)) { b = null; alpha = 0; }     // a mode change in between
 
             // ---- cache validity ----
             var key = new InterpKey(rotation, mirror, adj, crop, a.W, a.H);
@@ -1889,7 +1920,13 @@ internal sealed partial class D3DRenderer : IDisposable
             Size o = Oriented(CropMath.Effective(src, crop).Size, rotation);
 
             // frames nobody ever looked at
-            if (_interpMaxUsed != 0 && a.Seq > _interpMaxUsed + 1) _ringDropped += a.Seq - _interpMaxUsed - 1;
+            if (_interpMaxUsed != 0 && a.Seq > _interpMaxUsed + 1)
+            {
+                if (!uniqueAware) _ringDropped += a.Seq - _interpMaxUsed - 1;
+                else
+                    foreach (Slot s in _selSlots)       // repeats that were skipped on purpose are not drops
+                        if (!s.Dup && s.Seq > _interpMaxUsed && s.Seq < a.Seq) _ringDropped++;
+            }
             _interpMaxUsed = Math.Max(_interpMaxUsed, Math.Max(a.Seq, b?.Seq ?? 0));
             _shownSeq = a.Seq;
 
@@ -1940,6 +1977,14 @@ internal sealed partial class D3DRenderer : IDisposable
                 _lastAlpha = eff;
                 _orientedVer++;
                 changed = true;
+            }
+            else if (uniqueAware && b == null)
+            {
+                // A still picture (or the wait for the next new one): the frames keep arriving but they only repeat the picture, so the
+                // pair no longer changes. Interpolating identical frames used to present at every refresh and the rest of the pipeline
+                // (pacing figures, latency, the tests) counts on that, so it still does; the oriented texture itself is left as it is.
+                foreach (Slot s in _selSlots)
+                    if (s.Seq > a.Seq) { changed = true; break; }
             }
             return true;
         }
@@ -2215,7 +2260,7 @@ internal sealed partial class D3DRenderer : IDisposable
         _swap?.Dispose(); _swap = null;
         if (!releaseDevice) return;
 
-        lock (FrameLock) { FreeRing(); DisposeFrameTextures(); }
+        lock (FrameLock) { FreeRing(); DisposeFrameTextures(); DupFree(); }
         _gpu?.Dispose(); _gpu = null;
         _vs?.Dispose(); _psConvert?.Dispose(); _psScale?.Dispose(); _psOverlay?.Dispose(); _blendOver?.Dispose(); _psEasu?.Dispose(); _psRcas?.Dispose();
         _psPre?.Dispose(); _psIbp?.Dispose(); _cbPre?.Dispose();
@@ -2226,5 +2271,6 @@ internal sealed partial class D3DRenderer : IDisposable
         Ctx?.Dispose();
         Device?.Dispose();
         Marshal.FreeHGlobal(_scratch);
+        Marshal.FreeHGlobal(_dupScratch);
     }
 }
