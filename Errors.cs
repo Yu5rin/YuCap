@@ -12,9 +12,21 @@ namespace YuCap;
 /// Message through verbatim, unlike a framework exception whose Message is
 /// developer-facing English text or a bare HRESULT string.
 /// </summary>
-internal sealed class UserFacingException : Exception
+internal class UserFacingException : Exception
 {
     public UserFacingException(string message) : base(message) { }
+}
+
+/// <summary>
+/// The video window already carries a DirectComposition target from an earlier renderer
+/// (DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED, 0x88980800), so no composition swap chain can be attached
+/// to it. Thrown by <see cref="D3DVideoEngine.Start"/>; the host must recreate the video window
+/// (the UI's ResetHandle) and call Start again. <see cref="Exception.HResult"/> is 0x88980800.
+/// </summary>
+internal sealed class WindowAlreadyComposedException : UserFacingException
+{
+    public const int Code = unchecked((int)0x88980800);
+    public WindowAlreadyComposedException(string message) : base(message) { HResult = Code; }
 }
 
 /// <summary>

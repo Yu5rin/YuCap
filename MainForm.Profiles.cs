@@ -170,6 +170,13 @@ public sealed partial class MainForm
 
     private void ApplyProfile(VideoProfile profile)
     {
+        _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
+        try { ApplyProfileCore(profile); }
+        finally { _devOpBusy--; }
+    }
+
+    private void ApplyProfileCore(VideoProfile profile)
+    {
         VideoProfile before = CaptureProfile(string.Empty);   // to go back to if the new one cannot start
         bool rendererDiffers = profile.Renderer != _settings.Renderer;
         bool modeDiffers = profile.ToMode() != _savedMode;
@@ -496,6 +503,13 @@ public sealed partial class MainForm
     /// the renderer, including falling back when the new mode cannot start.
     /// </summary>
     private void ToggleLowLatency()
+    {
+        _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
+        try { ToggleLowLatencyCore(); }
+        finally { _devOpBusy--; }
+    }
+
+    private void ToggleLowLatencyCore()
     {
         if (!_video.SupportsLowLatency) return;
         bool on = !_settings.LowLatency;

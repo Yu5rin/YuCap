@@ -38,7 +38,10 @@ internal static class SingleInstance
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
     [DllImport("user32.dll")] private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string? cls, string? title);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref CopyDataStruct lParam);
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, ref CopyDataStruct lParam,
+        uint flags, uint timeoutMs, out IntPtr result);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint message, uint action, IntPtr changeFilterStruct);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
@@ -47,9 +50,18 @@ internal static class SingleInstance
     [DllImport("user32.dll")] private static extern IntPtr RemovePropW(IntPtr hWnd, string name);
 
     private const int SwRestore = 9;
+    private const uint SmtoAbortIfHung = 0x0002;
+    private const uint MsgFltAllow = 1;
 
-    /// <summary>Tag the window so <see cref="ActivateExisting"/> can find it.</summary>
-    public static void MarkWindow(IntPtr hWnd) => SetPropW(hWnd, WindowMarker, new IntPtr(1));
+    /// <summary>Tag the window so <see cref="ActivateExisting"/> can find it, and let WM_COPYDATA from a lower-integrity
+    /// process through: when this instance runs elevated (started "as administrator"), a normal second launch would
+    /// otherwise have its message dropped by UIPI and the forwarded command line would be lost.</summary>
+    public static void MarkWindow(IntPtr hWnd)
+    {
+        SetPropW(hWnd, WindowMarker, new IntPtr(1));
+        try { ChangeWindowMessageFilterEx(hWnd, WmCopyData, MsgFltAllow, IntPtr.Zero); }
+        catch (Exception ex) { Log.Info("single instance: could not allow WM_COPYDATA through UIPI - " + ex.Message); }
+    }
 
     public static void UnmarkWindow(IntPtr hWnd) => RemovePropW(hWnd, WindowMarker);
 
@@ -86,7 +98,13 @@ internal static class SingleInstance
                 cbData = (payload.Length + 1) * 2,   // bytes, including the terminator
                 lpData = buffer,
             };
-            SendMessage(target, WmCopyData, IntPtr.Zero, ref data);
+            // A hung first instance must not hang the second one too: give up after 2 s.
+            IntPtr sent = SendMessageTimeout(target, WmCopyData, IntPtr.Zero, ref data, SmtoAbortIfHung, 2000, out _);
+            if (sent == IntPtr.Zero)
+            {
+                Log.Info("single instance: the running instance did not answer the forwarded command line (hung or busy)");
+                return false;
+            }
         }
         finally
         {

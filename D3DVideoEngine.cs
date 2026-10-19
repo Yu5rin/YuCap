@@ -63,9 +63,17 @@ public sealed class D3DVideoEngine : IVideoEngine
 
     // ---- state reported to the UI ------------------------------------------
     public string? CurrentDeviceName { get; private set; }
-    public Size CurrentResolution { get; private set; }
-    public CaptureMode? CurrentMode { get; private set; }
+    private Size _resolution;
+    private CaptureMode? _mode;
+    /// <summary>The size the source reader delivers; follows a mid-stream media type change of the running session.</summary>
+    public Size CurrentResolution => _s is { } s ? s.ResolutionNow : _resolution;
+    public CaptureMode? CurrentMode => _s is { } s ? s.Mode : _mode;
     public int NegotiatedFps { get; private set; }
+    /// <summary>The running session stopped by itself (device lost, present failure, end of stream, reader/capture error,
+    /// window gone) - not through <see cref="Stop"/>. Reset by Start and Stop; the host polls it and restarts.</summary>
+    public bool EndedUnexpectedly => _s?.UnexpectedEnd != null;
+    /// <summary>Why <see cref="EndedUnexpectedly"/> is set (for logs / messages); null otherwise.</summary>
+    public string? EndedReason => _s?.UnexpectedEnd;
     public string? LastSnapshotError { get; private set; }
     public bool IsRunning => _s is { Alive: true };
     private List<CaptureMode> _modes = new();
@@ -275,6 +283,11 @@ public sealed class D3DVideoEngine : IVideoEngine
     //  Start / Stop
     // =====================================================================
 
+    /// <summary>Render thread: device, shaders, swap chain and capture open must all finish within this.</summary>
+    internal const int StartBudgetMs = 7000;
+    /// <summary>Longest a Stop() waits: above the render thread's worst teardown (capture join 800 + source shutdown 1000 + join 1200 + disposal).</summary>
+    internal const int ShutdownBudgetMs = 6000;
+
     public void Start(VideoDeviceInfo info, CaptureMode? mode = null)
     {
         Log.Info($"D3D: Start {info.Name} mode={(mode == null ? "auto" : $"{mode.Compression} {mode.Width}x{mode.Height}@{mode.Fps}")}");
@@ -284,25 +297,27 @@ public sealed class D3DVideoEngine : IVideoEngine
 
         var s = new Session(this, _hwnd, info, mode);
         s.Begin();
-        if (!s.Started.Wait(8000))
+        // The render thread's own deadline (device + shaders + capture open) is StartBudgetMs; wait a little longer
+        // than that so its specific error wins over a bare timeout here.
+        if (!s.Started.Wait(StartBudgetMs + 1500))
         {
-            Log.Info("D3D: Start timed out after 8s — abandoning the threads");
+            Log.Info("D3D: Start timed out — abandoning the threads");
             s.RequestStop("start timeout");
             throw new UserFacingException(L.T("映像の開始がタイムアウトしました。"));
         }
         if (s.StartError != null)
         {
-            s.JoinRender(2000);   // let it release the window's composition target before a retry
+            s.JoinRender(3500);   // let it release the window's composition target before a retry
             ExceptionDispatchInfo.Capture(s.StartError).Throw();
         }
 
         _s = s;
         CurrentDeviceName = info.Name;
-        CurrentResolution = s.Resolution;
+        _resolution = s.Resolution;
+        _mode = s.Mode;
         NegotiatedFps = s.Fps;
-        CurrentMode = s.Mode;
         _modes = s.Modes;
-        Log.Info($"D3D: running {CurrentResolution.Width}x{CurrentResolution.Height}@{NegotiatedFps} ({s.Mode?.Compression})");
+        Log.Info($"D3D: running {_resolution.Width}x{_resolution.Height}@{NegotiatedFps} ({s.Mode?.Compression})");
     }
 
     public void Stop()
@@ -312,11 +327,11 @@ public sealed class D3DVideoEngine : IVideoEngine
         if (s != null)
         {
             Log.Info("D3D: Stop");
-            s.Shutdown(3000);
+            s.Shutdown(ShutdownBudgetMs);
         }
         CurrentDeviceName = null;
-        CurrentResolution = Size.Empty;
-        CurrentMode = null;
+        _resolution = Size.Empty;
+        _mode = null;
         NegotiatedFps = 0;
         _modes = new();
     }
@@ -331,7 +346,7 @@ public sealed class D3DVideoEngine : IVideoEngine
     {
         Session? s = _s;
         if (s == null || !s.Alive) return null;
-        return s.Run(r => r.ReadOriented(), timeoutMs, needFrame: true, out _);
+        return s.Run(r => r.ReadOrientedNearest(), timeoutMs, needFrame: true, out _);
     }
 
     public Bitmap? Snapshot(bool cropToVideo = true)
@@ -481,10 +496,34 @@ public sealed class D3DVideoEngine : IVideoEngine
         // Result of Start
         public readonly ManualResetEventSlim Started = new(false);
         public Exception? StartError;
-        public Size Resolution;
+        public Size Resolution;                  // the size at Start; see ResolutionNow for the live value
         public int Fps;
-        public CaptureMode? Mode;
+        private volatile CaptureMode? _mode;
+        public CaptureMode? Mode { get => _mode; set => _mode = value; }
         public List<CaptureMode> Modes = new();
+        private long _resPacked;                 // width << 32 | height of the reader's current output type (0 = see Resolution)
+        public Size ResolutionNow
+        {
+            get
+            {
+                long p = Volatile.Read(ref _resPacked);
+                return p == 0 ? Resolution : new Size((int)(p >> 32), (int)(p & 0xFFFFFFFF));
+            }
+        }
+
+        /// <summary>Capture thread: the source reader's output type changed while running (a console switching modes).</summary>
+        private void UpdateResolution(int w, int h)
+        {
+            Volatile.Write(ref _resPacked, ((long)w << 32) | (uint)h);
+            CaptureMode? m = _mode;
+            if (m != null && (m.Width != w || m.Height != h)) _mode = m with { Width = w, Height = h };
+        }
+
+        // Set when the session ended on its own (not through Shutdown): the first reason wins.
+        private string? _unexpected;
+        private volatile bool _userStop;
+        public string? UnexpectedEnd => Volatile.Read(ref _unexpected);
+        private volatile bool _drained;          // the render thread has failed every queued request and takes no more
 
         // Handshake between the render thread (device owner) and the capture thread.
         private readonly ManualResetEventSlim _deviceReady = new(false);
@@ -535,12 +574,15 @@ public sealed class D3DVideoEngine : IVideoEngine
             _nrThread.Start();
         }
 
-        /// <summary>Every ~3 s (every 1.5 s until the first decision) read one full-size oriented frame back through the render
-        /// thread's request queue and estimate its real vertical detail. A decision (or a change) needs the same estimate three
-        /// samples in a row; black, flat and capture-card message pictures are skipped.</summary>
+        /// <summary>Judge the picture's real vertical detail: every 1.5 s until a decision, then only when the picture size changes,
+        /// when a sample disagrees with the decision (then every 1.5 s until settled), and as a slow re-check every 30 s. A decision
+        /// (or a change) needs the same estimate three samples in a row; black, flat and capture-card message pictures are skipped.
+        /// The picture is copied to a staging texture on the GPU and mapped without waiting; the render thread is only asked for the
+        /// copy command, and the CPU reads the pixels here, on this thread (see <see cref="D3DRenderer.AnalysisBegin"/>).</summary>
         private void NativeResLoop()
         {
             const int Need = 3;
+            const int ActiveMs = 1500, SkipRetryMs = 5000, StableRecheckMs = 30000;
             bool wasAuto = false;
             int lastEst = -1, count = 0, decidedEst = -1;
             Size lastSize = Size.Empty;
@@ -561,18 +603,18 @@ public sealed class D3DVideoEngine : IVideoEngine
                     Volatile.Write(ref _nrTarget, 0); _nrDecided = false;
                     nextAt = now + 800;
                 }
-                if (now < nextAt) continue;
-                nextAt = now + (_nrDecided ? 3000 : 1500);
                 D3DRenderer? r = _r;
                 if (r == null || !r.HasFrame || _e._rotation is 90 or 270) continue;
+                // A new picture size (mode, crop, device) is judged at once, however settled the last decision was.
+                Size cur = r.OrientedSize;
+                if (lastSize != Size.Empty && cur.Width > 0 && cur != lastSize && nextAt > now) nextAt = now;
+                if (now < nextAt) continue;
+                nextAt = now + (_nrDecided ? SkipRetryMs : ActiveMs);
 
-                Bitmap? bmp = null;
                 try
                 {
-                    bmp = Run(rr => rr.ReadOrientedForAnalysis(), 1500, needFrame: true, out _);
-                    if (bmp == null) continue;
-                    float[] y = ResEstimate.LumaOf(bmp, out int w, out int h);
-                    bmp.Dispose(); bmp = null;
+                    float[]? y = GrabLuma(r, out int w, out int h);
+                    if (y == null) continue;
                     var size = new Size(w, h);
                     if (size != lastSize)
                     {
@@ -597,10 +639,35 @@ public sealed class D3DVideoEngine : IVideoEngine
                                          : $"D3D: native-res auto: detail is the full {h}p - no shrinking");
                         Poke();
                     }
+                    // Settled and unchanged: look again only slowly. A disagreeing sample (or no decision yet) is followed up quickly.
+                    nextAt = now + (_nrDecided && est == decidedEst ? StableRecheckMs : ActiveMs);
                 }
                 catch (Exception ex) { Log.Info("D3D: native-res analysis failed: " + ex.Message.Split('\n')[0]); }
-                finally { bmp?.Dispose(); }
             }
+        }
+
+        /// <summary>The luma of the current picture for the analysis, or null. The render thread only queues a GPU copy; the
+        /// pixels are mapped (without waiting) and converted here, outside FrameLock and off the render thread.</summary>
+        private float[]? GrabLuma(D3DRenderer r, out int w, out int h)
+        {
+            w = h = 0;
+            D3DRenderer.AnalysisShot? shot = null;
+            Run(rr => { shot = rr.AnalysisBegin(); return null; }, 1500, needFrame: true, out _, allowNull: true);
+            D3DRenderer.AnalysisShot? got = shot;
+            if (got == null) return null;
+            try
+            {
+                long deadline = Environment.TickCount64 + 1500;
+                while (!r.AnalysisTryMap(got))
+                {
+                    if (_stopping || Environment.TickCount64 > deadline) return null;
+                    Thread.Sleep(3);
+                }
+                using var bmp = new Bitmap(got.Size.Width, got.Size.Height, got.RowPitch,
+                    System.Drawing.Imaging.PixelFormat.Format32bppArgb, got.Data);
+                return ResEstimate.LumaOf(bmp, out w, out h);
+            }
+            finally { got.Dispose(); }
         }
 
         // Video delay bookkeeping (render thread writes, anyone reads).
@@ -681,25 +748,57 @@ public sealed class D3DVideoEngine : IVideoEngine
 
         public InterpolationStatus InterpStatus() => EvaluateInterpolation(_interpActive);
 
+        private readonly double[] _oob = new double[20];
+        private int _oobCount;
+
+        private void SeedNominal(double nominal)
+        {
+            _nominalMs = nominal;
+            double m0 = Math.Clamp(nominal * 0.25, 2.0, Math.Max(2.0, nominal * 0.5));
+            Volatile.Write(ref _marginMs, m0);
+            _loggedMargin = m0;
+        }
+
         /// <summary>Capture thread: fold one arrival into the jitter estimate (p90 of how far the
         /// arrival interval strays from nominal) and update the margin.</summary>
         private void TrackArrival(long arrival)
         {
             double nominal = Fps > 0 ? 1000.0 / Fps : 16.7;
-            double maxMargin = nominal * 0.5;
             if (_nominalMs == 0)
             {
-                _nominalMs = nominal;
-                double m0 = Math.Clamp(nominal * 0.25, 2.0, Math.Max(2.0, maxMargin));
-                Volatile.Write(ref _marginMs, m0);
-                _loggedMargin = m0;
+                SeedNominal(nominal);
             }
+            double maxMargin = _nominalMs * 0.5;
             long last = _lastArrival;
             _lastArrival = arrival;
             if (last == 0) return;
             double iv = (arrival - last) * 1000.0 / Stopwatch.Frequency;
-            if (iv > nominal * 6) return;   // a stall, not jitter
-            if (iv > nominal * 0.5 && iv < nominal * 1.5) _nominalMs = _nominalMs * 0.98 + iv * 0.02;
+            if (iv > _nominalMs * 0.5 && iv < _nominalMs * 1.5)
+            {
+                _nominalMs = _nominalMs * 0.98 + iv * 0.02;
+                _oobCount = 0;
+            }
+            else if (iv <= 2000)
+            {
+                // Out of band: either a hiccup (the next interval is in band again) or the device really delivers at another
+                // rate than negotiated (a 30 fps feed on a 60 fps mode). After 20 in a row take their median as the new beat.
+                _oob[_oobCount++] = iv;
+                if (_oobCount >= _oob.Length)
+                {
+                    _oobCount = 0;
+                    double[] srt = (double[])_oob.Clone();
+                    Array.Sort(srt);
+                    double med = (srt[srt.Length / 2 - 1] + srt[srt.Length / 2]) / 2;
+                    if (med >= 2.0 && med <= 1000.0)
+                    {
+                        Log.Info($"D3D: arrival interval {med:0.0}ms is outside the expected {_nominalMs:0.0}ms - re-seeding the frame rate ({1000.0 / med:0.0} fps)");
+                        SeedNominal(med);
+                        _devCount = _devPos = _sinceCalc = 0;
+                        return;
+                    }
+                }
+            }
+            if (iv > _nominalMs * 6) return;   // a stall, not jitter
             _dev[_devPos] = Math.Abs(iv - _nominalMs);
             _devPos = (_devPos + 1) % _dev.Length;
             if (_devCount < _dev.Length) _devCount++;
@@ -828,8 +927,10 @@ public sealed class D3DVideoEngine : IVideoEngine
         public void PokeConvert() { Volatile.Write(ref _dirtyConvert, 1); Poke(); }
         private void TryWake() { try { _wake.Set(); } catch (ObjectDisposedException) { } }
 
-        public void RequestStop(string why)
+        public void RequestStop(string why, bool unexpected = false)
         {
+            if (unexpected && !_userStop && Interlocked.CompareExchange(ref _unexpected, why, null) == null)
+                Log.Info("D3D: session ended on its own — " + why);
             if (!_stopping) Log.Info("D3D: stopping — " + why);
             _stopping = true;
             TryWake();
@@ -841,6 +942,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         public void Shutdown(int budgetMs)
         {
             var sw = Stopwatch.StartNew();
+            _userStop = true;
             RequestStop("Stop()");
 
             // The render thread owns the teardown order (it stops the capture thread first).
@@ -858,7 +960,10 @@ public sealed class D3DVideoEngine : IVideoEngine
         {
             error = null;
             var req = new SnapRequest { Work = work, NeedFrame = needFrame, AllowNull = allowNull };
+            if (_drained) { error = L.T("映像がありません"); return null; }
             _requests.Enqueue(req);
+            // The render thread may have drained the queue for the last time just before the enqueue: fail it here.
+            if (_drained) { DrainRequests(); error = L.T("映像がありません"); return null; }
             TryWake();
             if (!req.Done.Wait(timeoutMs))
             {
@@ -877,6 +982,8 @@ public sealed class D3DVideoEngine : IVideoEngine
         //  Render thread
         // ------------------------------------------------------------------
 
+        [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
+        [DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint ms);
         [DllImport("user32.dll")]
         private static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
         [DllImport("user32.dll")]
@@ -896,6 +1003,9 @@ public sealed class D3DVideoEngine : IVideoEngine
         {
             D3DRenderer? r = null;
             bool captureMayUseDevice = false;
+            // The delayed (low-latency) path sleeps until a frame is due: at the default 15.6 ms timer tick it would show
+            // frames up to a tick late. Held for the session's lifetime.
+            bool timerRaised = timeBeginPeriod(1) == 0;
             try
             {
                 var sw = Stopwatch.StartNew();
@@ -919,7 +1029,8 @@ public sealed class D3DVideoEngine : IVideoEngine
                 _captureThread.SetApartmentState(ApartmentState.MTA);
                 captureMayUseDevice = true;
                 _captureThread.Start();
-                if (!_captureOpened.Wait(7000))
+                // Device + shaders + capture open together stay inside StartBudgetMs, which Start() outwaits.
+                if (!_captureOpened.Wait(Math.Max(1000, StartBudgetMs - (int)sw.ElapsedMilliseconds)))
                     throw new UserFacingException(L.T("映像の開始がタイムアウトしました。"));
                 if (_captureOpenError != null) ExceptionDispatchInfo.Capture(_captureOpenError).Throw();
 
@@ -940,14 +1051,17 @@ public sealed class D3DVideoEngine : IVideoEngine
                 else
                 {
                     Log.Info($"D3D: render thread failed — {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+                    RequestStop($"render thread failed ({ex.GetType().Name} 0x{ex.HResult:X8})", unexpected: true);
                     _stopping = true;
                 }
             }
             finally
             {
                 _stopping = true;
-                // Fail any waiting stills requests.
-                while (_requests.TryDequeue(out SnapRequest? q)) q.Done.Set();
+                // Fail any waiting stills requests; Run() fails by itself once _drained is set.
+                DrainRequests();
+                _drained = true;
+                DrainRequests();
 
                 bool captureDone = true;
                 Thread? cap = _captureThread;
@@ -977,6 +1091,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     try { _dxgiManager?.Dispose(); } catch { }
                 }
                 _alive = 0;
+                if (timerRaised) timeEndPeriod(1);
                 if (!Started.IsSet) Started.Set();
             }
         }
@@ -1074,7 +1189,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     presentedLast = false;
                     if (_stopping) break;
                     ServiceRequests(r);
-                    if (!IsWindow(_hwnd)) { RequestStop("window gone"); break; }
+                    if (!IsWindow(_hwnd)) { RequestStop("window gone", unexpected: true); break; }
                     Interlocked.Exchange(ref _frameReady, 0);   // arrivals feed the ring here, not presentation
                     newFrame = false;
                 }
@@ -1096,7 +1211,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     // Stills first: they must see the state the user is looking at.
                     ServiceRequests(r);
 
-                    if (!IsWindow(_hwnd)) { RequestStop("window gone"); break; }
+                    if (!IsWindow(_hwnd)) { RequestStop("window gone", unexpected: true); break; }
                     newFrame = Interlocked.Exchange(ref _frameReady, 0) == 1;
                     delayMs = userDelayMs;
                 }
@@ -1272,7 +1387,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
         private void HandlePresentFailure(D3DRenderer r, Result hr)
         {
-            if (hr == Vortice.DXGI.ResultCode.DeviceRemoved || hr == Vortice.DXGI.ResultCode.DeviceReset)
+            if (hr == Vortice.DXGI.ResultCode.DeviceRemoved || hr == Vortice.DXGI.ResultCode.DeviceReset || hr.Code == DxgiDeviceHung)
             {
                 string reason = "?";
                 try { reason = r.Device.DeviceRemovedReason.ToString(); } catch { }
@@ -1282,7 +1397,19 @@ public sealed class D3DVideoEngine : IVideoEngine
             {
                 Log.Info($"D3D: Present failed hr=0x{hr.Code:X8} — stopping");
             }
-            RequestStop("present failure");
+            RequestStop($"present failure 0x{hr.Code:X8}", unexpected: true);
+        }
+
+        private const int DxgiDeviceHung = unchecked((int)0x887A0006);
+
+        /// <summary>Fail every queued request at once (the session is over).</summary>
+        private void DrainRequests()
+        {
+            while (_requests.TryDequeue(out SnapRequest? q))
+            {
+                q.Error ??= L.T("映像がありません");
+                q.Done.Set();
+            }
         }
 
         private void ServiceRequests(D3DRenderer r)
@@ -1304,8 +1431,8 @@ public sealed class D3DVideoEngine : IVideoEngine
                 {
                     Log.Info("D3D: still request failed — " + ex.Message.Split('\n')[0]);
                     q.Error = Errors.Describe(ex);
-                    if (ex.HResult == unchecked((int)0x887A0005) || ex.HResult == unchecked((int)0x887A0007))
-                        RequestStop("device removed during still request");
+                    if (ex.HResult == unchecked((int)0x887A0005) || ex.HResult == unchecked((int)0x887A0007) || ex.HResult == DxgiDeviceHung)
+                        RequestStop($"device lost during still request (0x{ex.HResult:X8})", unexpected: true);
                 }
                 if (q.Abandoned) { Interlocked.Exchange(ref q.Result, null)?.Dispose(); }
                 q.Done.Set();
@@ -1351,19 +1478,20 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if ((flags & SourceReaderFlag.EndOfStream) != 0)
                         {
                             Log.Info("D3D: end of stream (device removed?)");
-                            RequestStop("end of stream");
+                            RequestStop("end of stream", unexpected: true);
                             break;
                         }
                         if ((flags & SourceReaderFlag.Error) != 0)
                         {
                             Log.Info("D3D: source reader reported an error");
-                            RequestStop("source reader error");
+                            RequestStop("source reader error", unexpected: true);
                             break;
                         }
                         if ((flags & SourceReaderFlag.CurrentMediaTypeChanged) != 0)
                         {
                             using IMFMediaType t = reader.GetCurrentMediaType(VideoStream);
                             (width, height, yuv) = ReadOutputType(t, width, height);
+                            UpdateResolution(width, height);
                             Log.Info($"D3D: output type changed -> {width}x{height} matrix={yuv.Matrix} fullRange={yuv.FullRange}");
                         }
                         if (sample == null) continue;
@@ -1389,7 +1517,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 else if (!_stopping)
                 {
                     Log.Info($"D3D: capture failed — {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message.Split('\n')[0]}");
-                    RequestStop("capture failure");
+                    RequestStop($"capture failure (0x{ex.HResult:X8})", unexpected: true);
                 }
             }
             finally
@@ -1459,7 +1587,16 @@ public sealed class D3DVideoEngine : IVideoEngine
             ra.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, 1u);    // MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS
             ra.Set(SourceReaderAttributeKeys.EnableAdvancedVideoProcessing, 1u);
             IMFSourceReader reader = MediaFactory.MFCreateSourceReaderFromMediaSource(source, ra);
+            try { return ConfigureReader(reader, out yuv, out width, out height); }
+            catch
+            {
+                try { reader.Dispose(); } catch { }   // the media source is shut down by the capture thread's cleanup
+                throw;
+            }
+        }
 
+        private IMFSourceReader ConfigureReader(IMFSourceReader reader, out YuvInfo yuv, out int width, out int height)
+        {
             reader.SetStreamSelection(unchecked((int)0xFFFFFFFE), false);   // all streams off
             reader.SetStreamSelection(VideoStream, true);
 
@@ -1528,6 +1665,7 @@ public sealed class D3DVideoEngine : IVideoEngine
             width &= ~1; height &= ~1;
 
             Resolution = new Size(width, height);
+            Volatile.Write(ref _resPacked, ((long)width << 32) | (uint)height);
             Fps = pick.Fps;
             Mode = new CaptureMode(pick.Comp, pick.W, pick.H, pick.Fps);
             Log.Info($"D3D: format {pick.Comp} {pick.W}x{pick.H}@{pick.Fps} -> NV12 {width}x{height}, matrix={(yuv.Matrix == 2 ? "601" : yuv.Matrix is 4 or 5 ? "2020" : "709")}, {(yuv.FullRange ? "0-255" : "16-235")}");

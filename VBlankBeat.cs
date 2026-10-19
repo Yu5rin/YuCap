@@ -31,7 +31,10 @@ internal sealed class VBlankBeat : IDisposable
     private IntPtr _monitor;
     private string _name = string.Empty;
     private long _nextCheck;             // Environment.TickCount64 at which the monitor is compared again
-    private bool _failed;                // gave up on this output (until the monitor changes)
+    private bool _failed;                // gave up on this output (until the monitor changes or the retry time comes)
+    private long _retryAt;               // Environment.TickCount64 at which a failed output is verified again
+    private int _retryDelayMs = RetryFirstMs;
+    private const int RetryFirstMs = 8000, RetryMaxMs = 60000;
     private bool _verified;              // the period of this output was compared with the display's refresh rate
     private int _fast, _errors;
     private string? _lastLogged;
@@ -67,6 +70,7 @@ internal sealed class VBlankBeat : IDisposable
     {
         IDXGIOutput? old = _out;
         _out = null; _name = string.Empty; _failed = false; _verified = false; _fast = 0; _errors = 0;
+        _retryDelayMs = RetryFirstMs; _retryAt = 0;
         _monitor = monitor;
         Volatile.Write(ref _lastQpc, 0);   // the time since the last vblank of the old output says nothing here
         Volatile.Write(ref _periodMs, 0);  // nor does the old output's period: 0 = unknown, callers use the display's reported rate
@@ -128,6 +132,7 @@ internal sealed class VBlankBeat : IDisposable
             return false;
         }
         Volatile.Write(ref _lastQpc, 0);   // this check blocked for a while: not a gap in the render loop
+        _retryDelayMs = RetryFirstMs;
         Volatile.Write(ref _periodMs, med);   // a first measurement of the new output, so the rate is right from the start
         Log1($"D3D: pacing beat verified - {med:0.00} ms per vblank ({1000.0 / med:0.0} Hz), display {hz} Hz");
         return true;
@@ -136,6 +141,8 @@ internal sealed class VBlankBeat : IDisposable
     private void Fail(string why)
     {
         _failed = true;
+        _retryAt = Environment.TickCount64 + _retryDelayMs;
+        _retryDelayMs = Math.Min(RetryMaxMs, _retryDelayMs * 2);   // a permanently odd output is looked at ever more rarely
         Log1($"D3D: pacing beat = vblank of {_name} gave up ({why}) - using DWM / latency waitable");
     }
 
@@ -151,6 +158,14 @@ internal sealed class VBlankBeat : IDisposable
             if (mon != _monitor) Resolve(device, mon);
         }
         IDXGIOutput? o = _out;
+        if (o != null && _failed && tick >= _retryAt)
+        {
+            // A temporary cause (the monitor slept, a mode change, a long hitch) must not cost the beat for good: verify again.
+            _failed = false; _verified = false; _fast = 0; _errors = 0;
+            Volatile.Write(ref _periodMs, 0);
+            Volatile.Write(ref _lastQpc, 0);
+            Log1($"D3D: pacing beat = vblank of {_name} - trying again");
+        }
         if (o == null || _failed) return false;
         if (!_verified)
         {
@@ -175,7 +190,9 @@ internal sealed class VBlankBeat : IDisposable
         if (last != 0)
         {
             double iv = (t1 - last) * 1000.0 / Stopwatch.Frequency;
-            double rough = roughPeriodMs > 1 ? roughPeriodMs : 16.7;
+            // The period Verify measured on this output is a better yardstick than the rate Windows reports (59 vs 59.94 Hz).
+            double known = Volatile.Read(ref _periodMs);
+            double rough = known > 1 ? known : roughPeriodMs > 1 ? roughPeriodMs : 16.7;
             if (iv < rough * 0.4) { if (++_fast >= 10) { Fail("returns at once"); return false; } }
             else _fast = 0;
             if (iv > rough * 0.7 && iv < rough * 1.3)

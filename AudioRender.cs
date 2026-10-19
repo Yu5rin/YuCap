@@ -137,34 +137,44 @@ internal sealed class SharedRender : IDisposable
     /// <summary>Opens the render endpoint (does not start). Rate/Channels are the engine mix format.</summary>
     public SharedRender(string deviceId)
     {
-        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
         try
         {
-            Check(enumerator.GetDevice(deviceId, out var dev), "GetDevice");
-            _device = dev;
-        }
-        finally { Marshal.ReleaseComObject(enumerator); }
+            var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+            try
+            {
+                Check(enumerator.GetDevice(deviceId, out var dev), "GetDevice");
+                _device = dev;
+            }
+            finally { Marshal.ReleaseComObject(enumerator); }
 
-        object? obj;
-        Guid iid3 = IID_IAudioClient3;
-        if (_device!.Activate(ref iid3, 23 /* CLSCTX_ALL */, IntPtr.Zero, out obj) >= 0 && obj is IAudioClient3 c3)
-        {
-            _client3 = c3;
-        }
-        else
-        {
-            Guid iid1 = IID_IAudioClient;
-            Check(_device.Activate(ref iid1, 23, IntPtr.Zero, out obj), "Activate(IAudioClient)");
-            _client = (IAudioClient)obj;
-        }
+            object? obj;
+            Guid iid3 = IID_IAudioClient3;
+            if (_device!.Activate(ref iid3, 23 /* CLSCTX_ALL */, IntPtr.Zero, out obj) >= 0 && obj is IAudioClient3 c3)
+            {
+                _client3 = c3;
+            }
+            else
+            {
+                if (obj != null) { try { Marshal.ReleaseComObject(obj); } catch { } }
+                Guid iid1 = IID_IAudioClient;
+                Check(_device.Activate(ref iid1, 23, IntPtr.Zero, out obj), "Activate(IAudioClient)");
+                _client = (IAudioClient)obj;
+            }
 
-        IntPtr fmt = IntPtr.Zero;
-        try
-        {
-            Check(_client3 != null ? _client3.GetMixFormat(out fmt) : _client!.GetMixFormat(out fmt), "GetMixFormat");
-            ParseFormat(fmt);
+            IntPtr fmt = IntPtr.Zero;
+            try
+            {
+                Check(_client3 != null ? _client3.GetMixFormat(out fmt) : _client!.GetMixFormat(out fmt), "GetMixFormat");
+                ParseFormat(fmt);
+            }
+            finally { if (fmt != IntPtr.Zero) Marshal.FreeCoTaskMem(fmt); }
         }
-        finally { if (fmt != IntPtr.Zero) Marshal.FreeCoTaskMem(fmt); }
+        catch
+        {
+            // The caller never gets an object to dispose when the constructor throws: release the COM objects here.
+            Dispose();
+            throw;
+        }
     }
 
     private void ParseFormat(IntPtr fmt)
@@ -289,7 +299,14 @@ internal sealed class SharedRender : IDisposable
         {
             while (!_stop)
             {
-                if (!_event!.WaitOne(250)) { if (_stop) break; continue; }
+                if (!_event!.WaitOne(250))
+                {
+                    if (_stop) break;
+                    // No event for a while: a removed / reconfigured device never signals again, so ask it directly.
+                    // AUDCLNT_E_DEVICE_INVALIDATED (or any failure) ends the loop through the Failed event.
+                    Check(GetCurrentPadding(out _), "GetCurrentPadding");
+                    continue;
+                }
                 if (_stop) break;
                 Check(GetCurrentPadding(out uint padding), "GetCurrentPadding");
                 if (HasRun && padding == 0) Interlocked.Increment(ref _deviceStarved);

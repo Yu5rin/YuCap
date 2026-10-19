@@ -371,7 +371,7 @@ internal sealed partial class D3DRenderer : IDisposable
                 if (ex.HResult == WindowAlreadyComposed)
                 {
                     Log.Info("D3D: the window already has a DirectComposition target (DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED) — the host window must be recreated before attaching this renderer");
-                    throw new UserFacingException(L.T("このウィンドウは別の描画方式で使われています。映像ウィンドウを作り直す必要があります。"));
+                    throw new WindowAlreadyComposedException(L.T("このウィンドウは別の描画方式で使われています。映像ウィンドウを作り直す必要があります。"));
                 }
                 Log.Info($"D3D: DirectComposition binding failed ({ex.Message.Split('\n')[0]}, 0x{ex.HResult:X8}) — falling back to a window swap chain");
                 desc.AlphaMode = AlphaMode.Ignore;
@@ -1084,9 +1084,14 @@ internal sealed partial class D3DRenderer : IDisposable
     public void Resize(Size client)
     {
         if (_swap == null || client.Width <= 0 || client.Height <= 0) return;
-        Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
-        Ctx.ClearState();
-        Ctx.Flush();
+        // The capture thread uses the immediate context (dup-detection dispatch) under FrameLock; the context is
+        // not free-threaded, so ClearState/Flush must not interleave with it.
+        lock (FrameLock)
+        {
+            Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+            Ctx.ClearState();
+            Ctx.Flush();
+        }
         _swap.ResizeBuffers(0, (uint)client.Width, (uint)client.Height, Format.Unknown,
             _swapFlags).CheckError();
         _swapSize = client;
@@ -2013,6 +2018,82 @@ internal sealed partial class D3DRenderer : IDisposable
         }
     }
 
+    /// <summary>A real captured picture for a photo: the oriented frame, or while interpolating the nearer of the two real
+    /// frames of the pair (the in-between picture is synthesised and must not be saved as if the device had sent it).</summary>
+    public Bitmap? ReadOrientedNearest()
+    {
+        lock (FrameLock)
+        {
+            if (_interpHold && _oriA is { Seq: not 0 } a && a.Size == _orientedSize)
+            {
+                OriFrame pick = a;
+                if (_oriB is { Seq: not 0 } b && b.Size == a.Size && _curB == b.Seq && _lastAlpha >= 0.5) pick = b;
+                return ReadBack(pick.Tex, new Rectangle(Point.Empty, pick.Size));
+            }
+            return ReadOriented();
+        }
+    }
+
+    /// <summary>A staging copy of the picture to analyse, taken on the GPU; the CPU reads it later without holding any lock
+    /// or the render thread (see <see cref="AnalysisBegin"/>).</summary>
+    public sealed class AnalysisShot : IDisposable
+    {
+        internal ID3D11Texture2D? Staging;
+        internal ID3D11DeviceContext? Ctx;
+        internal bool Mapped;
+        public Size Size { get; }
+        public IntPtr Data { get; internal set; }
+        public int RowPitch { get; internal set; }
+        internal AnalysisShot(ID3D11Texture2D staging, ID3D11DeviceContext ctx, Size size) { Staging = staging; Ctx = ctx; Size = size; }
+        public void Dispose()
+        {
+            try { if (Mapped) Ctx?.Unmap(Staging, 0); } catch { }
+            Mapped = false;
+            Staging?.Dispose(); Staging = null;
+        }
+    }
+
+    /// <summary>Render thread: queue a GPU copy of the picture for judging its detail (the oriented frame, or while interpolating
+    /// the unmixed frame A) and return at once. Only the copy command runs under FrameLock.</summary>
+    public AnalysisShot? AnalysisBegin()
+    {
+        lock (FrameLock)
+        {
+            ID3D11Texture2D? src; Size size;
+            if (_interpHold && _oriA is { Seq: not 0 } a && a.Size == _orientedSize) { src = a.Tex; size = a.Size; }
+            else if (_oriented != null) { src = _oriented; size = _orientedSize; }
+            else return null;
+            if (size.Width <= 0 || size.Height <= 0) return null;
+            ID3D11Texture2D staging = Device.CreateTexture2D(new Texture2DDescription
+            {
+                Width = (uint)size.Width, Height = (uint)size.Height, MipLevels = 1, ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Staging, BindFlags = BindFlags.None,
+                CPUAccessFlags = CpuAccessFlags.Read,
+            });
+            Ctx.CopySubresourceRegion(staging, 0, 0, 0, 0, src, 0, new Box(0, 0, 0, size.Width, size.Height, 1));
+            Ctx.Flush();
+            return new AnalysisShot(staging, Ctx, size);
+        }
+    }
+
+    /// <summary>Any thread (the device is multithread-protected): map the staging copy if the GPU has finished it, without
+    /// waiting. False = not ready yet (ask again); throws on a real failure.</summary>
+    public bool AnalysisTryMap(AnalysisShot shot)
+    {
+        if (shot.Mapped) return true;
+        if (shot.Staging == null) return false;
+        Result hr = Ctx.Map(shot.Staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.DoNotWait, out MappedSubresource map);
+        if (hr.Failure)
+        {
+            if (hr == Vortice.DXGI.ResultCode.WasStillDrawing) return false;
+            hr.CheckError();
+            return false;
+        }
+        shot.Data = map.DataPointer; shot.RowPitch = (int)map.RowPitch; shot.Mapped = true;
+        return true;
+    }
+
     /// <summary>Test hook: make <paramref name="src"/> the oriented picture (replacing what the live pipeline left there; the
     /// caller pokes a re-convert afterwards) and render it at <paramref name="output"/>. Needs no capture and no swap chain.</summary>
     internal Bitmap? RenderFromBitmap(Bitmap src, Size output, ScalingQuality quality, float sharpness, int nativeH, int filter)
@@ -2244,7 +2325,7 @@ internal sealed partial class D3DRenderer : IDisposable
     /// safe choice there).</summary>
     public void DisposeAll(bool releaseDevice)
     {
-        try { Ctx?.ClearState(); Ctx?.Flush(); } catch { }
+        try { lock (FrameLock) { Ctx?.ClearState(); Ctx?.Flush(); } } catch { }
         Beat.Dispose();
         InterpFree();
         A4kFree();

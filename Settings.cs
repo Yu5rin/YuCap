@@ -144,6 +144,10 @@ public sealed class AppSettings
     /// <summary>Endpoint id of the audio output (speakers) to play the capture audio on; null = follow the Windows default.</summary>
     public string? AudioOutputDeviceId { get; set; }
     public string DeviceKeyword { get; set; } = "JVA14";
+    /// <summary>The video / audio capture device the user last picked from the menu (symbolic link / endpoint id).
+    /// Startup and hot-plug prefer it, then <see cref="DeviceKeyword"/>; null = never picked. Never some other device.</summary>
+    public string? VideoDeviceId { get; set; }
+    public string? AudioDeviceId { get; set; }
     public string Language { get; set; } = "ja";  // "ja" | "en"
 
     // Window placement.
@@ -204,6 +208,8 @@ public sealed class AppSettings
 
         CaptureLevelBefore = Math.Clamp(CaptureLevelBefore, -1, 100);
         if (string.IsNullOrWhiteSpace(AudioOutputDeviceId)) AudioOutputDeviceId = null;
+        if (string.IsNullOrWhiteSpace(VideoDeviceId)) VideoDeviceId = null;
+        if (string.IsNullOrWhiteSpace(AudioDeviceId)) AudioDeviceId = null;
         // Settings files from before the volume hotkeys have no such entries: the property initialisers
         // already gave them their defaults. Only a combo without a key (modifiers alone) is meaningless.
         if ((HotkeyVolumeUp & 0xFFFF) == 0) HotkeyVolumeUp = 0;
@@ -299,7 +305,7 @@ public static class SettingsStore
             {
                 // First run — not a failure.
                 LastLoadFailed = false;
-                return new AppSettings();
+                return Fresh();
             }
             AppSettings? loaded = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path));
             LastLoadFailed = false;
@@ -324,8 +330,17 @@ public static class SettingsStore
             {
                 Log.Info($"settings: load failed ({ex.Message}); could not preserve bad file — {moveEx.Message}");
             }
-            return new AppSettings();
+            return Fresh();
         }
+    }
+
+    /// <summary>Defaults, through <see cref="AppSettings.Normalize"/> like a loaded file (the first-run and
+    /// corrupt-file paths used to skip it, which left <c>AudioSettingsVersion</c> at 0 and re-ran the migration).</summary>
+    private static AppSettings Fresh()
+    {
+        var s = new AppSettings();
+        s.Normalize();
+        return s;
     }
 
     public static void Save(AppSettings settings)

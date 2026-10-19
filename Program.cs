@@ -45,38 +45,26 @@ internal static partial class Program
         Log.Init();
         if (args.Length > 0) Log.Info("args: " + string.Join(" ", args));
 
-        // The diagnostic and error paths below (--help, --check-update, the
-        // "already running" notice, the crash dialog) can show a MessageBox
-        // before MainForm ever runs, so the UI language must be loaded now —
-        // otherwise an English-configured user sees Japanese in those dialogs.
-        Settings = SettingsStore.Load();
-
-        // An earlier test mode that never finished (crash, power loss, killed process) left the user's
-        // real settings in test-in-progress.json: put them back before anything reads the settings.
-        AppSettings? recovered = TestModeGuard.TryRecover();
-        if (recovered != null)
-        {
-            recovered.Normalize();
-            Settings = recovered;
-            SettingsStore.Save(recovered);
-            TestModeGuard.Recovered = true;
-            Log.Info("test mode: restored the settings of an interrupted test");
-        }
-        L.English = Settings.Language == "en";
-
-        // A staged update that is already applied (version <= running), or that
-        // the user no longer wants (automatic updates switched off), is dropped.
-        if (Settings.StagedUpdateVersion != null
-            && (!TryGetStagedVersion(out Version? stagedAtStart) || stagedAtStart <= Updater.CurrentVersion
-                || !Settings.UpdateCheckOnStartup))
-        {
-            ClearStaged();
-        }
-
         // Crash log: keep evidence in %APPDATA%\YuCap\error.log even after the
         // dialog is dismissed.
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             LogCrash(e.ExceptionObject as Exception);
+
+        // The diagnostic one-shots below load the settings right away (they read device keywords and the like).
+        // A normal launch does NOT: a second instance must not load, repair or save the settings of the instance that is
+        // already running, so the single-instance check comes first and the settings are loaded only by the first instance.
+        bool diagnostic = args.Length > 0 && DiagnosticModes.Contains(args[0]);
+        if (diagnostic)
+        {
+            // These can show a MessageBox before MainForm runs, so the UI language must be loaded now -
+            // otherwise an English-configured user sees Japanese in those dialogs.
+            Settings = SettingsStore.Load();
+            L.English = Settings.Language == "en";
+        }
+        else
+        {
+            L.English = PeekLanguage() == "en";   // read-only: enough for the "already running" / --help messages
+        }
 
         // Diagnostic mode: dump the capture formats Media Foundation reports.
         if (args.Length > 0 && args[0] == "--list-formats")
@@ -330,7 +318,7 @@ internal static partial class Program
         }
 
         // Just replaced a running build: wait for it to exit before contending
-        // for the single-instance mutex, then clear away the displaced exe.
+        // for the single-instance mutex.
         int postUpdate = Array.IndexOf(args, Updater.PostUpdateArg);
         if (postUpdate >= 0 && postUpdate + 1 < args.Length
             && int.TryParse(args[postUpdate + 1], out int oldPid))
@@ -338,7 +326,6 @@ internal static partial class Program
             Log.Info($"update: started after update, waiting for pid {oldPid}");
             Updater.WaitForPreviousExit(oldPid);
         }
-        Updater.CleanupOld();
 
         if (args.Contains("--help") || args.Contains("-h") || args.Contains("/?"))
         {
@@ -387,6 +374,36 @@ internal static partial class Program
             return;
         }
 
+        // From here on this process is THE instance: it alone rotates the log, loads (and may repair) the settings,
+        // restores an interrupted test and cleans up after an update.
+        Log.RotateIfLarge();
+        Settings = SettingsStore.Load();
+
+        // An earlier test mode that never finished (crash, power loss, killed process) left the user's
+        // real settings in test-in-progress.json: put them back before anything reads the settings.
+        AppSettings? recovered = TestModeGuard.TryRecover();
+        if (recovered != null)
+        {
+            recovered.Normalize();
+            Settings = recovered;
+            SettingsStore.Save(recovered);
+            TestModeGuard.Recovered = true;
+            Log.Info("test mode: restored the settings of an interrupted test");
+        }
+        L.English = Settings.Language == "en";
+
+        // A staged update that is already applied (version <= running), or that
+        // the user no longer wants (automatic updates switched off), is dropped.
+        if (Settings.StagedUpdateVersion != null
+            && (!TryGetStagedVersion(out Version? stagedAtStart) || stagedAtStart <= Updater.CurrentVersion
+                || !Settings.UpdateCheckOnStartup))
+        {
+            ClearStaged();
+        }
+
+        // The displaced exe of an earlier update goes away once this build has run for a while.
+        Updater.CleanupOld();
+
         // Crash-recovery path: an update was staged but never applied on exit
         // (crash, forced kill, power loss). Apply it first and relaunch via the
         // --post-update handshake. Skipped for a --post-update launch so a
@@ -398,8 +415,11 @@ internal static partial class Program
             try
             {
                 Log.Info("update: applying staged update left over from the last run");
-                Updater.Apply(stagedPath, relaunch: true);
-                return;   // the mutex is released on return; the new build waits for our pid
+                ApplyResult applied = Updater.Apply(stagedPath, relaunch: true, expectedSha256: Settings.StagedUpdateSha256);
+                if (applied == ApplyResult.Relaunched)
+                    return;   // the mutex is released on return; the new build waits for our pid
+                // The new exe is in place but could not be started: carry on with this (old) build for this run.
+                Log.Info("update: staged build installed but not started - continuing with the running build");
             }
             catch (Exception ex)
             {
@@ -434,10 +454,34 @@ internal static partial class Program
         if (!Updater.AppliedThisSession && !Options.TestMode && Settings.UpdateCheckOnStartup
             && TryGetVerifiedStaged(out string exitStaged) && Updater.CanWriteToInstallDir())
         {
-            try { Updater.Apply(exitStaged, relaunch: false); }
+            try { Updater.Apply(exitStaged, relaunch: false, expectedSha256: Settings.StagedUpdateSha256); }
             catch (Exception ex) { Log.Info("update: apply on exit failed — " + ex.Message); }
         }
         Log.Info("==== exit ====");
+    }
+
+    /// <summary>The command-line one-shots (first argument) that run a check and exit instead of starting the viewer.</summary>
+    private static readonly HashSet<string> DiagnosticModes = new(StringComparer.Ordinal)
+    {
+        "--list-formats", "--dump-menus", "--check-update", "--selftest", "--restart-stress", "--gpu-bench",
+        "--live-triple-check", "--native-res-check", "--a4k-check", "--refresh-hz-check", "--res-estimate-check",
+        "--interp-synth", "--interp-capture", "--dup-probe", "--interp-seq-capture", "--interp-seq-eval", "--interp-eval",
+        "--interp-probe", "--vblank-probe", "--audio-probe", "--hdr-probe", "--render-test",
+    };
+
+    /// <summary>The saved UI language, read without side effects (SettingsStore.Load moves a corrupt file aside, which only
+    /// the running instance may do). "" when unknown.</summary>
+    private static string PeekLanguage()
+    {
+        try
+        {
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YuCap", "settings.json");
+            if (!File.Exists(path)) return string.Empty;
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            return doc.RootElement.TryGetProperty("Language", out var l) && l.ValueKind == System.Text.Json.JsonValueKind.String
+                ? l.GetString() ?? string.Empty : string.Empty;
+        }
+        catch { return string.Empty; }
     }
 
     private static bool TryGetStagedVersion(out Version? v)
@@ -497,14 +541,18 @@ internal static partial class Program
     internal static CaptureMode? ParseMode(string s)
     {
         s = s.Trim().ToLowerInvariant();
+        // TryParse, not Parse: "--mode 99999999999x1@1" is a typo, not a reason to crash at startup.
         var m = System.Text.RegularExpressions.Regex.Match(s, @"^(\d+)x(\d+)@(\d+)$");
         if (m.Success)
-            return new CaptureMode("", int.Parse(m.Groups[1].Value),
-                int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value));
+        {
+            return int.TryParse(m.Groups[1].Value, out int mw) && int.TryParse(m.Groups[2].Value, out int mh)
+                   && int.TryParse(m.Groups[3].Value, out int mf) && mw > 0 && mh > 0 && mf > 0
+                ? new CaptureMode("", mw, mh, mf) : null;
+        }
 
         m = System.Text.RegularExpressions.Regex.Match(s, @"^(\d+)(p|k)(\d+)$");
         if (!m.Success) return null;
-        int n = int.Parse(m.Groups[1].Value), fps = int.Parse(m.Groups[3].Value);
+        if (!int.TryParse(m.Groups[1].Value, out int n) || !int.TryParse(m.Groups[3].Value, out int fps) || fps <= 0) return null;
         (int w, int h) = (n, m.Groups[2].Value) switch
         {
             (480, "p") => (640, 480),

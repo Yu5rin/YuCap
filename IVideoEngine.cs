@@ -96,6 +96,8 @@ public interface IVideoEngine : IDisposable
     void Start(VideoDeviceInfo info, CaptureMode? mode = null);
     void Stop();
     bool IsRunning { get; }
+    /// <summary>The running session stopped by itself (device lost, present failure, stream end/error), not via <see cref="Stop"/>.</summary>
+    bool EndedUnexpectedly => false;
 
     // ---- what is being shown ---------------------------------------------
     string? CurrentDeviceName { get; }

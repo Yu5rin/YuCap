@@ -164,7 +164,15 @@ public sealed partial class MainForm
             if (result.Error != null)
             {
                 Log.Info("update check failed: " + result.Error);
-                if (manual)
+                if (manual && result.NewerVersion != null)
+                {
+                    // Not a network failure: a newer release exists but has no file that can be installed from here.
+                    if (MessageBox.Show(this, L.F("{0}\n\nリリースページを開きますか？", result.Error),
+                            "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes
+                        && result.PageUrl != null)
+                        OpenUrl(result.PageUrl);
+                }
+                else if (manual)
                 {
                     MessageBox.Show(this,
                         L.F("更新の確認に失敗しました。\nネットワーク接続を確認してください。\n\n{0}", result.Error),
@@ -301,7 +309,7 @@ public sealed partial class MainForm
 
         // Already downloaded and verified in the background: don't fetch again.
         string? staged = GetVerifiedStagedFile(info);
-        if (staged != null) ApplyAndClose(staged);
+        if (staged != null) ApplyAndClose(staged, info.Sha256);
         else DownloadAndApply(info);
     }
 
@@ -325,7 +333,7 @@ public sealed partial class MainForm
                     info.Version),
                 "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return;
-        ApplyAndClose(staged);
+        ApplyAndClose(staged, info.Sha256);
     }
 
     private enum UpdatePrompt { Now, Later, Skip }
@@ -420,26 +428,36 @@ public sealed partial class MainForm
         }
         if (file == null) return;   // cancelled
 
-        ApplyAndClose(file);
+        ApplyAndClose(file, info.Sha256);
     }
 
     /// <summary>Swap in <paramref name="file"/>, relaunch, and close this window.</summary>
-    private void ApplyAndClose(string file)
+    private void ApplyAndClose(string file, string? sha256 = null)
     {
         try
         {
-            // Save settings and release devices before the swap: the new process
-            // starts immediately and would otherwise fight over the capture card.
+            // Settings first (the new process reads them), but the video and audio keep running until the swap has
+            // really worked: the new process waits for this one to exit before it opens any device, so there is
+            // nothing to release early - and a failed swap must leave the user with a working picture.
             SaveSettings();
-            try { _video.Dispose(); } catch { /* ignore */ }
-            try { _audio.Dispose(); } catch { /* ignore */ }
 
-            Updater.Apply(file);      // rolls back internally if the swap fails
+            ApplyResult result = Updater.Apply(file, relaunch: true, expectedSha256: sha256);   // a failed swap rolls back and throws
+            if (result == ApplyResult.AppliedRelaunchFailed)
+            {
+                // The new build IS installed (it runs at the next launch) but could not be started from here: no rollback
+                // happened, so do not claim one. This window keeps running with its devices.
+                MessageBox.Show(this,
+                    L.F("更新ファイルの入れ替えは終わりましたが、新しい版を起動できませんでした。YuCap をいったん閉じて、もう一度起動してください。\n\n{0}",
+                        Updater.LastRelaunchError ?? "?"),
+                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             _skipSaveOnClose = true;  // settings already written above
-            Close();
+            Close();                  // OnFormClosing releases the devices
         }
         catch (Exception ex)
         {
+            // The swap failed and was rolled back: the running build is untouched and its video and audio were never stopped.
             Log.Info("update apply failed: " + ex.Message);
             MessageBox.Show(this,
                 L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", Errors.Describe(ex)),

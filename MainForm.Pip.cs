@@ -28,6 +28,7 @@ public sealed partial class MainForm
         _prePipFullscreen = _isFullscreen;
         if (_isFullscreen) ExitFullscreen(userAction: false);
 
+        _prePipWindowState = WindowState;
         _prePipBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         _prePipBorderless = _isBorderless;
         _prePipTopmost = _alwaysOnTop;
@@ -70,6 +71,7 @@ public sealed partial class MainForm
         _isPip = false;
         _pipHoverTimer.Stop();
         ApplyClickThrough(false);
+        SyncPipHotkey();
         try { Opacity = 1.0; } catch { }
         TopMost = _alwaysOnTop = _prePipTopmost;
         if (_isBorderless != _prePipBorderless)
@@ -85,12 +87,23 @@ public sealed partial class MainForm
         // applied, and raising MinimumSize afterwards would immediately clamp
         // the just-restored window back up rather than leaving it untouched.
         MinimumSize = NormalMinimumSize;
-        if (_prePipBounds.Width > 0) Bounds = _prePipBounds;
+        if (_prePipBounds.Width > 0)
+        {
+            _prePipBounds = EnsureOnScreen(_prePipBounds);   // the monitor it came from may be gone
+            Bounds = _prePipBounds;
+        }
         // Return to the mode the user was in before PiP (e.g. fullscreen).
         if (_prePipFullscreen)
         {
             _prePipFullscreen = false;
             EnterFullscreen(userAction: false);
+            // Leaving that fullscreen later must lead back to where the window was (maximized included).
+            _restoreWindowState = _prePipWindowState;
+            if (_prePipBounds.Width > 0) _restoreBounds = _prePipBounds;
+        }
+        else if (_prePipWindowState == FormWindowState.Maximized)
+        {
+            WindowState = FormWindowState.Maximized;
         }
         LayoutCanvas(ModeChangeSettleMs);
         UpdateChecks();
@@ -228,6 +241,7 @@ public sealed partial class MainForm
             _settings.PipClickThrough = false;
         }
         if (_isPip) ApplyClickThrough(_settings.PipClickThrough);
+        SyncPipHotkey();   // registered only while it is needed (global hotkeys on, or an active click-through PiP)
         UpdateChecks();
         // With the mouse passing through, the menus are unreachable — name the
         // key that gets the window back rather than leaving the user stuck.
@@ -269,8 +283,20 @@ public sealed partial class MainForm
                 if (_isPip) ApplyPipOpacity();
             }
             catch { }
-            if (!_settings.GlobalHotkeys) UnregisterHotKey(Handle, HkPip);
+            SyncPipHotkey();
         }
+    }
+
+    /// <summary>The PiP hotkey is the way back out of a click-through PiP, so it must be registered then even when the
+    /// global hotkeys are off - and it must not stay registered once that is no longer true.</summary>
+    private void SyncPipHotkey()
+    {
+        if (!IsHandleCreated || _settings.GlobalHotkeys) return;   // with global hotkeys on, RegisterGlobalHotkeys owns it
+        if (_isPip && _settings.PipClickThrough)
+        {
+            if (!EnsurePipHotkeyForClickThrough()) UnregisterHotKey(Handle, HkPip);
+        }
+        else UnregisterHotKey(Handle, HkPip);
     }
 
     // ---- Global hotkeys --------------------------------------------------
@@ -519,6 +545,7 @@ public sealed partial class MainForm
 
         SaveSettings();
         if (_settings.GlobalHotkeys) RegisterGlobalHotkeys(); // re-register + report conflicts now
+        else SyncPipHotkey();                                  // a click-through PiP needs its (possibly new) combo
         UpdateChecks();
     }
 
@@ -535,7 +562,7 @@ public sealed partial class MainForm
     {
         _settings.GlobalHotkeys = !_settings.GlobalHotkeys;
         if (_settings.GlobalHotkeys) RegisterGlobalHotkeys();
-        else UnregisterGlobalHotkeys();
+        else { UnregisterGlobalHotkeys(); SyncPipHotkey(); }
         UpdateChecks();
     }
 }

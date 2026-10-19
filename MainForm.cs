@@ -25,6 +25,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const int WmMouseWheel = 0x020A;
     private const int WmSizing = 0x0214;
     private const int WmDeviceChange = 0x0219;
+    private const int WmDisplayChange = 0x007E;
     private const int WmHotkey = 0x0312;
     private const int WmEnterSizeMove = 0x0231;
     private const int WmExitSizeMove = 0x0232;
@@ -82,6 +83,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly System.Windows.Forms.Timer _fpsTimer = new() { Interval = 250 };   // FPS だけ: ~4 updates a second
     private readonly System.Windows.Forms.Timer _devTimer = new(); // WM_DEVICECHANGE debounce
     private readonly System.Windows.Forms.Timer _resumeTimer = new(); // post-resume engine restart
+    private readonly System.Windows.Forms.Timer _displayTimer = new() { Interval = 700 }; // WM_DISPLAYCHANGE debounce
     // One-shot: fires almost immediately after the window is shown, so device
     // enumeration/Start() (each up to a 5s MF timeout) never delays the window
     // appearing in the first place. See OnLoad / the tick handler below.
@@ -190,6 +192,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     // Picture-in-picture.
     private bool _isPip;
     private Rectangle _prePipBounds;
+    private FormWindowState _prePipWindowState = FormWindowState.Normal;
     private bool _prePipBorderless, _prePipTopmost, _prePipMenu, _prePipStatus, _prePipFullscreen;
     private readonly System.Windows.Forms.Timer _pipHoverTimer = new(); // hover-opacity polling
     private bool _pipHovered;
@@ -257,6 +260,9 @@ public sealed partial class MainForm : Form, IMessageFilter
     private bool _cursorHidden;
     private int _restartAttempts;                 // capped so recovery can't loop
     private const int MaxRestartAttempts = 2;
+    private const int ResumeFirstMs = 2500;
+    private int _resumeTries;
+    private bool _resumeWantVideo, _resumeWantAudio;
 
     // The normal-mode minimum window size. MainForm.Pip.cs lowers MinimumSize
     // below this while entering PiP (small preset sizes would otherwise be
@@ -341,7 +347,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _osd.Click += (_, _) => OsdClick();
 
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); UpdateStatus(); CheckNativeResChange(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
         _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
@@ -349,6 +355,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _devTimer.Tick += (_, _) => { _devTimer.Stop(); OnDeviceChange(); };
 
         _burstTimer.Tick += (_, _) => BurstTick();
+        _displayTimer.Tick += (_, _) => { _displayTimer.Stop(); OnDisplaysChanged(); };
 
         _resizeGuard.Interval = 400;
         _resizeGuard.Tick += (_, _) => CheckResizeStuck();
@@ -373,15 +380,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         // After system resume the MF pipeline can be left wedged (COM calls then
         // block the UI thread — seen as a freeze on fullscreen toggle). Restart
         // both engines from scratch once devices have settled.
-        _resumeTimer.Interval = 2500;
-        _resumeTimer.Tick += (_, _) =>
-        {
-            _resumeTimer.Stop();
-            Log.Info("resume: restarting engines");
-            try { _video.Stop(); } catch { /* ignore */ }
-            try { _audio.Stop(); } catch { /* ignore */ }
-            OnDeviceChange(); // re-opens video + audio with the saved device/mode
-        };
+        // Devices often enumerate late after resume: if something is still not running, try again
+        // (3 tries over about 6 s: after 2.5 s, +1.5 s, +2 s) before leaving it to the normal recovery.
+        _resumeTimer.Interval = ResumeFirstMs;
+        _resumeTimer.Tick += (_, _) => OnResumeTick();
 
         // Interval 1: fires on the very next message-loop tick, i.e. after the
         // window has already been shown, rather than blocking OnLoad itself.
@@ -429,7 +431,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Graphics g = e.Graphics;
         g.Clear(Color.Black);
 
-        string main = _busyText ?? (_startingUp ? L.T("接続しています...") : L.T("映像が入力されていません"));
+        string main = _busyText ?? (_startingUp ? L.T("接続しています...") : (_recoveryMain ?? L.T("映像が入力されていません")));
         // RGB(200,200,200) on black is ~10.6:1 — the old Brushes.Gray (128,128,128)
         // was only ~4.5:1, borderline for a large-ish message like this.
         using var font = TextScale.MakeFont("Segoe UI", 14f * 96 / 72, _msgScale, FontStyle.Regular);
@@ -477,14 +479,14 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const int WmNcHitTest = 0x0084;
     private const int HtClient = 1, HtLeft = 10, HtRight = 11, HtTop = 12, HtTopLeft = 13,
         HtTopRight = 14, HtBottom = 15, HtBottomLeft = 16, HtBottomRight = 17;
-    private const int ResizeBorder = 6;
+    private const int ResizeBorder = 6;   // at 96 dpi; scaled with Dpi()
     private const uint SwpFrameChanged = 0x0020, SwpNoMove = 0x0002, SwpNoSize = 0x0001, SwpNoZOrder = 0x0004, SwpNoActivate = 0x0010;
 
     /// <summary>Resize hit code for a point near the client edges, else HTCLIENT.</summary>
-    internal static int EdgeHit(Point p, Size client)
+    internal static int EdgeHit(Point p, Size client, int border = ResizeBorder)
     {
-        bool l = p.X < ResizeBorder, r = p.X >= client.Width - ResizeBorder;
-        bool t = p.Y < ResizeBorder, b = p.Y >= client.Height - ResizeBorder;
+        bool l = p.X < border, r = p.X >= client.Width - border;
+        bool t = p.Y < border, b = p.Y >= client.Height - border;
         if (t && l) return HtTopLeft;
         if (t && r) return HtTopRight;
         if (b && l) return HtBottomLeft;
@@ -516,7 +518,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     // ---- Drag the window by the video area, with edge/window snapping ----
-    private const int SnapDistance = 14;
+    private int SnapDistance => Dpi(14);   // 14 px at 96 dpi
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
@@ -1263,11 +1265,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         void Row(ListViewGroup g, string action, string keys) =>
             lv.Items.Add(new ListViewItem(new[] { action, keys }) { Group = g });
 
-        Row(gHere, L.T("全画面表示の切替"), $"F11 ／ {L.T("ダブルクリック")}");
+        Row(gHere, L.T("全画面表示の切替"), $"F11{L.Or}{L.T("ダブルクリック")}");
         Row(gHere, L.T("全画面・PiP を終了"), "Esc");
         Row(gHere, L.T("一時停止 / 再開"), "Space");
-        Row(gHere, L.T("ミュート"), $"M ／ {L.T("中クリック")} ／ {L.T("音量表示をクリック")}");
-        Row(gHere, L.T("音量"), $"↑ ↓ ／ {L.T("ホイール")}");
+        Row(gHere, L.T("ミュート"), $"M{L.Or}{L.T("中クリック")}{L.Or}{L.T("音量表示をクリック")}");
+        Row(gHere, L.T("音量"), $"↑ ↓{L.Or}{L.T("ホイール")}");
         Row(gHere, L.T("ズーム"), $"Ctrl + {L.T("ホイール")}");
         Row(gHere, L.T("ズームをリセット"), "Ctrl+0");
         Row(gHere, L.T("ズーム中の表示位置"), L.T("ドラッグ"));
@@ -1432,11 +1434,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_settings.WindowW is int ww && _settings.WindowH is int hh && ww >= MinimumSize.Width && hh >= MinimumSize.Height)
         {
             var b = new Rectangle(_settings.WindowX ?? Location.X, _settings.WindowY ?? Location.Y, ww, hh);
-            if (IsMostlyOnScreen(b))
-            {
-                StartPosition = FormStartPosition.Manual;
-                Bounds = b;
-            }
+            // On a screen that is gone: same size on the primary screen rather than somewhere unreachable.
+            b = EnsureOnScreen(b);
+            StartPosition = FormStartPosition.Manual;
+            Bounds = b;
         }
 
         FormBorderStyle = FormBorderStyle.Sizable;
@@ -1459,6 +1460,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         return false;
     }
+
+    /// <summary><paramref name="b"/> when it is on a connected screen, else the same size (shrunk to fit if needed)
+    /// centred in the primary work area. Used wherever bounds remembered earlier are applied again: the monitor
+    /// they were on may have been unplugged or reconfigured since.</summary>
+    private static Rectangle EnsureOnScreen(Rectangle b)
+    {
+        if (b.Width > 0 && b.Height > 0 && IsMostlyOnScreen(b)) return b;
+        Rectangle wa = (Screen.PrimaryScreen ?? Screen.AllScreens[0]).WorkingArea;
+        int w = b.Width > 0 ? Math.Min(b.Width, wa.Width) : Math.Min(960, wa.Width);
+        int h = b.Height > 0 ? Math.Min(b.Height, wa.Height) : Math.Min(540, wa.Height);
+        return new Rectangle(wa.Left + (wa.Width - w) / 2, wa.Top + (wa.Height - h) / 2, w, h);
+    }
+
+    private int Dpi(int px96) => Math.Max(1, (int)Math.Round(px96 * DeviceDpi / 96.0));
 
     private void SaveSettings()
     {
@@ -1486,7 +1501,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         _settings.Pip = _isPip;
         _settings.SetMode(_savedMode);
 
-        _settings.WindowMaximized = !_isPip && WindowState == FormWindowState.Maximized;
+        // Fullscreen and PiP are temporary: persist the state they will return to (maximized included).
+        _settings.WindowMaximized = _isFullscreen ? _restoreWindowState == FormWindowState.Maximized
+            : _isPip ? _prePipWindowState == FormWindowState.Maximized
+            : WindowState == FormWindowState.Maximized;
         Rectangle b = _isFullscreen ? _restoreBounds
             : _isPip ? _prePipBounds
             : (WindowState == FormWindowState.Normal ? Bounds : RestoreBounds);
@@ -1519,6 +1537,8 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void RunDeviceStart(string deviceName, Action start)
     {
         _busyText = L.F("接続しています: {0}", deviceName);
+        NoteVideoStopped();   // a deliberate stop: the health check must not "recover" it behind our back
+        _devOpBusy++;
         try { _video.Stop(); } catch { /* best-effort: about to (re)start anyway */ }
         _canvas.Invalidate();
         _canvas.Update();
@@ -1528,11 +1548,23 @@ public sealed partial class MainForm : Form, IMessageFilter
             // Before the start too: the low-latency choice decides the swap chain kind when the
             // engine starts, so the engine must already know it. Idempotent and cheap.
             ApplyRenderOptions();
-            start();
+            try { start(); }
+            catch (Exception ex) when (IsWindowAlreadyComposed(ex))
+            {
+                // The window still carries the DirectComposition target of a previous session
+                // (DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED). A fresh window has none: same cure as RestartPreview.
+                Log.Info("start: window already composed - recreating the render window and trying once more");
+                try { _video.Stop(); } catch { /* ignore */ }
+                _canvas.ResetHandle();
+                _video.Attach(_canvas.Handle);
+                ApplyRenderOptions();
+                start();
+            }
             ApplyRenderOptions(); // every start path goes through here
         }
         finally
         {
+            _devOpBusy--;
             _busyText = null;
             Cursor = Cursors.Default;
             _canvas.Invalidate();
@@ -1544,16 +1576,22 @@ public sealed partial class MainForm : Form, IMessageFilter
         try
         {
             var devices = VideoEngine.EnumerateDevices();
-            var pick = VideoEngine.PickPreferred(devices, _settings.DeviceKeyword);
+            var pick = ChooseVideoDevice(devices, _settings.VideoDeviceId, _settings.DeviceKeyword);
             if (pick == null)
             {
-                Log.Info("InitVideo: no video device found");
+                // Nothing the user chose and nothing matching the keyword: never open "some other" device
+                // (a webcam, a virtual camera). Say so and wait for WM_DEVICECHANGE / the device menu.
+                Log.Info($"InitVideo: no capture device found ({devices.Count} other video device(s))");
+                SetNoCaptureDeviceState(devices.Count > 0);
+                if (devices.Count > 0)
+                    ShowOsd(L.T("キャプチャーボードが見つかりません。「デバイス」メニューから映像デバイスを選んでください"), OsdLongMilliseconds);
                 return;
             }
             LayoutCanvas();               // give the canvas a valid size before Start
             RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
             _currentVideoInfo = pick;
             _videoError = null;
+            _recoveryMain = null;
             LayoutCanvas();               // re-fit now that the resolution is known
         }
         catch (Exception ex)
@@ -1569,10 +1607,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         try
         {
             var devices = AudioEngine.EnumerateDevices();
-            var pick = AudioEngine.PickPreferred(devices, _settings.DeviceKeyword);
+            var pick = ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword);
             if (pick == null)
             {
-                Log.Info("InitAudio: no audio device found");
+                Log.Info("InitAudio: no capture audio device found (not opening an unrelated input)");
                 return;
             }
             _audio.Start(pick, _settings.AudioOutputDeviceId);
@@ -1594,6 +1632,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         if (IsDisposed || _testRunning) return;
         Log.Info($"OnDeviceChange: videoRunning={_video.IsRunning} audioRunning={_audio.IsRunning}");
+        ResetRecovery();   // a plug event is a new chance: the automatic retries may arm again
 
         try // ---- video ----
         {
@@ -1602,14 +1641,20 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (_video.IsRunning && _currentVideoInfo != null && !present)
             {
                 if (_frozen) ToggleFreeze();
+                NoteVideoStopped();
                 _video.Stop();
                 _canvas.Invalidate();
                 ShowOsd(L.T("映像デバイスが切断されました"), OsdLongMilliseconds);
             }
+            else if (_video.IsRunning && _video.EndedUnexpectedly)
+            {
+                NoteVideoStopped();
+                _video.Stop();   // dead already: the branch below reopens it
+            }
             if (!_video.IsRunning)
             {
                 var pick = (present ? _currentVideoInfo : null)
-                    ?? VideoEngine.PickPreferred(devices, _settings.DeviceKeyword);
+                    ?? ChooseVideoDevice(devices, _settings.VideoDeviceId, _settings.DeviceKeyword);
                 if (pick != null)
                 {
                     try
@@ -1617,10 +1662,15 @@ public sealed partial class MainForm : Form, IMessageFilter
                         RunDeviceStart(pick.Name, () => _video.Start(pick, _cliMode ?? _savedMode));
                         _currentVideoInfo = pick;
                         _videoError = null;
+                        _recoveryMain = null;
                         LayoutCanvas();
                         Log.Info($"video reconnected: {pick.Name}");
                     }
-                    catch { /* device still settling — the next change event retries */ }
+                    catch (Exception ex) { Log.Info("video reconnect (device change) failed: " + ex.Message); /* device still settling — the next change event retries */ }
+                }
+                else if (_currentVideoInfo == null || !present)
+                {
+                    SetNoCaptureDeviceState(devices.Count > 0);
                 }
             }
         }
@@ -1639,12 +1689,13 @@ public sealed partial class MainForm : Form, IMessageFilter
                 (_audio.IsFaulted || _audio.DefaultRenderChanged() || outVanished || outReturned ||
                  (_currentAudioInfo != null && !present)))
             {
+                NoteAudioStopped();
                 _audio.Stop();
             }
             if (!_audio.IsRunning)
             {
                 var pick = (present ? _currentAudioInfo : null)
-                    ?? AudioEngine.PickPreferred(devices, _settings.DeviceKeyword);
+                    ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword);
                 if (pick != null)
                 {
                     try
@@ -1658,7 +1709,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                         else
                             Log.Info($"audio reconnected: {pick.Name}");
                     }
-                    catch { /* retried on the next change event */ }
+                    catch (Exception ex) { Log.Info("audio reconnect (device change) failed: " + ex.Message); /* retried on the next change event */ }
                 }
             }
         }
@@ -1668,16 +1719,89 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateChecks();
     }
 
+    /// <summary>Post-resume restart: the first pass restarts both engines from scratch (a wedged Media Foundation
+    /// pipeline is common after sleep); later passes only retry what still is not running.</summary>
+    private void OnResumeTick()
+    {
+        _resumeTimer.Stop();
+        if (IsDisposed) return;
+        _resumeTries++;
+        Log.Info($"resume: restarting engines (try {_resumeTries})");
+        if (_resumeTries == 1)
+        {
+            NoteVideoStopped(); NoteAudioStopped();
+            try { _video.Stop(); } catch { /* ignore */ }
+            try { _audio.Stop(); } catch { /* ignore */ }
+        }
+        if (!_testRunning) OnDeviceChange();   // re-opens video + audio with the saved device/mode
+
+        bool missing = (_resumeWantVideo && !_video.IsRunning) || (_resumeWantAudio && !_audio.IsRunning);
+        if (missing && _resumeTries < 3 && !_testRunning)
+        {
+            _resumeTimer.Interval = _resumeTries == 1 ? 1500 : 2000;
+            _resumeTimer.Start();
+            return;
+        }
+        _resumeTimer.Interval = ResumeFirstMs;
+        _suspended = false;
+        // Whatever was running and is not any more is the normal recovery's job from here on.
+        if (_resumeWantVideo && !_video.IsRunning && _currentVideoInfo != null) _videoWasRunning = true;
+        if (_resumeWantAudio && !_audio.IsRunning && _currentAudioInfo != null) _audioWasRunning = true;
+        ResetRecovery();
+        UpdateStatus();
+    }
+
+    /// <summary>After the set of monitors changed: fullscreen goes back over its (possibly different) monitor, a PiP
+    /// that is no longer on a screen is docked again, and a normal window that ended up off-screen is brought back.</summary>
+    private void OnDisplaysChanged()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        Log.Info("displays changed: " + string.Join(", ", Screen.AllScreens.Select(s => $"{s.DeviceName} {s.Bounds}")));
+        try
+        {
+            if (_isFullscreen)
+            {
+                PlaceFullscreen();
+                _restoreBounds = EnsureOnScreen(_restoreBounds);
+            }
+            else if (_isPip)
+            {
+                if (!IsMostlyOnScreen(Bounds)) Location = PipCornerLocation();
+                _prePipBounds = EnsureOnScreen(_prePipBounds);
+                if (_prePipFullscreen) { /* the fullscreen it will return to is placed when it is entered */ }
+            }
+            else if (WindowState == FormWindowState.Normal && !IsMostlyOnScreen(Bounds))
+            {
+                Bounds = EnsureOnScreen(Bounds);
+            }
+        }
+        catch (Exception ex) { Log.Info("OnDisplaysChanged failed: " + ex.Message); }
+    }
+
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
         // An update has already saved settings; re-saving here would capture the
         // torn-down state (no device, window mid-close) over the real settings.
         if (_testRunning)
         {
-            // Closing mid-test: stop the test first (it restores the settings), then the window can close.
-            e.Cancel = true;
+            bool mustClose = e.CloseReason is CloseReason.WindowsShutDown or CloseReason.TaskManagerClosing
+                or CloseReason.ApplicationExitCall;
             _testCts?.Cancel();
-            return;
+            if (!mustClose)
+            {
+                // Closing mid-test (Alt+F4, X): stop the test first (it puts everything back), then the window
+                // closes by itself - one Alt+F4 is enough.
+                e.Cancel = true;
+                _closeAfterTest = true;
+                return;
+            }
+            // Windows is shutting down / the process is being ended: never hold that up. Put the settings back
+            // right now (the test's own restore needs the message loop, which may not run again) and go on closing.
+            try { if (_testSaved != null) CopySettings(_testSaved, _settings); }
+            catch (Exception ex) { Log.Info("closing during the test: restoring the settings failed - " + ex.Message); }
+            try { if (_audio.IsRunning && _audio.Muted != _testMutedBefore) _audio.Muted = _testMutedBefore; } catch { /* ignore */ }
+            _testRunning = false;
+            try { TestModeGuard.ClearMarker(); } catch { /* ignore */ }
         }
         if (!_skipSaveOnClose)
         {
@@ -1689,6 +1813,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _burstTimer.Stop();
         _pipHoverTimer.Stop();
         _resumeTimer.Stop();
+        _displayTimer.Stop();
         _resizeGuard.Stop();
         _cursorTimer.Stop();
         _settingsSaveTimer.Stop();
@@ -2203,7 +2328,10 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// wheel handling from hijacking those.
     /// </summary>
     private bool IsOwnWheelTarget(IntPtr hwnd) =>
-        hwnd == _canvas.Handle || hwnd == _freezeView.Handle || hwnd == _osd.Handle || hwnd == Handle;
+        hwnd == _canvas.Handle || hwnd == _freezeView.Handle || hwnd == _osd.Handle || hwnd == Handle
+        || (_info.IsHandleCreated && hwnd == _info.Handle);
+
+    private int _wheelAccum;
 
     private bool IsMenuDropdownOpen()
     {
@@ -2224,7 +2352,11 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         int wparam = (int)(m.WParam.ToInt64() & 0xFFFFFFFF);
         short delta = (short)((wparam >> 16) & 0xFFFF);
-        int steps = delta / 120;
+        // Touchpads and smooth-scroll wheels send many small deltas (< 120): collect them until a notch is full.
+        if (Math.Sign(delta) != Math.Sign(_wheelAccum)) _wheelAccum = 0;
+        _wheelAccum += delta;
+        int steps = _wheelAccum / 120;
+        _wheelAccum -= steps * 120;
         if (steps == 0) return true;
 
         if ((ModifierKeys & Keys.Control) != 0)
@@ -2291,10 +2423,26 @@ public sealed partial class MainForm : Form, IMessageFilter
                 "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return;
 
-        _settings.CaptureLevelBefore = before;
-        _settings.CaptureLevelDeviceId = _audio.CurrentDeviceId;
+        // A second "maximise" on the same device must not replace the remembered ORIGINAL level with
+        // an intermediate one (that would make "元に戻す" restore the wrong value).
+        bool keepOriginal = _settings.CaptureLevelBefore >= 0 && _settings.CaptureLevelDeviceId == _audio.CurrentDeviceId;
+        if (!keepOriginal)
+        {
+            _settings.CaptureLevelBefore = before;
+            _settings.CaptureLevelDeviceId = _audio.CurrentDeviceId;
+        }
         MarkSettingsDirty();
         _audio.CaptureLevelPercent = 100;
+        int after = _audio.CaptureLevelPercent;
+        if (after < 99)
+        {
+            // The setter swallows errors; read it back so a refused change is not announced as done.
+            if (!keepOriginal) { _settings.CaptureLevelBefore = -1; _settings.CaptureLevelDeviceId = null; }
+            ShowOsd(L.T("入力レベルを変更できませんでした"), OsdLongMilliseconds);
+            UpdateStatus();
+            UpdateChecks();
+            return;
+        }
         ShowOsd(L.F("入力レベル {0}% → 100%", before));
         UpdateStatus();
         UpdateChecks();
@@ -2308,8 +2456,18 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         if (_settings.CaptureLevelBefore < 0 || !_audio.IsRunning
             || _audio.CurrentDeviceId != _settings.CaptureLevelDeviceId) return;
-        _audio.CaptureLevelPercent = _settings.CaptureLevelBefore;
-        ShowOsd(L.F("入力レベルを {0}% に戻しました", _settings.CaptureLevelBefore));
+        int want = _settings.CaptureLevelBefore;
+        _audio.CaptureLevelPercent = want;
+        int got = _audio.CaptureLevelPercent;
+        if (got < 0 || Math.Abs(got - want) > 2)
+        {
+            // Not restored (the setter swallows errors): keep the remembered value so it can be tried again.
+            ShowOsd(L.T("入力レベルを元に戻せませんでした"), OsdLongMilliseconds);
+            UpdateStatus();
+            UpdateChecks();
+            return;
+        }
+        ShowOsd(L.F("入力レベルを {0}% に戻しました", want));
         _settings.CaptureLevelBefore = -1;
         _settings.CaptureLevelDeviceId = null;
         MarkSettingsDirty();
@@ -2319,6 +2477,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleMute()
     {
+        if (_testRunning) return;   // the test measures the audio as it is; the mute state is put back afterwards anyway
         if (!_audio.IsRunning) { ShowOsd(L.T("音声がありません")); return; }
         if (_frozen)
         {
@@ -2525,19 +2684,22 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         string keyword = string.IsNullOrWhiteSpace(txt.Text) ? "JVA14" : txt.Text.Trim();
+        bool keywordChanged = !string.Equals(_settings.DeviceKeyword, keyword, StringComparison.Ordinal);
         _settings.DeviceKeyword = keyword;
+        // A new keyword is a new choice of device: the id picked earlier must not outrank it.
+        if (keywordChanged) { _settings.VideoDeviceId = null; _settings.AudioDeviceId = null; }
         SaveSettings();
 
         // Applying the new keyword right away (rather than only on the next
         // device/app start) matches what the dialog implies it just did.
-        var videoMatch = VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), keyword);
+        var videoMatch = ChooseVideoDevice(VideoEngine.EnumerateDevices(), null, keyword);   // keyword only; no "first device" fallback
         bool switched = false;
         if (videoMatch != null && videoMatch.Id != _currentVideoInfo?.Id)
         {
             SwitchVideoDevice(videoMatch);
             switched = true;
         }
-        var audioMatch = AudioEngine.PickPreferred(AudioEngine.EnumerateDevices(), keyword);
+        var audioMatch = ChooseAudioDevice(AudioEngine.EnumerateDevices(), null, keyword);
         if (audioMatch != null && audioMatch.Id != _currentAudioInfo?.Id)
         {
             SwitchAudioDevice(audioMatch);
@@ -3065,7 +3227,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (d.Width <= 0 || d.Height <= 0) return null;
         int h = EffectiveDetailHeight(out bool est);
         string detail = est ? L.F("{0}p 相当", h) : $"{h}p";
-        string text = $"{detail} → {d.Width}x{d.Height}（{ScalerName()}）";
+        string text = $"{detail} → {d.Width}x{d.Height}{L.Par(ScalerName())}";
         tip = L.F("拡大: 元の絵の細かさ {0} から、画面に出す大きさ {1}x{2} へ（{3}）。キャプチャの大きさは {4}x{5} です。",
             detail, d.Width, d.Height, ScalerName(), res.Width, res.Height);
         return text;
@@ -3143,6 +3305,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         try
         {
+            NoteVideoStopped();
             try { _video.Stop(); } catch { /* going away anyway */ }
             try { _video.Dispose(); } catch { /* going away anyway */ }
             _canvas.ResetHandle();
@@ -3166,6 +3329,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     private void SwitchRenderer(string renderer)
+    {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { SwitchRendererCore(renderer); }
+        finally { _devOpBusy--; }
+    }
+
+    private void SwitchRendererCore(string renderer)
     {
         if (renderer == _settings.Renderer) { UpdateChecks(); return; }
         string previous = _settings.Renderer;
@@ -3236,6 +3406,17 @@ public sealed partial class MainForm : Form, IMessageFilter
         SetOuterForClient(new Size(videoW, videoH + chrome));
     }
 
+    /// <summary>Window size minus client size under the current frame style (zero when borderless: the client
+    /// fills the whole window, see WM_NCCALCSIZE).</summary>
+    private Size NonClientSize()
+    {
+        if (_isBorderless || !IsHandleCreated) return Size.Empty;
+        var rc = new Rect { Left = 0, Top = 0, Right = 100, Bottom = 100 };
+        AdjustWindowRectExForDpi(ref rc, GetWindowLong(Handle, GwlStyle), false,
+            GetWindowLong(Handle, GwlExStyle), GetDpiForWindow(Handle));
+        return new Size(Math.Max(0, rc.Right - rc.Left - 100), Math.Max(0, rc.Bottom - rc.Top - 100));
+    }
+
     private int ChromeHeight() =>
         (_menu.Visible ? _menu.Height : 0) + (_status.Visible ? _status.Height : 0);
 
@@ -3262,8 +3443,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         // the video's aspect ratio, and say so when that changed the request.
         int chrome = ChromeHeight();
         Rectangle wa = Screen.FromControl(this).WorkingArea;
-        int maxClientW = wa.Width;
-        int maxClientH = Math.Max(1, wa.Height - chrome);
+        Size nc = NonClientSize();   // title bar and borders count against the work area too
+        int maxClientW = Math.Max(1, wa.Width - nc.Width);
+        int maxClientH = Math.Max(1, wa.Height - chrome - nc.Height);
         bool clamped = false;
         if (videoW > maxClientW || videoH > maxClientH)
         {
@@ -3307,8 +3489,9 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         Log.Info("EnterFullscreen: begin");
         if (userAction) _fullscreenOverridden = false;
-        // PiP's opacity/topmost/small-window state must not leak into fullscreen.
-        if (_isPip) ExitPip();
+        // PiP's opacity/topmost/small-window state must not leak into fullscreen. We are going fullscreen
+        // now, so ExitPip must not "return to fullscreen" itself (it would re-enter this method).
+        if (_isPip) { _prePipFullscreen = false; ExitPip(); }
         // The second click of the fullscreen double-click also started a drag;
         // cancel it so mouse movement can't drag the fullscreen window around.
         _dragging = false;
@@ -3343,6 +3526,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _menu.Visible = _savedMenuVisible;
         _status.Visible = _savedStatusVisible;
         FormBorderStyle = FormBorderStyle.Sizable;
+        _restoreBounds = EnsureOnScreen(_restoreBounds);   // the screen it came from may be gone
         Bounds = _restoreBounds;
         if (Bounds != _restoreBounds) Bounds = _restoreBounds;   // may have crossed a DPI boundary
         WindowState = _restoreWindowState;
@@ -3415,7 +3599,10 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         _topmostOverridden = false; // the user is now choosing this themselves
         _alwaysOnTop = !_alwaysOnTop;
-        if (!_isFullscreen)
+        // In PiP the window is topmost whatever the setting says; the choice made now belongs to the
+        // state PiP will return to (ExitPip restores _prePipTopmost), otherwise it would be lost on exit.
+        if (_isPip) _prePipTopmost = _alwaysOnTop;
+        if (!_isFullscreen && !_isPip)
             TopMost = _alwaysOnTop;
         UpdateChecks();
     }
@@ -3535,6 +3722,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// the A/V delay live in the engine / settings and carry over to the restarted stream.</summary>
     private void SwitchAudioOutput(string? id, string? name)
     {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { SwitchAudioOutputCore(id, name); }
+        finally { _devOpBusy--; }
+    }
+
+    private void SwitchAudioOutputCore(string? id, string? name)
+    {
         string? previous = _settings.AudioOutputDeviceId;
         _settings.AudioOutputDeviceId = id;
         if (_audio.IsRunning && _currentAudioInfo != null)
@@ -3558,12 +3752,23 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void SwitchVideoDevice(VideoDeviceInfo info)
     {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { SwitchVideoDeviceCore(info); }
+        finally { _devOpBusy--; }
+    }
+
+    private void SwitchVideoDeviceCore(VideoDeviceInfo info)
+    {
         if (_frozen) ToggleFreeze();
         try
         {
             RunDeviceStart(info.Name, () => _video.Start(info, _savedMode));
             _currentVideoInfo = info;
             _videoError = null;
+            _recoveryMain = null;
+            ResetRecovery();
+            _settings.VideoDeviceId = info.Id;   // the user's own choice: startup and hot-plug prefer it from now on
+            MarkSettingsDirty();
             LayoutCanvas();
             ShowOsd(L.F("映像: {0}", info.Name));
         }
@@ -3642,11 +3847,18 @@ public sealed partial class MainForm : Form, IMessageFilter
         };
         bool hasComp = !string.IsNullOrEmpty(m.Compression);
         if (name != null)
-            return hasComp ? $"{name}（{m.Width}x{m.Height} {m.Compression}）" : $"{name}（{m.Width}x{m.Height}）";
-        return hasComp ? $"{m.Width}x{m.Height} {m.Fps}fps（{m.Compression}）" : $"{m.Width}x{m.Height} {m.Fps}fps";
+            return hasComp ? $"{name}{L.Par($"{m.Width}x{m.Height} {m.Compression}")}" : $"{name}{L.Par($"{m.Width}x{m.Height}")}";
+        return hasComp ? $"{m.Width}x{m.Height} {m.Fps}fps{L.Par(m.Compression)}" : $"{m.Width}x{m.Height} {m.Fps}fps";
     }
 
     private void ApplyVideoMode(CaptureMode mode)
+    {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { ApplyVideoModeCore(mode); }
+        finally { _devOpBusy--; }
+    }
+
+    private void ApplyVideoModeCore(CaptureMode mode)
     {
         if (_currentVideoInfo == null)
         {
@@ -3675,6 +3887,13 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ClearModePreference()
     {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { ClearModePreferenceCore(); }
+        finally { _devOpBusy--; }
+    }
+
+    private void ClearModePreferenceCore()
+    {
         _savedMode = null;
         _cliMode = null;
         SaveSettings();
@@ -3698,16 +3917,34 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void SwitchAudioDevice(AudioDeviceInfo info)
     {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { SwitchAudioDeviceCore(info); }
+        finally { _devOpBusy--; }
+    }
+
+    private void SwitchAudioDeviceCore(AudioDeviceInfo info)
+    {
+        AudioDeviceInfo? previous = _currentAudioInfo;
+        bool wasRunning = _audio.IsRunning;
         try
         {
             _audio.Start(info, _settings.AudioOutputDeviceId);
             _currentAudioInfo = info;
+            ResetRecovery();
+            _settings.AudioDeviceId = info.Id;   // the user's own choice: startup and hot-plug prefer it from now on
+            MarkSettingsDirty();
             ShowOsd(L.F("音声: {0}", info.Name));
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, L.F("音声デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            // Start() leaves the engine stopped on failure: bring the previous device back, like SwitchAudioOutput.
+            if (wasRunning && previous != null)
+            {
+                try { _audio.Start(previous, _settings.AudioOutputDeviceId); _currentAudioInfo = previous; }
+                catch (Exception back) { Log.Info("audio: could not restore the previous device - " + back.Message); }
+            }
         }
         UpdateStatus();
     }
@@ -3715,6 +3952,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     // ---- Audio buffer settings ------------------------------------------
 
     private void ShowAudioBufferSettings()
+    {
+        _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
+        try { ShowAudioBufferSettingsCore(); }
+        finally { _devOpBusy--; }
+    }
+
+    private void ShowAudioBufferSettingsCore()
     {
         using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 360, 250);
 
@@ -3747,6 +3991,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
+        int oldBuffer = _audio.BufferMilliseconds;
         _audio.BufferMilliseconds = (int)num.Value;
         if (_audio.IsRunning && _currentAudioInfo != null)
         {
@@ -3755,6 +4000,10 @@ public sealed partial class MainForm : Form, IMessageFilter
             {
                 MessageBox.Show(this, L.F("音声の再初期化に失敗しました。\n\n{0}", Errors.Describe(ex)),
                     "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // Back to the setting that worked, and bring the sound back with it.
+                _audio.BufferMilliseconds = oldBuffer;
+                try { _audio.Start(_currentAudioInfo, _settings.AudioOutputDeviceId); }
+                catch (Exception back) { Log.Info("audio: could not restore the previous buffer - " + back.Message); }
             }
         }
 
@@ -3775,6 +4024,13 @@ public sealed partial class MainForm : Form, IMessageFilter
             return;
         }
 
+        // Monitors added / removed / re-arranged / resolution changed: put fullscreen, PiP and off-screen windows right.
+        if (m.Msg == WmDisplayChange)
+        {
+            _displayTimer.Stop();
+            _displayTimer.Start();
+        }
+
         // Hot-plug: debounce the burst of WM_DEVICECHANGE messages, then rescan.
         if (m.Msg == WmDeviceChange)
         {
@@ -3790,13 +4046,25 @@ public sealed partial class MainForm : Form, IMessageFilter
             Log.Info($"power broadcast 0x{evt:X}");
             if (evt == PbtApmSuspend)
             {
+                _resumeWantVideo = _video.IsRunning || _videoWasRunning;
+                _resumeWantAudio = _audio.IsRunning || _audioWasRunning;
+                _suspended = true;
+                NoteVideoStopped(); NoteAudioStopped();
                 try { _video.Stop(); } catch { /* ignore */ }
                 try { _audio.Stop(); } catch { /* ignore */ }
                 _canvas.Invalidate();
             }
             else if (evt is PbtApmResumeSuspend or PbtApmResumeAutomatic)
             {
+                if (!_suspended)
+                {
+                    _resumeWantVideo = _video.IsRunning || _videoWasRunning;
+                    _resumeWantAudio = _audio.IsRunning || _audioWasRunning;
+                    _suspended = true;
+                }
                 _resumeTimer.Stop();
+                _resumeTries = 0;
+                _resumeTimer.Interval = ResumeFirstMs;
                 _resumeTimer.Start();
             }
         }
@@ -3854,7 +4122,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             {
                 int lp = (int)(long)m.LParam;
                 Point p = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
-                m.Result = (IntPtr)EdgeHit(p, ClientSize);
+                m.Result = (IntPtr)EdgeHit(p, ClientSize, Dpi(ResizeBorder));
             }
             return;
         }
@@ -4001,6 +4269,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         var stateParts = new List<string>();
         if (_settings.ActiveProfile is { } activeProfile)
             stateParts.Add(ActiveProfileModified() ? L.F("{0}（変更あり）", activeProfile) : activeProfile);
+        if (_vGaveUp) stateParts.Add(L.T("映像が停止中"));
+        else if (_vRecovering) stateParts.Add(L.T("映像をつなぎ直し中"));
+        if (_aGaveUp) stateParts.Add(L.T("音声が停止中"));
+        else if (_aRecovering) stateParts.Add(L.T("音声をつなぎ直し中"));
         if (_frozen) stateParts.Add(L.T("一時停止中"));
         if (_isPip) stateParts.Add(L.T("PiP"));
         if (_burstTimer.Enabled) stateParts.Add(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
@@ -4070,8 +4342,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cmiPip.Checked = _isPip;
         // The displayed shortcut must track the user's actual binding — it can
         // be changed in ホットキー設定, and a stale "Ctrl+Alt+P" would lie.
-        _miPip.ShortcutKeyDisplayString = FormatHotkey((Keys)_settings.HotkeyPip);
-        _cmiPip.ShortcutKeyDisplayString = FormatHotkey((Keys)_settings.HotkeyPip);
+        _miPip.ShortcutKeyDisplayString = HotkeyMenuText((Keys)_settings.HotkeyPip);
+        _cmiPip.ShortcutKeyDisplayString = HotkeyMenuText((Keys)_settings.HotkeyPip);
         _miClickThrough.Checked = _settings.PipClickThrough;
         _miHotkeys.Checked = _settings.GlobalHotkeys;
         _miCursorHide.Checked = _settings.CursorAutoHide;

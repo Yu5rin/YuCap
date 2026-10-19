@@ -156,6 +156,8 @@ internal sealed class CaptureEventCallback : IMFCaptureEngineOnEventCallback
     public readonly ManualResetEventSlim PhotoTaken = new(false);
     public volatile int LastHr;
     public volatile int LastPhotoHr;
+    /// <summary>The capture engine reported MF_CAPTURE_ENGINE_ERROR (device lost, stream failure): the preview is over.</summary>
+    public volatile bool EngineError;
 
     public int OnEvent(IntPtr mediaEvent)
     {
@@ -176,6 +178,7 @@ internal sealed class CaptureEventCallback : IMFCaptureEngineOnEventCallback
             }
             else if (ext == Mf.EventError)
             {
+                EngineError = true;
                 if (LastHr == 0) LastHr = -1;
                 Initialized.Set();
                 PreviewStarted.Set();

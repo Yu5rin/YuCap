@@ -23,8 +23,21 @@ internal sealed record UpdateInfo(
 
 /// <summary>Outcome of an update check. Info != null means a newer release
 /// exists; Error != null means the check could not be completed; both null
-/// means the running build is current.</summary>
-internal sealed record UpdateCheckResult(UpdateInfo? Info, string? Error);
+/// means the running build is current. When <see cref="NewerVersion"/> is set (Error is then also set, with a readable
+/// sentence) a newer release exists but it carries no usable exe, so the user must get it from <see cref="PageUrl"/>.</summary>
+internal sealed record UpdateCheckResult(UpdateInfo? Info, string? Error, Version? NewerVersion = null, string? PageUrl = null);
+
+/// <summary>What <see cref="Updater.Apply"/> did. A failed swap throws instead (after rolling back).</summary>
+internal enum ApplyResult
+{
+    /// <summary>The new exe is in place and was started (relaunch requested): the caller exits.</summary>
+    Relaunched,
+    /// <summary>The new exe is in place; no relaunch was requested.</summary>
+    AppliedNoRelaunch,
+    /// <summary>The new exe is in place but starting it failed: the update IS installed (it runs at the next launch), so the
+    /// caller must not report a rollback. <see cref="Updater.LastRelaunchError"/> has the reason.</summary>
+    AppliedRelaunchFailed,
+}
 
 /// <summary>
 /// Checks GitHub Releases for a newer build, downloads it, and replaces the
@@ -133,10 +146,10 @@ internal static class Updater
             string body = root.TryGetProperty("body", out JsonElement b) ? b.GetString() ?? "" : "";
 
             // Pick the .exe asset.
-            if (!root.TryGetProperty("assets", out JsonElement assets))
+            if (!root.TryGetProperty("assets", out JsonElement assets) || assets.ValueKind != JsonValueKind.Array)
             {
                 Log.Info("update: release has no assets array");
-                return new UpdateCheckResult(null, null);
+                return NewerWithoutFile(latest, page);
             }
             foreach (JsonElement a in assets.EnumerateArray())
             {
@@ -174,16 +187,21 @@ internal static class Updater
                 Log.Info($"update: {CurrentVersion} → {latest} ({name}, {size} bytes, sha256={(sha == null ? "none" : "yes")})");
                 return new UpdateCheckResult(new UpdateInfo(latest, tag, url, name, size, sha, page), null);
             }
-            // No usable .exe asset — not something the user can act on, just log it.
             Log.Info("update: no usable .exe asset found on latest release");
-            return new UpdateCheckResult(null, null);
+            return NewerWithoutFile(latest, page);
         }
         catch (Exception ex)
         {
-            Log.Info("update check failed: " + ex.Message);
-            return new UpdateCheckResult(null, ex.Message);
+            Log.Info($"update check failed: {ex.GetType().Name} {ex.Message}");
+            return new UpdateCheckResult(null, Errors.Describe(ex));
         }
     }
+
+    /// <summary>A newer release exists but has no exe we can install (not published yet, or the files are not trusted):
+    /// say so instead of "up to date".</summary>
+    private static UpdateCheckResult NewerWithoutFile(Version latest, string page) =>
+        new(null, L.F("新しいバージョン {0} がありますが、自動で更新できるファイルが見つかりません。リリースページから入手してください。", latest),
+            latest, string.IsNullOrEmpty(page) ? null : page);
 
     private static bool TryParseTag(string tag, out Version? version)
     {
@@ -257,7 +275,16 @@ internal static class Updater
     /// <summary>Download the asset and verify it (when a hash is published).
     /// Throws on failure.</summary>
     public static Task<string> DownloadAsync(UpdateInfo info, IProgress<int>? progress,
-        CancellationToken ct = default) => DownloadCoreAsync(info, progress, ct);
+        CancellationToken ct = default)
+    {
+        // The downloaded exe replaces the running program: without a published hash nothing proves it is the release.
+        if (info.Sha256 == null)
+        {
+            Log.Info("update: refusing to install a download without a published SHA256");
+            throw new UserFacingException(L.T("このリリースには検証用のハッシュ（SHA256）がないため、アプリ内では更新できません。リリースページから手動で更新してください。"));
+        }
+        return DownloadCoreAsync(info, progress, ct);
+    }
 
     private static async Task<string> DownloadCoreAsync(UpdateInfo info, IProgress<int>? progress,
         CancellationToken ct)
@@ -293,21 +320,14 @@ internal static class Updater
             throw;
         }
 
-        if (info.Sha256 != null)
+        string actual = ComputeSha256(path);
+        if (info.Sha256 == null || !actual.Equals(info.Sha256, StringComparison.OrdinalIgnoreCase))
         {
-            string actual = ComputeSha256(path);
-            if (!actual.Equals(info.Sha256, StringComparison.OrdinalIgnoreCase))
-            {
-                DiscardStaging();
-                Log.Info($"update: SHA256 mismatch (expected {info.Sha256}, got {actual})");
-                throw new UserFacingException(L.T("ダウンロードしたファイルの検証に失敗しました。"));
-            }
-            Log.Info("update: SHA256 verified");
+            DiscardStaging();
+            Log.Info($"update: SHA256 mismatch (expected {info.Sha256}, got {actual})");
+            throw new UserFacingException(L.T("ダウンロードしたファイルの検証に失敗しました。"));
         }
-        else
-        {
-            Log.Info("update: no SHA256 published — skipping hash verification");
-        }
+        Log.Info("update: SHA256 verified");
         return path;
     }
 
@@ -343,17 +363,58 @@ internal static class Updater
     /// path does not try to apply again.</summary>
     public static bool AppliedThisSession { get; private set; }
 
+    /// <summary>Why the last <see cref="Apply"/> could not start the new build (<see cref="ApplyResult.AppliedRelaunchFailed"/>).</summary>
+    public static string? LastRelaunchError { get; private set; }
+
+    /// <summary>Run <paramref name="action"/>, trying again a few times: antivirus and the search indexer often hold a freshly
+    /// written exe for a moment.</summary>
+    private static void Retry(string what, Action action, int tries = 5, int delayMs = 300)
+    {
+        for (int i = 1; ; i++)
+        {
+            try { action(); return; }
+            catch (Exception ex) when (i < tries && ex is IOException or UnauthorizedAccessException)
+            {
+                Log.Info($"update: {what} failed ({ex.Message.Split('\n')[0]}) - retry {i}/{tries - 1}");
+                Thread.Sleep(delayMs);
+            }
+        }
+    }
+
     /// <summary>
     /// Swap in the downloaded build. With <paramref name="relaunch"/> the new
     /// build is started and the caller is expected to exit; without it the
     /// swap is done silently (the exit-time apply) and nothing is started.
-    /// Rolls back and throws if the swap fails.
+    ///
+    /// Order, so that a failure at any point leaves a working install: (1) copy the new exe next to the current one as
+    /// YuCap.exe.new and verify its SHA256 (<paramref name="expectedSha256"/>, else the source file's own); (2) rename current
+    /// to .old; (3) rename .new to current - two renames, each atomic on one volume. If (3) fails, .old is moved back over
+    /// the current name. A failed swap throws (after rolling back); a swap that worked but whose relaunch failed is
+    /// reported as <see cref="ApplyResult.AppliedRelaunchFailed"/>, not as an exception.
     /// </summary>
-    public static void Apply(string downloadedExe, bool relaunch = true)
+    public static ApplyResult Apply(string downloadedExe, bool relaunch = true, string? expectedSha256 = null)
     {
         string? cur = ExePath;
         if (cur == null) throw new UserFacingException(L.T("実行ファイルの場所を特定できません。"));
-        string old = cur + OldSuffix;
+        string old = cur + OldSuffix, fresh = cur + ".new";
+
+        // (1) stage next to the target and verify the copy
+        try
+        {
+            Retry("copy", () => File.Copy(downloadedExe, fresh, overwrite: true));
+            string want = expectedSha256 ?? ComputeSha256(downloadedExe);
+            string got = ComputeSha256(fresh);
+            if (!got.Equals(want, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Info($"update: copy verification failed (expected {want}, got {got})");
+                throw new UserFacingException(L.T("ダウンロードしたファイルの検証に失敗しました。"));
+            }
+        }
+        catch
+        {
+            try { File.Delete(fresh); } catch { /* ignore */ }
+            throw;
+        }
 
         // A leftover from a previous update would block the rename.
         if (File.Exists(old))
@@ -362,36 +423,51 @@ internal static class Updater
             catch (Exception ex) { Log.Info("update: cannot remove previous .old — " + ex.Message); }
         }
 
+        // (2) + (3)
         Log.Info("update: renaming current exe aside");
-        File.Move(cur, old);            // permitted even though the file is running
+        try { Retry("rename aside", () => File.Move(cur, old, overwrite: true)); }
+        catch { try { File.Delete(fresh); } catch { /* ignore */ } throw; }   // nothing changed yet
         try
         {
-            File.Copy(downloadedExe, cur);
+            Retry("rename into place", () => File.Move(fresh, cur));
             Log.Info("update: new exe in place");
         }
         catch (Exception ex)
         {
-            Log.Info("update: copy failed, rolling back — " + ex.Message);
-            try { if (File.Exists(cur)) File.Delete(cur); } catch { /* ignore */ }
-            File.Move(old, cur);        // restore the working build
+            Log.Info("update: swap failed, rolling back — " + ex.Message);
+            try { Retry("rollback", () => File.Move(old, cur, overwrite: true)); }
+            catch (Exception rb) { Log.Info("update: ROLLBACK FAILED — " + rb.Message); }
+            try { File.Delete(fresh); } catch { /* ignore */ }
             throw;
         }
 
         AppliedThisSession = true;
+        LastRelaunchError = null;
         if (!relaunch)
         {
             Log.Info("update: applied on exit, no relaunch");
-            return;
+            return ApplyResult.AppliedNoRelaunch;
         }
 
         // Hand the new process our id so it can wait for us to exit before
         // taking the single-instance mutex.
-        Process.Start(new ProcessStartInfo(cur, $"{PostUpdateArg} {Environment.ProcessId}")
+        try
         {
-            UseShellExecute = true,
-            WorkingDirectory = Path.GetDirectoryName(cur)!,
-        });
+            Process.Start(new ProcessStartInfo(cur, $"{PostUpdateArg} {Environment.ProcessId}")
+            {
+                UseShellExecute = true,
+                WorkingDirectory = Path.GetDirectoryName(cur)!,
+            });
+        }
+        catch (Exception ex)
+        {
+            // The swap is done: the next launch runs the new build. Do not claim a rollback that did not happen.
+            LastRelaunchError = ex.Message;
+            Log.Info("update: installed, but starting the new build failed — " + ex.Message);
+            return ApplyResult.AppliedRelaunchFailed;
+        }
         Log.Info("update: relaunched, exiting");
+        return ApplyResult.Relaunched;
     }
 
     /// <summary>Delete the staged download. The applying process cannot do this
@@ -410,23 +486,36 @@ internal static class Updater
         catch (Exception ex) { Log.Info("update: could not remove staging — " + ex.Message); }
     }
 
-    /// <summary>Remove the executable displaced by a previous update. Staging
-    /// is deliberately left alone: it may hold an update waiting to be applied,
-    /// and Program decides whether to keep it.</summary>
+    /// <summary>Seconds this build must have kept running before the displaced exe of the previous version is deleted: until then
+    /// it is the way back if the new build turns out not to start.</summary>
+    private const int KeepOldSeconds = 60;
+    private static System.Threading.Timer? _oldTimer;
+
+    /// <summary>Remove leftovers of an update: a half-copied .new now, and the displaced .old once this build has run for
+    /// <see cref="KeepOldSeconds"/> (so a new build that dies at start-up does not take its predecessor with it). Staging
+    /// is deliberately left alone: it may hold an update waiting to be applied, and Program decides whether to keep it.</summary>
     public static void CleanupOld()
     {
         try
         {
             string? cur = ExePath;
             if (cur == null) return;
+            string fresh = cur + ".new";
+            if (File.Exists(fresh)) { try { File.Delete(fresh); } catch { /* still locked */ } }
             string old = cur + OldSuffix;
-            if (File.Exists(old))
+            if (!File.Exists(old)) return;
+            Log.Info($"update: keeping {Path.GetFileName(old)} until this build has run for {KeepOldSeconds}s");
+            _oldTimer?.Dispose();
+            _oldTimer = new System.Threading.Timer(_ =>
             {
-                File.Delete(old);
-                Log.Info("update: removed " + Path.GetFileName(old));
-            }
+                try
+                {
+                    if (File.Exists(old)) { File.Delete(old); Log.Info("update: removed " + Path.GetFileName(old)); }
+                }
+                catch { /* still locked; next launch will get it */ }
+            }, null, KeepOldSeconds * 1000, Timeout.Infinite);
         }
-        catch { /* still locked; next launch will get it */ }
+        catch { /* next launch will get it */ }
     }
 
     /// <summary>Wait for the superseded process to exit so the mutex is free.</summary>

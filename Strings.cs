@@ -21,6 +21,15 @@ internal static class L
 {
     public static bool English;
 
+    // Punctuation that differs between the languages (full-width brackets and middle dots read as
+    // broken text in the English UI): use these instead of writing （ ） ・ ／ into a string that is not translated.
+    /// <summary>Parenthesised remark: "（x）" in Japanese, " (x)" in English.</summary>
+    public static string Par(string inner) => English ? " (" + inner + ")" : "（" + inner + "）";
+    /// <summary>List separator inside a label: "・" / ", ".</summary>
+    public static string Sep => English ? ", " : "・";
+    /// <summary>Separator between alternatives (key hints): " ／ " / " / ".</summary>
+    public static string Or => English ? " / " : " ／ ";
+
     public static string T(string ja) =>
         English && Map.TryGetValue(ja, out string? en) ? en : ja;
 
@@ -177,6 +186,10 @@ internal static class L
         ["既に起動しています"] = "Already running",
         ["{0} をスキップします"] = "Skipping {0}",
         ["バージョン {0} に更新しました"] = "Updated to version {0}",
+        ["新しいバージョン {0} がありますが、自動で更新できるファイルが見つかりません。リリースページから入手してください。"] =
+            "Version {0} is available, but no file for automatic updating was found. Please get it from the release page.",
+        ["このリリースには検証用のハッシュ（SHA256）がないため、アプリ内では更新できません。リリースページから手動で更新してください。"] =
+            "This release has no verification hash (SHA256), so it cannot be installed from within the app. Please update manually from the release page.",
         ["ホットキー使用中のため無効: {0}（オプションで変更できます）"] =
             "Hotkey in use by another app: {0} (change it in Options)",
         ["クリックスルー: オン（{0} で解除）"] = "Click-through: on ({0} to exit)",
@@ -600,11 +613,31 @@ internal static class L
         ["静止"] = "Still",
         ["プロファイル"] = "Profiles",
         ["ウィンドウ"] = "Window",
-        ["切り取り"] = "crop",
         ["色の調整"] = "color adjustment",
         ["映像の遅延"] = "video delay",
         ["表示どおりの保存"] = "save as displayed",
         ["回転と反転"] = "rotation and mirror",
         ["テスト表示"] = "Test overlay",
+
+        // ---- Device choice and automatic reconnection ----
+        ["キャプチャーボードが見つかりません"] = "No capture card found",
+        ["キャプチャーボードが見つかりません。「デバイス」メニューから映像デバイスを選んでください"] = "No capture card found. Choose the video device from the Device menu.",
+        ["キャプチャーボードを接続すると自動的に表示されます"] = "Connect the capture card and the picture appears automatically.",
+        ["使う機器が決まっていません。「デバイス」メニューの「映像デバイス」から選んでください（接続すると自動的に表示されます）"] = "No device has been chosen yet. Pick one under Device > Video device (the picture appears automatically once the card is connected).",
+        ["映像が止まったため、つなぎ直しています"] = "The video stopped - reconnecting",
+        ["映像をつなぎ直しました"] = "Video reconnected",
+        ["映像をつなぎ直せませんでした"] = "Could not reconnect the video",
+        ["映像が止まり、つなぎ直せませんでした"] = "The video stopped and could not be reconnected",
+        ["ケーブルとキャプチャーボードを確かめてください。抜き差しすると自動で再開します。「デバイス」メニューから選び直すこともできます"] = "Check the cable and the capture card. Unplugging and re-plugging restarts it automatically; you can also choose the device again from the Device menu.",
+        ["音声が止まったため、つなぎ直しています"] = "The audio stopped - reconnecting",
+        ["音声をつなぎ直せませんでした（抜き差しすると自動で再開します）"] = "Could not reconnect the audio (it restarts automatically when the device is re-plugged)",
+        ["映像が停止中"] = "Video stopped",
+        ["映像をつなぎ直し中"] = "Reconnecting video",
+        ["音声が停止中"] = "Audio stopped",
+        ["音声をつなぎ直し中"] = "Reconnecting audio",
+        ["入力レベルを変更できませんでした"] = "Could not change the input level",
+        ["入力レベルを元に戻せませんでした"] = "Could not restore the input level",
+        ["更新ファイルの入れ替えは終わりましたが、新しい版を起動できませんでした。YuCap をいったん閉じて、もう一度起動してください。\n\n{0}"] = "The update was installed, but the new version could not be started. Close YuCap and start it again.\n\n{0}",
+        ["{0}\n\nリリースページを開きますか？"] = "{0}\n\nOpen the release page?",
     };
 }

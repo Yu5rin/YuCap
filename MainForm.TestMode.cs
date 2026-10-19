@@ -69,6 +69,29 @@ internal static class TestModeGuard
     /// <summary>The settings saved by a test that never finished, or null. A marker whose process is still
     /// alive belongs to a test running right now in another YuCap and is left alone. The marker is deleted
     /// once read.</summary>
+    /// <summary>Settings the update machinery and the one-time notices write while the app runs. A snapshot of the
+    /// settings from before a test must not bring back an older value of these.</summary>
+    public static bool IsRuntimeManagedSetting(string name) =>
+        name.StartsWith("Staged", StringComparison.Ordinal) || name.StartsWith("Skipped", StringComparison.Ordinal)
+        || name.StartsWith("LastRun", StringComparison.Ordinal) || name.StartsWith("LastUpdateCheck", StringComparison.Ordinal)
+        || name == nameof(AppSettings.HotkeyConflictNotified);
+
+    /// <summary>Take the runtime-managed values from the settings file on disk (they are newer than the snapshot).</summary>
+    private static void KeepRuntimeManaged(AppSettings snapshot)
+    {
+        try
+        {
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YuCap", "settings.json");
+            if (!File.Exists(path)) return;
+            AppSettings? disk = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path));
+            if (disk == null) return;
+            foreach (var p in typeof(AppSettings).GetProperties())
+                if (p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0 && IsRuntimeManagedSetting(p.Name))
+                    p.SetValue(snapshot, p.GetValue(disk));
+        }
+        catch (Exception ex) { Log.Info("test mode: could not keep the update state - " + ex.Message); }
+    }
+
     public static AppSettings? TryRecover()
     {
         try
@@ -85,7 +108,9 @@ internal static class TestModeGuard
                 catch (ArgumentException) { /* no such process: the test died */ }
             }
             File.Delete(MarkerPath);
-            return m?.Settings;
+            AppSettings? saved = m?.Settings;
+            if (saved != null) KeepRuntimeManaged(saved);
+            return saved;
         }
         catch (Exception ex)
         {
@@ -289,6 +314,7 @@ public sealed partial class MainForm
         _testSaved = JsonSerializer.Deserialize<AppSettings>(json)!;
         TestModeGuard.WriteMarker(JsonSerializer.Deserialize<AppSettings>(json)!);
         var before = new UiBefore(_isFullscreen, _isPip, _zoom, _panX, _panY, CurrentInfoMode);
+        _testMutedBefore = _audio.Muted;
         Log.Info($"test mode: start target={o.Target.DeviceName} quick={o.Quick} report={_rep.Folder}");
 
         try
@@ -326,11 +352,11 @@ public sealed partial class MainForm
             Log.Info($"test mode: finished [{_rep.State}] {_rep.Folder}");
         }
 
-        if (openReport)
+        if (openReport && !_closeAfterTest)
         {
             OpenInBrowser(_rep.HtmlPath);
         }
-        if (Program.Options.TestMode) Close();
+        if ((Program.Options.TestMode || _closeAfterTest) && !IsDisposed) Close();
     }
 
     private static void OpenInBrowser(string path)
@@ -339,15 +365,26 @@ public sealed partial class MainForm
         catch (Exception ex) { Log.Info("test mode: could not open the report - " + ex.Message); }
     }
 
+    /// <summary>Settings the update machinery (and the one-time notices) write while the test runs. They must
+    /// survive the restore: putting the pre-test snapshot back would forget a download staged during the test.</summary>
+    private static bool IsRuntimeManagedSetting(string name) => TestModeGuard.IsRuntimeManagedSetting(name);
+
     private static void CopySettings(AppSettings from, AppSettings to)
     {
         foreach (var p in typeof(AppSettings).GetProperties())
-            if (p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0)
+            if (p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0 && !IsRuntimeManagedSetting(p.Name))
                 p.SetValue(to, p.GetValue(from));
     }
 
+    private bool _testMutedBefore;
+    private bool _closeAfterTest;     // the user closed the window mid-test: close once the test has put everything back
+
     private void RestoreAfterTest(UiBefore before)
     {
+        // settings back FIRST, then everything derived from them. Its own try: whatever else fails below,
+        // the user's settings must be back.
+        try { if (_testSaved != null) CopySettings(_testSaved, _settings); }
+        catch (Exception ex) { Log.Info("test mode: restoring the settings failed - " + ex); }
         // test widgets away
         if (_testCaption != null) { _testCaption.Showing = false; Controls.Remove(_testCaption); _testCaption.Dispose(); _testCaption = null; }
         _osd.TestBack = null; _info.TestBack = null;
@@ -356,8 +393,8 @@ public sealed partial class MainForm
         if (_frozen) ToggleFreeze();
         if (CurrentInfoMode != before.Info) SetInfoMode(before.Info);
 
-        // settings back, then everything that was derived from them
-        if (_testSaved != null) CopySettings(_testSaved, _settings);
+        try { if (_audio.IsRunning && _audio.Muted != _testMutedBefore) _audio.Muted = _testMutedBefore; }
+        catch (Exception ex) { Log.Info("test mode: restoring the mute state failed - " + ex.Message); }
         L.English = _settings.Language == "en";
         _displayMode = (VideoDisplayMode)Math.Clamp(_settings.DisplayMode, 0, 3);
         _zoom = before.Zoom; _panX = before.PanX; _panY = before.PanY;
@@ -810,7 +847,7 @@ public sealed partial class MainForm
         });
 
         // device + engine
-        _currentVideoInfo ??= VideoEngine.PickPreferred(VideoEngine.EnumerateDevices(), _settings.DeviceKeyword);
+        _currentVideoInfo ??= ChooseVideoDevice(VideoEngine.EnumerateDevices(), _settings.VideoDeviceId, _settings.DeviceKeyword);
         if (_currentVideoInfo == null)
         {
             sec.Items.Add(new TestItem
@@ -1052,7 +1089,11 @@ public sealed partial class MainForm
         double shown = recvEl > 0 ? presN / recvEl : 0;
         // With interpolation every refresh gets a new picture, so a frame's time budget is one refresh.
         bool interpOn = c.Interp && interpSt is { Active: true } && panel > 0;
-        double budget = 1000.0 / Math.Max(1, interpOn ? panel : srcFps);
+        // Without interpolation no more than min(source, panel) pictures a second can be shown: a 60 fps source on a
+        // 30 Hz panel has 33 ms per shown frame, not 16.7 ms (judging by the source rate would call a fine GPU slow).
+        double shownRate = interpOn ? panel : (panel > 0 ? Math.Min(srcFps, panel) : srcFps);
+        double budget = 1000.0 / Math.Max(1, shownRate);
+        bool dropsExpected = !interpOn && panel > 0 && panel < srcFps * 0.98;   // the panel is slower: dropping source frames is normal
 
         item.Num("映像", $"{ModeLabel(c.Mode)}  → {_topt.Target.Bounds.Width}x{_topt.Target.Bounds.Height} に拡大")
             .Num("拡大の画質", c.Quality == ScalingQuality.Fsr ? "FSR（高画質）" : c.Quality == ScalingQuality.Anime4K ? "くっきり（Anime4K）" : "標準")
@@ -1151,7 +1192,7 @@ public sealed partial class MainForm
                 else if (p.JudderShare > 0.05) { v = Worst(v, Verdict.Warn); why.Add($"{Pct(p.JudderShare)} のコマが本来より長く出ています（軽いカクつき）。"); }
                 else why.Add("コマはほぼ一定の間隔で出ています。");
                 judderSeen = p.JudderShare > 0.05;
-                displayPerfect = shownRatio >= 0.97 && drops == 0 && p.JudderShare <= 0.02;
+                displayPerfect = shownRatio >= 0.97 && (drops == 0 || dropsExpected) && p.JudderShare <= 0.02;
                 vrr.Add((c.LowLatency, new PacingQuality(p.VrrKnown, p.VrrWorking, c.Label)));
             }
             else
@@ -1662,12 +1703,22 @@ public sealed partial class MainForm
         }
         else if (lumaA > 235)
         {
-            item.Verdict = Verdict.Info; item.Summary = "映像がほぼ真っ白で、明るさの変化を確認できませんでした";
+            item.Verdict = Verdict.Info; item.Summary = "[情報] 映像がほぼ真っ白で、明るさの変化を確認できませんでした";
         }
         else if (lumaB > lumaA + 10 && lumaC < lumaB - 10)
         {
             item.Verdict = Verdict.Ok; item.Summary = "明るさの調整は正しく働きます";
             item.Explanation = "明るさを上げると絵が明るくなり、戻すと元に近づきました（映像が動いているため、数字は多少前後します）。";
+        }
+        else if (lumaA > 215 || Math.Abs(lumaC - lumaA) >= 8)
+        {
+            // Near white a +30 step clips before it can move the average by 10; and when the picture itself changed by
+            // about as much between the readings, the difference cannot be told from the picture moving.
+            item.Verdict = Verdict.Info;
+            item.Summary = "[情報] 明るさの変化が映像の動きや白つぶれの範囲に収まり、判定できませんでした";
+            item.Explanation = lumaA > 215
+                ? "映像がほとんど白に近く、明るさを上げても平均がほとんど変わりません（白に張り付くため）。暗めの場面を映して試験すると判定できます。"
+                : "調整の前後で、調整とは関係なく映像そのものが同じくらい動いていました。静止した場面を映して試験すると判定できます。";
         }
         else
         {
@@ -1742,6 +1793,7 @@ public sealed partial class MainForm
         Size src = _video.CurrentResolution;
         var lines = new List<string>();
         Verdict v = Verdict.Ok;
+        bool undecided = false;   // the picture was too symmetric / too still-less to tell the orientations apart
         try
         {
             _video.SetRotation(90);
@@ -1754,6 +1806,7 @@ public sealed partial class MainForm
             string r1 = await OrientationCheck(flip: false);
             item.Num("90° 回転の向き（静止画と画面の比較）", r1);
             if (r1.StartsWith("逆")) v = Worst(v, Verdict.Ng);
+            if (r1.StartsWith("判定できません")) undecided = true;
 
             _video.SetRotation(0);
             _video.SetMirror(true);
@@ -1762,6 +1815,7 @@ public sealed partial class MainForm
             string r2 = await OrientationCheck(flip: true);
             item.Num("左右反転の向き（静止画と画面の比較）", r2);
             if (r2.StartsWith("逆")) v = Worst(v, Verdict.Ng);
+            if (r2.StartsWith("判定できません")) undecided = true;
         }
         finally
         {
@@ -1769,11 +1823,16 @@ public sealed partial class MainForm
             _video.SetMirror(false);
             LayoutCanvas();
         }
+        if (v == Verdict.Ok && undecided) v = Verdict.Info;
         item.Verdict = v;
-        item.Summary = v == Verdict.Ok ? "回転と反転は正しく働きます" : "回転か反転の結果が期待と違います";
+        item.Summary = v == Verdict.Ok ? "回転と反転は正しく働きます"
+            : v == Verdict.Info ? "[情報] 絵の向きの違いが小さく、判定できませんでした"
+            : "回転か反転の結果が期待と違います";
         item.Explanation = v == Verdict.Ok
             ? "画面に出ている絵と、保存される静止画の向きが一致しました（映像が動いているため、判定は大まかな比較です）。"
-            : "画面に出ている絵と、保存される静止画の向きが食い違いました。";
+            : v == Verdict.Info
+                ? "映像がほぼ左右・上下対称などで、向きを入れ替えても比較の差が誤差の範囲でした。向きが分かる絵（文字やロゴのある場面）を映して試験してください。"
+                : "画面に出ている絵と、保存される静止画の向きが食い違いました。";
         sec.Items.Add(item);
     }
 
@@ -1789,6 +1848,10 @@ public sealed partial class MainForm
             double[,] t1 = Program.Thumbnail8x8(shot), t2 = Program.Thumbnail8x8(photo);
             using Bitmap alt = flip ? Program.FlippedCopy(photo) : Program.Rotated180Copy(photo);
             double mad = Program.MeanAbsDiff(t1, t2), madAlt = Program.MeanAbsDiff(t1, Program.Thumbnail8x8(alt));
+            // The picture moves between the two grabs, so a difference of a few grey levels is noise, and an image that
+            // is (nearly) the same turned over has nothing to compare.
+            double noise = Math.Max(3.0, 0.1 * Math.Max(mad, madAlt));
+            if (Math.Abs(mad - madAlt) <= noise) return $"判定できません（向きを入れ替えても差が {Math.Abs(mad - madAlt):0.0} しかなく、誤差の範囲です）";
             return mad < madAlt ? "一致" : "逆の向きの疑いがあります";
         }
         finally { photo?.Dispose(); shot?.Dispose(); }

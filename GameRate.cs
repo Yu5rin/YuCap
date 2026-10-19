@@ -84,6 +84,19 @@ internal sealed class GameRateMeter
 
     public const double WindowSec = 1.0;
 
+    /// <summary>Frames stopped arriving this long ago: the last reading no longer says anything (neither a rate nor "still").</summary>
+    public const double StaleSec = 1.5;
+
+    private bool Stale(long now) => _lastArrival != 0 && now - _lastArrival > (long)(StaleSec * System.Diagnostics.Stopwatch.Frequency);
+
+    /// <summary>Unique pictures per second (smoothed); 0 until a window is full, while the picture is still, or when no frame arrived
+    /// for <see cref="StaleSec"/> (<paramref name="now"/>: Stopwatch ticks).</summary>
+    public double FpsAt(long now) { lock (_gate) return _valid && !_still && !Stale(now) ? _fps : 0; }
+    /// <summary>A rate was measured and the picture is moving (and frames are still arriving).</summary>
+    public bool ReliableAt(long now) { lock (_gate) return _valid && !_still && !Stale(now); }
+    /// <summary>The picture did not change (at most one new picture in the window): a still screen, not 0 fps.</summary>
+    public bool StillAt(long now) { lock (_gate) return _valid && _still && !Stale(now); }
+
     /// <summary>Unique pictures per second (smoothed); 0 until a window is full or while the picture is still.</summary>
     public double Fps { get { lock (_gate) return _valid && !_still ? _fps : 0; } }
     /// <summary>A rate was measured and the picture is moving.</summary>

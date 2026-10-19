@@ -76,9 +76,10 @@ internal sealed partial class D3DRenderer
     public bool UniqueAware { get; set; } = true;
 
     /// <summary>Unique pictures per second over about the last second; 0 = unknown or a still picture (see <see cref="PictureStill"/>).</summary>
-    public double GameFps => _meter.Fps;
-    public bool GameFpsReliable => _meter.Reliable;
-    public bool PictureStill => _meter.Still;
+    public double GameFps => _meter.FpsAt(MeterNow);
+    public bool GameFpsReliable => _meter.ReliableAt(MeterNow);
+    public bool PictureStill => _meter.StillAt(MeterNow);
+    private long MeterNow => ClockOverride?.Invoke() ?? Stopwatch.GetTimestamp();
 
     /// <summary>Test hook: called for every answer (capture/render thread, under FrameLock): frame number, arrival tick, sum*64, max*64, counts, verdict "same".</summary>
     public Action<long, long, uint, uint, uint, uint, bool>? DupSink { get; set; }

@@ -121,6 +121,9 @@ public sealed class VideoEngine : IVideoEngine
     public CaptureMode? CurrentMode { get; private set; }
     public int NegotiatedFps { get; private set; }
     public bool IsRunning => _engine != null;
+    /// <summary>The capture engine reported an error after Start (device unplugged, stream failure): the picture is gone and the
+    /// host should restart. Reset by Start and Stop.</summary>
+    public bool EndedUnexpectedly => _callback is { EngineError: true };
 
     public int Rotation => _rotation;
     public bool Mirror => _mirror;
@@ -200,12 +203,19 @@ public sealed class VideoEngine : IVideoEngine
         try { return attr.GetString(key); } catch { return string.Empty; }
     }
 
-    public static VideoDeviceInfo? PickPreferred(IReadOnlyList<VideoDeviceInfo> devices, string keyword)
+    /// <summary>The device to use without asking: the one with <paramref name="preferredId"/> (the user's earlier choice) if it is
+    /// present, else the first whose name contains <paramref name="keyword"/>, else null. There is no "first device" fallback:
+    /// it could be the PC's webcam instead of the capture card.</summary>
+    public static VideoDeviceInfo? PickPreferred(IReadOnlyList<VideoDeviceInfo> devices, string keyword, string? preferredId = null)
     {
         if (devices.Count == 0) return null;
-        return devices.FirstOrDefault(d =>
-                   d.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-               ?? devices[0];
+        if (!string.IsNullOrEmpty(preferredId))
+        {
+            VideoDeviceInfo? chosen = devices.FirstOrDefault(d => d.Id == preferredId);
+            if (chosen != null) return chosen;
+        }
+        if (string.IsNullOrWhiteSpace(keyword)) return null;
+        return devices.FirstOrDefault(d => d.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase));
     }
 
     private IMFActivate FindActivate(VideoDeviceInfo info)
@@ -236,6 +246,17 @@ public sealed class VideoEngine : IVideoEngine
     {
         Log.Info($"VideoEngine.Start: {info.Name} mode={(mode == null ? "auto" : $"{mode.Width}x{mode.Height}@{mode.Fps}")}");
         Stop();
+        try { StartCore(info, mode); }
+        catch
+        {
+            // Whatever was built before the failure must not leave the engine looking started (IsRunning = _engine != null).
+            try { Stop(); } catch (Exception ex) { Log.Info("VideoEngine.Start: cleanup after failure - " + ex.Message.Split('\n')[0]); }
+            throw;
+        }
+    }
+
+    private void StartCore(VideoDeviceInfo info, CaptureMode? mode)
+    {
         EnsureStartup();
         if (_hwnd == IntPtr.Zero)
             throw new UserFacingException(L.T("表示ウィンドウが設定されていません。"));
@@ -362,6 +383,13 @@ public sealed class VideoEngine : IVideoEngine
             {
                 if (gated) Monitor.Exit(session.Gate);
             }
+        }        else if (_engine != null)
+        {
+            // Start failed before a preview session existed: nothing can be in flight, release what was built.
+            try { _engine.StopPreview(); } catch { /* ignore */ }
+            SafeRelease(_sink);
+            try { _source?.Dispose(); } catch { /* ignore */ }
+            SafeRelease(_engine);
         }
 
         lock (_photoLock)

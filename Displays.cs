@@ -20,9 +20,9 @@ internal sealed record DisplayInfo(string DeviceName, string FriendlyName, Recta
     /// <summary>"Hisense（3840x2160・144Hz）" and, for the primary display, " ・メイン" after it.</summary>
     public string MenuLabel()
     {
-        string hz = RefreshHz > 0 ? $"・{RefreshHz}Hz" : string.Empty;
-        string label = $"{FriendlyName}（{Bounds.Width}x{Bounds.Height}{hz}）";
-        return Primary ? label + " ・" + L.T("メイン") : label;
+        string hz = RefreshHz > 0 ? $"{L.Sep}{RefreshHz}Hz" : string.Empty;
+        string label = $"{FriendlyName}{L.Par($"{Bounds.Width}x{Bounds.Height}{hz}")}";
+        return Primary ? label + (L.English ? " - " : " ・") + L.T("メイン") : label;
     }
 }
 
@@ -57,10 +57,21 @@ internal static class Displays
         string size = p.Length > 2 ? p[2] : string.Empty;
 
         List<DisplayInfo> all = List();
-        DisplayInfo? hit = all.FirstOrDefault(d => d.Key == key)
-            ?? all.FirstOrDefault(d => name.Length > 0 && d.FriendlyName.Replace('|', ' ').Trim() == name
-                                       && $"{d.Bounds.Width}x{d.Bounds.Height}" == size)
-            ?? (name.Length == 0 ? all.FirstOrDefault(d => d.DeviceName == dev) : null);
+        DisplayInfo? hit = all.FirstOrDefault(d => d.Key == key);
+        if (hit == null && name.Length > 0)
+        {
+            // The monitor is recognised by its own name: a changed resolution (or a renumbered device) does not
+            // make it another monitor. The size only tells identical names apart (two of the same TV model),
+            // then the device name, then the first of them.
+            List<DisplayInfo> named = all.Where(d => d.FriendlyName.Replace('|', ' ').Trim() == name).ToList();
+            hit = named.Count == 1 ? named[0]
+                : named.FirstOrDefault(d => $"{d.Bounds.Width}x{d.Bounds.Height}" == size && d.DeviceName == dev)
+                  ?? named.FirstOrDefault(d => $"{d.Bounds.Width}x{d.Bounds.Height}" == size)
+                  ?? named.FirstOrDefault(d => d.DeviceName == dev)
+                  ?? named.FirstOrDefault();
+        }
+        // A key without a usable name falls back to the device name alone.
+        hit ??= name.Length == 0 ? all.FirstOrDefault(d => d.DeviceName == dev) : null;
         if (hit == null) return null;
         return Screen.AllScreens.FirstOrDefault(s => s.DeviceName == hit.DeviceName);
     }

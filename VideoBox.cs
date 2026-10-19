@@ -17,7 +17,8 @@ public sealed class VideoBox : Control
 {
     private const int WmNcHitTest = 0x0084;
     private const int HtTransparent = -1;
-    private const int Border = 6;
+    private const int BorderAt96Dpi = 6;
+    private int Border => Math.Max(1, (int)Math.Round(BorderAt96Dpi * DeviceDpi / 96.0));   // scales with the display
 
     /// <summary>True in borderless mode: expose the form's edges for resizing.</summary>
     public bool EnableEdgeResize { get; set; }

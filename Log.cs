@@ -16,6 +16,8 @@ internal static class Log
 
     public static string? Path => _path;
 
+    /// <summary>Open the log for this process. Does NOT rotate: a second instance or a command-line run must not move the
+    /// running instance's log away from under it (see <see cref="RotateIfLarge"/>).</summary>
     public static void Init()
     {
         try
@@ -24,16 +26,29 @@ internal static class Log
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YuCap");
             Directory.CreateDirectory(dir);
             _path = System.IO.Path.Combine(dir, "yucap.log");
-            var fi = new FileInfo(_path);
-            if (fi.Exists && fi.Length > 2_000_000)
-            {
-                string old = System.IO.Path.Combine(dir, "yucap.old.log");
-                if (File.Exists(old)) File.Delete(old);
-                File.Move(_path, old);
-            }
         }
         catch { _path = null; }
         Info($"==== YuCap start v{System.Windows.Forms.Application.ProductVersion} ====");
+    }
+
+    /// <summary>Move a log over 2 MB to yucap.old.log. Called only by the process that holds the single-instance mutex.
+    /// A failure leaves the log where it is and logging carries on appending to it.</summary>
+    public static void RotateIfLarge()
+    {
+        string? path = _path;
+        if (path == null) return;
+        try
+        {
+            lock (Gate)
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length <= 2_000_000) return;
+                string old = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, "yucap.old.log");
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(path, old);
+            }
+        }
+        catch { /* keep appending to the big file rather than lose the log */ }
     }
 
     public static void Info(string message)
@@ -43,8 +58,11 @@ internal static class Log
         {
             lock (Gate)
             {
-                File.AppendAllText(_path,
+                // Shared write access: a command-line run next to the viewer (or two processes starting together) can both log.
+                using var fs = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                byte[] line = new System.Text.UTF8Encoding(false).GetBytes(
                     $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [T{Environment.CurrentManagedThreadId}] {message}\r\n");
+                fs.Write(line, 0, line.Length);
             }
         }
         catch { /* logging must never break the app */ }
