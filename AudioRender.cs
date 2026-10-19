@@ -19,8 +19,11 @@ internal sealed class SharedRender : IDisposable
     private static readonly Guid IID_IAudioClient3 = new("7ED4EE07-8E67-4CD4-8C1A-2B7A5987AD42");
     private static readonly Guid IID_IAudioRenderClient = new("F294ACFC-3146-4483-A7BF-ADDCA7C260E2");
 
-    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-    private class MMDeviceEnumeratorCom { }
+    // MMDeviceEnumerator is a process-wide singleton: CoCreateInstance hands back the object NAudio
+    // already wraps (AudioEngine keeps one alive for device-change notifications), and the runtime then
+    // reuses NAudio's wrapper. So never cast to a ComImport *class* here (that cast throws) and never
+    // ReleaseComObject it (that would tear down NAudio's wrapper) - just query our interface.
+    private static readonly Guid CLSID_MMDeviceEnumerator = new("BCDE0395-E52F-467C-8E3D-C4579291692E");
 
     [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IMMDeviceEnumerator
@@ -139,13 +142,13 @@ internal sealed class SharedRender : IDisposable
     {
         try
         {
-            var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+            var enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_MMDeviceEnumerator, throwOnError: true)!)!;
             try
             {
                 Check(enumerator.GetDevice(deviceId, out var dev), "GetDevice");
                 _device = dev;
             }
-            finally { Marshal.ReleaseComObject(enumerator); }
+            finally { GC.KeepAlive(enumerator); }   // shared singleton: do not release (see CLSID_MMDeviceEnumerator)
 
             object? obj;
             Guid iid3 = IID_IAudioClient3;
