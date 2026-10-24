@@ -30,6 +30,8 @@ internal sealed partial class D3DRenderer
     /// <summary>自分専用モデル: a model file of the user's own training (tools/train_upscaler.py; Anime4K M layout) that replaces the built-in
     /// network while no guard override is active. null = the built-in one. Set it with <see cref="SetA4kCustom"/>.</summary>
     public static string? A4kCustomPath { get; private set; }
+    /// <summary>The layout of the custom model: 'S', 'M' or 'L' (from the first line of the model file; decides the passes and the cost estimate).</summary>
+    public static char A4kCustomArch { get; private set; } = 'M';
     /// <summary>Changes whenever the custom model (file or content) changes: part of the cache key, so a switched or retrained model is never shown from the cache.</summary>
     public static int A4kCustomEpoch { get; private set; }
 
@@ -40,6 +42,7 @@ internal sealed partial class D3DRenderer
         if (path != null && stamp == _a4kCustomBadStamp) { path = null; stamp = 0; }     // this very file did not compile: stay on the built-in network until it changes
         if (path == A4kCustomPath && stamp == A4kCustomEpoch) return;
         A4kCustomPath = path; A4kCustomEpoch = stamp;
+        A4kCustomArch = path == null ? 'M' : (UserModels.ArchOf(path) is var a && a != '\0' ? a : 'M');
     }
     private static int _a4kCustomBadStamp;
     /// <summary>float16 intermediate textures (false = float32; the equivalence check uses float32 to show the port is exact).</summary>
@@ -56,7 +59,7 @@ internal sealed partial class D3DRenderer
     /// everything else in one 144 Hz refresh (6.94 ms). Measured on an RTX 4060: M costs about 0.8 ms per megapixel of input per stage (S 0.4, L 1.2);
     /// a 720p picture would need 3.7 ms, a 480p one 1.2 ms. Memory is no issue below that (the textures of a stage-2 input of 3 Mpixel are ~0.2 GB).</summary>
     public static double A4kBudgetMs = 3.0;
-    private static double A4kMsPerMegapixel(char v) => v switch { 'S' => 0.4, 'L' => 1.2, _ => 0.8 };
+    private static double A4kMsPerMegapixel(char v) => (v == 'C' ? A4kCustomArch : v) switch { 'S' => 0.4, 'L' => 1.2, _ => 0.8 };
 
     internal readonly record struct A4kKey(long Ver, int PreH, int PreFilter, int PreIter, float PreClamp, char Variant, int Stages, bool Half, char Restore = '\0', int Model = 0);
 
@@ -98,8 +101,8 @@ internal sealed partial class D3DRenderer
         }
     }
 
-    private static A4kPassInfo[] PassesOf(char v) => v switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
-    private static int TexturesOf(char v) => v switch { 'S' => A4kModels.TexturesS, 'L' => A4kModels.TexturesL, _ => A4kModels.TexturesM };
+    private static A4kPassInfo[] PassesOf(char v) => (v == 'C' ? A4kCustomArch : v) switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
+    private static int TexturesOf(char v) => (v == 'C' ? A4kCustomArch : v) switch { 'S' => A4kModels.TexturesS, 'L' => A4kModels.TexturesL, _ => A4kModels.TexturesM };
 
     private bool EnsureA4kShaders()
     {

@@ -158,8 +158,8 @@ internal static class D3DShaders
 
     private static readonly Dictionary<string, byte[][]> A4kCustomCode = new();
 
-    /// <summary>Bytecode of the passes of a user-trained network (a model file written by tools/train_upscaler.py: the layout of Anime4K M,
-    /// so the passes and entry points are those of <c>A4kModels.PassesM</c>), compiled from the file on disk. Cached per file and modification
+    /// <summary>Bytecode of the passes of a user-trained network (a model file written by tools/train_upscaler.py: the layout of Anime4K S, M or L as the
+    /// first line says, so the passes and entry points are those of <c>A4kModels.Passes*</c>), compiled from the file on disk. Cached per file and modification
     /// time, so a retrained model that replaces the file is picked up without a rebuild. Throws if the file or the compile fails.</summary>
     public static byte[][] GetA4kCustom(string path)
     {
@@ -170,7 +170,7 @@ internal static class D3DShaders
             var sw = Stopwatch.StartNew();
             string src = File.ReadAllText(path, Encoding.UTF8);
             string label = Path.GetFileName(path);
-            A4kPassInfo[] passes = A4kModels.PassesM;
+            A4kPassInfo[] passes = UserModels.ArchOf(path) switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
             var code = new byte[passes.Length][];
             for (int i = 0; i < passes.Length; i++) code[i] = Compile(src, passes[i].Entry, label, "ps_5_0");
             Log.Info($"D3D: Anime4K user model {label} compiled in {sw.ElapsedMilliseconds}ms");

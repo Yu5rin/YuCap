@@ -252,7 +252,7 @@ internal static class Displays
                     Marshal.WriteInt32(buf, 12, p.Source.AdapterId.High);
                     Marshal.WriteInt32(buf, 16, unchecked((int)p.Source.Id));
                     if (DisplayConfigGetDeviceInfo(buf) != 0) continue;
-                    string gdi = Marshal.PtrToStringUni(buf + 20, 32).Split(' ')[0];
+                    string gdi = Marshal.PtrToStringUni(buf + 20, 32).Split('\0')[0];
                     if (!string.Equals(gdi, deviceName, StringComparison.OrdinalIgnoreCase)) continue;
                     Marshal.WriteInt32(buf, 0, 11 /* DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL */);
                     Marshal.WriteInt32(buf, 4, 24);

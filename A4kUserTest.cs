@@ -115,7 +115,7 @@ internal static class A4kUserTest
 
     /// <summary>Raw (unclamped, float32 intermediates) x2 output of <paramref name="net"/> ("S", "M", "L" or the path of a model file) for the picture
     /// <paramref name="png"/>, written as little-endian float32 RGB (H*W*3 of the doubled picture) to <paramref name="outFile"/>. Needs the GPU only.</summary>
-    public static string DumpRaw(string net, string png, string outFile, bool half = false)
+    public static string DumpRaw(string net, string png, string outFile, bool half = false, bool bench = false)
     {
         D3DRenderer? r = null;
         bool keepHalf = D3DRenderer.A4kHalf; char keepV = D3DRenderer.A4kVariantLetter; string? keepC = D3DRenderer.A4kCustomPath;
@@ -135,7 +135,14 @@ internal static class A4kUserTest
             var bytes = new byte[rgb.Length * 4];
             Buffer.BlockCopy(rgb, 0, bytes, 0, bytes.Length);
             File.WriteAllBytes(outFile, bytes);
-            return $"wrote {outFile}: {sz.Width}x{sz.Height} float32 RGB";
+            string res = $"wrote {outFile}: {sz.Width}x{sz.Height} float32 RGB";
+            if (bench)
+            {
+                // GPU milliseconds of the x2 stage alone for this picture (float16 intermediates when --half), median of 60 frames after a warm-up
+                double[] ms = r.A4kBench(src.Size, 1, 60);
+                if (ms.Length > 0) { var sorted = ms.OrderBy(x => x).ToArray(); res += Environment.NewLine + $"GPU x2 stage {src.Width}x{src.Height} -> {sz.Width}x{sz.Height}: median {sorted[sorted.Length / 2]:0.000} ms, min {sorted[0]:0.000} ms ({ms.Length} frames, {(half ? "float16" : "float32")} intermediates)"; }
+            }
+            return res;
         }
         catch (Exception ex) { return "FAILED: " + ex; }
         finally

@@ -187,8 +187,8 @@ internal static partial class Program
         if (args.Length > 3 && args[0] == "--a4k-run")
         {
             // Headless (GPU only): the raw float32 x2 output of one network for one picture, for the comparison with PyTorch.
-            //   --a4k-run <S|M|L|model.hlsl> <picture.png> <out.f32> [--half]   (--half: float16 intermediates as in the viewer; default float32)
-            File.WriteAllText(args[3] + ".txt", A4kUserTest.DumpRaw(args[1], args[2], args[3], args.Length > 4 && args[4] == "--half"), new System.Text.UTF8Encoding(true));
+            //   --a4k-run <S|M|L|model.hlsl> <picture.png> <out.f32> [--half] [--bench]   (--half: float16 intermediates as in the viewer; default float32; --bench: also the GPU ms of the x2 stage)
+            File.WriteAllText(args[3] + ".txt", A4kUserTest.DumpRaw(args[1], args[2], args[3], args.Length > 4 && args.Contains("--half"), args.Length > 4 && args.Contains("--bench")), new System.Text.UTF8Encoding(true));
             return;
         }
         if (args.Length > 0 && args[0] == "--chroma-check")

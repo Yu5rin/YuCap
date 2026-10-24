@@ -3,7 +3,7 @@
 
 Run with the training venv (see tools/setup_train_env.ps1):   %LOCALAPPDATA%\\YuCapTrain\\venv\\Scripts\\python.exe tools\\train_upscaler.py <command>
 
-  train   --name mine --data <dir> [<dir> ...]  [--minutes 45]     fine-tune from the original Anime4K weights, export when done
+  train   --name mine --data <dir> [<dir> ...]  [--minutes 45] [--arch S|M|L] [--loss edge|texture]     fine-tune from the original Anime4K weights, export when done
   eval    --name mine --data <dir> ...                              validation table: bilinear / bicubic / Anime4K original / yours
   export  --name mine [--ckpt best|last]                            write models\\<name>.hlsl (+ .json) again from a checkpoint
   dump    --name mine|orig --image in.png --out out.f32             PyTorch reference output
@@ -15,7 +15,7 @@ Frames are split into training / validation by *scene group* (consecutive captur
 the validation never sees a picture it was trained on.
 
 What is learned: low-resolution -> picture, x2.  The low-resolution input is made from the clean frame by the kind of damage a
-console capture has (scaler kernel, 4:2:2 / 4:2:0 chroma, a little noise, 8-bit rounding); the loss is L1 plus a small edge term.
+console capture has (scaler kernel, 4:2:2 / 4:2:0 chroma, a little noise, 8-bit rounding); the loss is L1 plus a small edge term (--loss edge) or L1 + SSIM + a high-pass texture term (--loss texture); --arch S|M|L picks the network size.
 Nothing here needs a pretrained network or a download.
 """
 import argparse, glob, hashlib, json, math, os, random, re, sys, time
@@ -201,6 +201,46 @@ def edge_strength(x):
     return gx.abs().mean().item() + gy.abs().mean().item()
 
 
+def _gauss1d(s, device, dtype, n=None):
+    n = n or int(2 * math.ceil(3 * s) + 1)
+    k = torch.arange(n, device=device, dtype=dtype) - n // 2
+    g = torch.exp(-(k ** 2) / (2 * s * s)); return g / g.sum()
+
+
+def blur(x, s):
+    """Separable gaussian blur (replicate padding) of (B,C,H,W)."""
+    g = _gauss1d(s, x.device, x.dtype); n = g.numel(); C = x.shape[1]
+    x = F.conv2d(F.pad(x, (n // 2, n // 2, 0, 0), mode="replicate"), g.view(1, 1, 1, n).repeat(C, 1, 1, 1), groups=C)
+    return F.conv2d(F.pad(x, (0, 0, n // 2, n // 2), mode="replicate"), g.view(1, 1, n, 1).repeat(C, 1, 1, 1), groups=C)
+
+
+def ssim_loss(a, b):
+    """1 - mean SSIM (differentiable; gaussian 11x11 on the three colour channels)."""
+    w = gauss_win(device=a.device).repeat(3, 1, 1, 1)
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    mu_a = F.conv2d(a, w, groups=3); mu_b = F.conv2d(b, w, groups=3)
+    saa = F.conv2d(a * a, w, groups=3) - mu_a ** 2
+    sbb = F.conv2d(b * b, w, groups=3) - mu_b ** 2
+    sab = F.conv2d(a * b, w, groups=3) - mu_a * mu_b
+    m = ((2 * mu_a * mu_b + c1) * (2 * sab + c2)) / ((mu_a ** 2 + mu_b ** 2 + c1) * (saa + sbb + c2))
+    return 1 - m.mean()
+
+
+def texture_loss(sr, hr):
+    """Match the fine texture, not only the edges: L1 on two high-pass bands of the luma (x - blur(x) at sigma 0.8 and 1.6, the grain / hatching / cloth
+    scale) plus the local contrast (gaussian-weighted standard deviation of the 0.8-band) so that a flattened area is not rewarded."""
+    def y(x): return 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
+    ys, yh = y(sr), y(hr)
+    t = 0.0
+    hs = hh = None
+    for i, s in enumerate((0.8, 1.6)):
+        a = ys - blur(ys, s); b = yh - blur(yh, s)
+        t = t + (a - b).abs().mean()
+        if i == 0: hs, hh = a, b
+    vs = blur(hs * hs, 1.5).clamp_min(0).add(1e-6).sqrt(); vh = blur(hh * hh, 1.5).clamp_min(0).add(1e-6).sqrt()
+    return t + (vs - vh).abs().mean()
+
+
 def sobel_l1(a, b):
     def g(x):
         y = (0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3])
@@ -219,8 +259,8 @@ def run_dir(name):
 
 
 def load_model(name, ckpt="best"):
-    if name in ("orig", "original", "M", "S", "L"):
-        n = T.A4kNet("M" if name in ("orig", "original") else name)
+    if name in ("orig", "original", "M", "S", "L", "origM", "origL", "origS"):
+        n = T.A4kNet("M" if name in ("orig", "original") else name[-1])
     else:
         p = os.path.join(run_dir(name), f"ckpt_{ckpt}.pt")
         st = torch.load(p, map_location="cpu")
@@ -265,6 +305,7 @@ def table(res, n):
 
 # ---------------------------------------------------------------------------- training
 def cmd_train(a):
+    a.edge_w_eff = a.edge_w if a.edge_w is not None else (0.15 if a.loss == "edge" else 0.0)
     items = list_frames(a.data)
     if not items:
         raise SystemExit("no frames found in " + ", ".join(a.data))
@@ -277,11 +318,14 @@ def cmd_train(a):
     rng = random.Random(a.seed); torch.manual_seed(a.seed)
     if DEV == "cuda":
         torch.cuda.set_per_process_memory_fraction(a.mem_fraction)
-    net = T.A4kNet("M").to(DEV)
-    orig = T.A4kNet("M").to(DEV).eval()
+    net = T.A4kNet(a.arch).to(DEV)
+    orig = T.A4kNet(a.arch).to(DEV).eval()
     if a.resume and os.path.exists(os.path.join(run_dir(a.name), "ckpt_last.pt")):
         st = torch.load(os.path.join(run_dir(a.name), "ckpt_last.pt"), map_location=DEV)
+        if st.get("letter", "M") != a.arch:
+            raise SystemExit(f"the checkpoint is architecture {st.get('letter', 'M')}, not {a.arch}")
         net.load_state_dict(st["model"]); print("resumed from ckpt_last.pt")
+    print(f"architecture {a.arch}, loss {a.loss}" + (f" (L1 + {a.ssim_w} SSIM + {a.tex_w} texture + {a.edge_w_eff} edge)" if a.loss == "texture" else f" (L1 + {a.edge_w_eff} edge)"))
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     scaler = torch.amp.GradScaler(DEV, enabled=a.amp and DEV == "cuda")
     os.makedirs(run_dir(a.name), exist_ok=True)
@@ -296,8 +340,11 @@ def cmd_train(a):
     base, nval = evaluate({"anime4k-orig": runner(orig), "yours": runner(net.eval())}, quick_val)
     print("before training (validation):\n" + table(base, nval))
     net.train()
-    best = base["yours"]["psnr"] - 1e-9
-    best_ssim = base["yours"]["ssim"]
+    def pick_score(r):
+        # which checkpoint is "best": PSNR for the edge loss; for the texture loss PSNR plus a SSIM bonus (0.001 SSIM ~ 0.025 dB), because that loss
+        # trades a little PSNR for SSIM and must not be judged by PSNR alone
+        return r["psnr"] + (25.0 * r["ssim"] if a.loss == "texture" else 0.0)
+    best = -1e9                    # the first validation always saves a checkpoint (a run whose loss never beats the starting PSNR must still export)
     t0 = time.time(); it = 0
     total_iters = a.iters
     deadline = t0 + a.minutes * 60 if a.minutes else None
@@ -346,7 +393,11 @@ def cmd_train(a):
             with torch.autocast(DEV, dtype=torch.float16, enabled=a.amp and DEV == "cuda"):
                 sr = net(lr_in)
             sr = sr.float()
-            loss = F.l1_loss(sr, hr) + a.edge_w * sobel_l1(sr, hr)
+            loss = F.l1_loss(sr, hr)
+            if a.edge_w_eff > 0:
+                loss = loss + a.edge_w_eff * sobel_l1(sr, hr)
+            if a.loss == "texture":
+                loss = loss + a.ssim_w * ssim_loss(sr, hr) + a.tex_w * texture_loss(sr, hr)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -363,9 +414,9 @@ def cmd_train(a):
                 with open(logp, "a") as f:
                     f.write(f"{it},{mins:.2f},{np.mean(hist[-a.val_every:]):.5f},{y['psnr']:.4f},{y['ssim']:.5f},{y['edge']:.4f},{o['psnr']:.4f},{o['ssim']:.5f},{bc['psnr']:.4f},{bc['ssim']:.5f}\n")
                 print(f"it {it:6d} {mins:5.1f}min lr {lr_now:.2e} loss {np.mean(hist[-a.val_every:]):.5f} | val PSNR yours {y['psnr']:.3f} orig {o['psnr']:.3f} bicubic {bc['psnr']:.3f} | SSIM yours {y['ssim']:.4f} orig {o['ssim']:.4f}", flush=True)
-                score = y["psnr"]
+                score = pick_score(y)
                 if score > best:
-                    best = score; best_ssim = y["ssim"]
+                    best = score
                     save_ckpt(net, a.name, "best", dict(it=it, val=res))
                 save_ckpt(net, a.name, "last", dict(it=it, val=res))
             if (deadline and time.time() > deadline) or (not deadline and it >= total_iters):
@@ -373,9 +424,12 @@ def cmd_train(a):
                 break
     print(f"finished: {it} iterations in {(time.time() - t0) / 60:.1f} min")
     cmd_export(argparse.Namespace(name=a.name, ckpt="best", tag=None))
-    full, n = evaluate({"anime4k-orig": runner(orig), "yours": runner(load_model(a.name, "best"))}, va)
+    ref = {"anime4k-orig": runner(orig)}
+    if a.arch != "M":
+        ref["anime4k-M"] = runner(load_model("M"))              # the default network too: is the bigger one worth it?
+    full, n = evaluate({**ref, "yours": runner(load_model(a.name, "best"))}, va)
     print("final validation (all held-out frames, best checkpoint):\n" + table(full, n))
-    fulln, _ = evaluate({"anime4k-orig": runner(orig), "yours": runner(load_model(a.name, "best"))}, va, native=True)
+    fulln, _ = evaluate({**ref, "yours": runner(load_model(a.name, "best"))}, va, native=True)
     print("same frames shrunk to their measured real detail (the clean 720p-class picture; frames without an estimate unchanged):\n" + table(fulln, n))
     json.dump(dict(final=full, final_native=fulln, frames=n, val_groups=vg, val_frames=[x["path"] for x in va], train_frames=len(tr), iters=it, minutes=(time.time() - t0) / 60),
               open(os.path.join(run_dir(a.name), "final.json"), "w"), indent=1)
@@ -387,7 +441,7 @@ def cmd_finalize(a):
     items = list_frames(a.data)
     tr, va, vg = split(items)
     st = torch.load(os.path.join(run_dir(a.name), "ckpt_best.pt"), map_location="cpu")
-    full, n = evaluate({"anime4k-orig": load_model("orig"), "yours": load_model(a.name, "best")}, va)
+    full, n = evaluate({"anime4k-orig": load_model("orig" + st.get("letter", "M")), "yours": load_model(a.name, "best")}, va)
     print(table(full, n))
     json.dump(dict(final=full, frames=n, val_groups=vg, val_frames=[x["path"] for x in va], train_frames=len(tr), iters=st.get("it"), minutes=None),
               open(os.path.join(run_dir(a.name), "final.json"), "w"), indent=1)
@@ -402,8 +456,8 @@ def cmd_export(a):
     # first line marker the app reads: architecture letter
     txt = open(out, encoding="ascii").read()
     with open(out, "w", encoding="ascii", newline="\n") as f:
-        f.write(f"// YUCAP-MODEL name={a.name} arch=M\n" + txt)
-    meta = dict(name=a.name, arch="M", created=time.strftime("%Y-%m-%d %H:%M:%S"), checkpoint=a.ckpt)
+        f.write(f"// YUCAP-MODEL name={a.name} arch={net.letter}\n" + txt)
+    meta = dict(name=a.name, arch=net.letter, created=time.strftime("%Y-%m-%d %H:%M:%S"), checkpoint=a.ckpt)
     fp = os.path.join(run_dir(a.name), "final.json")
     if os.path.exists(fp):
         fj = json.load(open(fp))
@@ -419,6 +473,8 @@ def cmd_eval(a):
     nets = {"anime4k-orig": load_model("orig")}
     if a.name:
         nets["yours"] = load_model(a.name, a.ckpt)
+        if nets["yours"].letter != "M":
+            nets["anime4k-" + nets["yours"].letter] = load_model(nets["yours"].letter)
     res, n = evaluate(nets, va if not a.all else items, native=a.native)
     print("validation scenes:", ", ".join(vg)); print(table(res, n))
 
@@ -459,7 +515,12 @@ def main():
     t.add_argument("--iters", type=int, default=20000)
     t.add_argument("--batch", type=int, default=32); t.add_argument("--patch", type=int, default=96)
     t.add_argument("--lr", type=float, default=1e-4); t.add_argument("--lr-min", dest="lr_min", type=float, default=1e-5)
-    t.add_argument("--edge-w", dest="edge_w", type=float, default=0.15)
+    t.add_argument("--arch", choices=["S", "M", "L"], default="M", help="network size (Anime4K CNN x2 S / M / L): L is more accurate but about 1.5x the GPU cost of M at play time")
+    t.add_argument("--loss", choices=["edge", "texture"], default="edge",
+                   help="edge: L1 + Sobel edge term (sharper lines, flatter texture).  texture: L1 + SSIM + high-pass texture terms (keeps grain / hatching / cloth)")
+    t.add_argument("--edge-w", dest="edge_w", type=float, default=None, help="weight of the Sobel edge term (default 0.15 for --loss edge, 0 for texture)")
+    t.add_argument("--ssim-w", dest="ssim_w", type=float, default=0.5, help="--loss texture: weight of 1-SSIM")
+    t.add_argument("--tex-w", dest="tex_w", type=float, default=1.0, help="--loss texture: weight of the high-pass texture term")
     t.add_argument("--shard", type=int, default=120); t.add_argument("--shard-iters", dest="shard_iters", type=int, default=1500)
     t.add_argument("--val-every", dest="val_every", type=int, default=500); t.add_argument("--val-frames", dest="val_frames", type=int, default=0)
     t.add_argument("--no-amp", dest="amp", action="store_false"); t.add_argument("--resume", action="store_true")
