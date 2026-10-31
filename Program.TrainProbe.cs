@@ -76,3 +76,98 @@ internal static partial class Program
         Application.Run(form);
     }
 }
+
+// Hidden developer command for the in-app training (TrainEnv / TrainJob), without the viewer or any capture device:
+//   --train-job-probe <dir>
+//        works in <dir>\root (YUCAP_TRAIN_DIR) with the real training venv: writes the scripts out of the exe, makes a tiny picture set, then
+//        (A) starts a run and stops it, checking that no python process is left; (B) runs a 1-minute run to the end and reads the result;
+//        (C) starts a run, stops it after its first validation and turns the best checkpoint into a model (finalize). Writes <dir>\probe.txt.
+internal static partial class Program
+{
+    private static void RunTrainJobProbe(string dir)
+    {
+        var log = new List<string>();
+        Directory.CreateDirectory(dir);
+        string root = Path.Combine(dir, "root");
+        string? py = null;
+        try
+        {
+            py = TrainEnv.PythonExe;
+            if (!File.Exists(py)) { log.Add("no training venv: " + py); return; }
+            Environment.SetEnvironmentVariable("YUCAP_TRAIN_PYTHON", py);
+            Environment.SetEnvironmentVariable("YUCAP_TRAIN_DIR", root);
+            string script = TrainEnv.EnsureTools();
+            log.Add("tools: " + string.Join(", ", Directory.GetFiles(TrainEnv.ToolsDir).Select(Path.GetFileName)) + " | glsl: "
+                + string.Join(", ", Directory.GetFiles(Path.Combine(root, "third_party", "Anime4K")).Select(Path.GetFileName)));
+            string data = Path.Combine(root, "data", "test");
+            Directory.CreateDirectory(data);
+            TrainEnv.MakeTinyTrainSet(data);
+            int pyBefore = System.Diagnostics.Process.GetProcessesByName("python").Length;
+            log.Add($"python processes before: {pyBefore}");
+
+            // (A) start and stop
+            using (var a = new TrainJob(new TrainOptions { Name = "pa", Arch = 'S', Minutes = 1, DataDirs = new List<string> { data } }))
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                a.Start();
+                while (sw.Elapsed.TotalSeconds < 150 && a.IsRunning && !a.LogText.Contains("frames:")) System.Threading.Thread.Sleep(200);
+                TrainStatus s = a.Snapshot();
+                log.Add($"(A) after {sw.Elapsed.TotalSeconds:0.0}s: running={a.IsRunning} frames={s.Frames} train={s.TrainFrames} val={s.ValFrames} active processes in job={a.ProcessCount}");
+                a.Cancel();
+                bool gone = a.WaitGone(10000);
+                log.Add($"(A) cancelled: gone={gone} active={a.ProcessCount} python processes now={System.Diagnostics.Process.GetProcessesByName("python").Length} phase={a.Snapshot().Phase}");
+                log.Add("(A) log tail: " + string.Join(" / ", a.LogText.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).TakeLast(3)));
+            }
+
+            // (B) a whole 1-minute run
+            using (var b = new TrainJob(new TrainOptions { Name = "pb", Arch = 'S', Minutes = 1, DataDirs = new List<string> { data } }))
+            {
+                var done = new System.Threading.ManualResetEventSlim();
+                b.Ended += _ => done.Set();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                b.Start();
+                bool ended = done.Wait(TimeSpan.FromMinutes(6));
+                System.Threading.Thread.Sleep(300);
+                TrainStatus s = b.Snapshot();
+                log.Add($"(B) ended={ended} after {sw.Elapsed.TotalSeconds:0}s phase={s.Phase} iter={s.Iter} min={s.Minutes:0.0} best={s.Best} latest={s.Latest} orig={s.Original} bicubic={s.Bicubic}");
+                log.Add($"(B) final yours={s.FinalYours} orig={s.FinalOriginal} bicubic={s.FinalBicubic}");
+                log.Add("(B) verdict: " + TrainJob.Verdict(s, out bool better) + $" better={better}");
+                log.Add("(B) models: " + string.Join(", ", UserModels.List().Select(n => n + "(" + UserModels.ArchOf(UserModels.PathOf(n)) + ")")) + $" resolve={(UserModels.Resolve("pb") != null)}");
+                log.Add($"(B) active processes in job after end: {b.ProcessCount}");
+                if (!ended) log.Add("(B) log tail: " + string.Join(" / ", b.LogText.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).TakeLast(5)));
+            }
+
+            // (C) stop after the first validation, then finalize
+            var oc = new TrainOptions { Name = "pc", Arch = 'S', Minutes = 3, DataDirs = new List<string> { data } };
+            using (var c = new TrainJob(oc))
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                c.Start();
+                while (sw.Elapsed.TotalSeconds < 240 && c.IsRunning && c.Snapshot().Iter == 0) System.Threading.Thread.Sleep(300);
+                log.Add($"(C) first report after {sw.Elapsed.TotalSeconds:0}s: iter={c.Snapshot().Iter} best checkpoint={c.HasBestCheckpoint}");
+                c.Cancel();
+                log.Add($"(C) cancelled: gone={c.WaitGone(10000)} active={c.ProcessCount}");
+                if (c.HasBestCheckpoint)
+                {
+                    using var f = new TrainJob(oc);
+                    var done = new System.Threading.ManualResetEventSlim();
+                    f.Ended += _ => done.Set();
+                    f.Start(finalize: true);
+                    bool ended = done.Wait(TimeSpan.FromMinutes(4));
+                    System.Threading.Thread.Sleep(300);
+                    f.RefreshResult();
+                    TrainStatus s = f.Snapshot();
+                    log.Add($"(C) finalize ended={ended} phase={s.Phase} yours={s.FinalYours} orig={s.FinalOriginal}; model resolve={(UserModels.Resolve("pc") != null)}");
+                    log.Add("(C) verdict: " + TrainJob.Verdict(s, out _));
+                }
+            }
+            log.Add($"python processes at the end: {System.Diagnostics.Process.GetProcessesByName("python").Length} (before: {pyBefore})");
+            _ = script;
+        }
+        catch (Exception ex) { log.Add("EXCEPTION: " + ex); }
+        finally
+        {
+            try { File.WriteAllLines(Path.Combine(dir, "probe.txt"), log, new UTF8Encoding(true)); } catch { }
+        }
+    }
+}

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace YuCap;
@@ -20,7 +21,7 @@ public sealed partial class MainForm
 
     private const string UserModelTagPrefix = "user:";
 
-    /// <summary>オプション → 自分専用モデル.</summary>
+    /// <summary>オプション → 自分専用モデル（右クリックのメニューにも同じものが入る）.</summary>
     private ToolStripMenuItem BuildTrainSubmenu()
     {
         var m = new ToolStripMenuItem(L.T("自分専用モデル"));
@@ -30,15 +31,114 @@ public sealed partial class MainForm
         };
         _trainCapItems.Add(collect);
         m.DropDownItems.Add(collect);
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("学習用の絵のフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.DataDirFor(_settings.ActiveProfile), null)));
+        var count = new ToolStripMenuItem(TrainCountText(), null, (_, _) => OpenFolder(UserModels.DataDirFor(_settings.ActiveProfile), null)) { Name = "traincount" };
+        _trainCountItems.Add(count);
+        m.DropDownItems.Add(count);
+        m.DropDownItems.Add(new ToolStripSeparator());
+
+        var start = new ToolStripMenuItem(L.T("学習を始める..."), null, (_, _) => ShowTrainDialog())
+        {
+            Name = "trainstart",
+            ToolTipText = L.T("集めた絵で、自分専用の拡大モデルを学習します。学習は別のプロセスで動くので、YuCap はそのまま使えます。"),
+        };
+        _trainStartItems.Add(start);
+        m.DropDownItems.Add(start);
+        var setup = new ToolStripMenuItem(L.T("学習の準備をする（約 3 GB ダウンロード）..."), null, (_, _) => OfferTrainSetup()) { Name = "trainsetup" };
+        _trainSetupItems.Add(setup);
+        m.DropDownItems.Add(setup);
+        var pause = new ToolStripMenuItem(L.T("学習中は映像の重い処理を止める"), null, (_, _) => ToggleTrainPause())
+        {
+            ToolTipText = L.T("学習のあいだ、拡大を標準に、フレーム補間とぼやけ取りをオフにして GPU を空けます。終わると元に戻ります（設定は書き換えません）。"),
+        };
+        _trainPauseItems.Add(pause);
+        m.DropDownItems.Add(pause);
+        m.DropDownItems.Add(new ToolStripSeparator());
+
+        var choose = new ToolStripMenuItem(L.T("自分専用モデルを選ぶ"));
+        choose.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
+        choose.DropDownOpening += (_, _) => FillTrainChoose(choose);
+        _trainChooseRoots.Add(choose);
+        m.DropDownItems.Add(choose);
         m.DropDownItems.Add(new ToolStripMenuItem(L.T("自分専用モデルのフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.ModelsDir, null)));
-        m.DropDownOpening += (_, _) => UpdateTrainChecks();
+        m.DropDownItems.Add(new ToolStripMenuItem(L.T("学習用の絵のフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.DataDirFor(_settings.ActiveProfile), null)));
+        m.DropDownItems.Add(new ToolStripMenuItem(L.T("学習のフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.Root, null)));
+        m.DropDownOpening += (_, _) => { UpdateTrainChecks(); RefreshTrainCount(); };
         return m;
+    }
+
+    private string TrainCountText() =>
+        _trainCountCache >= 0 ? L.F("集めた絵: {0} 枚（フォルダーを開く）", _trainCountCache) : L.T("集めた絵（フォルダーを開く）");
+
+    /// <summary>Count the collected pictures of the active profile off the UI thread, then show the number in the menu.</summary>
+    private void RefreshTrainCount()
+    {
+        string dir = UserModels.DataDirFor(_settings.ActiveProfile);
+        _ = Task.Run(() =>
+        {
+            int n = TrainEnv.CountPictures(dir);
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    _trainCountCache = n;
+                    foreach (var i in _trainCountItems) i.Text = TrainCountText();
+                }));
+            }
+            catch { /* closing */ }
+        });
+    }
+
+    /// <summary>自分専用モデルを選ぶ: the trained models, newest first (each with its layout), plus the way back to the built-in くっきり.</summary>
+    private void FillTrainChoose(ToolStripMenuItem root)
+    {
+        root.DropDownItems.Clear();
+        bool crisp = _settings.ScalingQuality == "anime4k";
+        root.DropDownItems.Add(new ToolStripMenuItem(L.T("内蔵のくっきり"), null, (_, _) => { _settings.A4kModel = ""; SetScalingQuality("anime4k"); })
+        {
+            Checked = crisp && !UserModelActive,
+            Enabled = _video.SupportsScalingQuality,
+        });
+        List<string> names = UserModels.List();
+        if (names.Count == 0)
+        {
+            root.DropDownItems.Add(new ToolStripMenuItem(L.T("（まだありません。学習を始めると作れます）")) { Enabled = false });
+            return;
+        }
+        root.DropDownItems.Add(new ToolStripSeparator());
+        foreach (string name in names)
+        {
+            string n = name;
+            char arch = UserModels.ArchOf(UserModels.PathOf(n));
+            root.DropDownItems.Add(new ToolStripMenuItem($"{n}（{arch}）", null, (_, _) => SetUserModel(n))
+            {
+                Checked = crisp && string.Equals(_settings.A4kModel, n, StringComparison.OrdinalIgnoreCase),
+                Enabled = _video.SupportsScalingQuality,
+                ToolTipText = L.F("{0} 形のモデル（{1}）", arch, File.GetLastWriteTime(UserModels.PathOf(n)).ToString("yyyy-MM-dd HH:mm")),
+            });
+        }
+    }
+
+    private void ToggleTrainPause()
+    {
+        _settings.TrainPauseHeavy = !_settings.TrainPauseHeavy;
+        MarkSettingsDirty();
+        if (TrainRunning) SetTrainHold(_settings.TrainPauseHeavy);
+        UpdateTrainChecks();
     }
 
     private void UpdateTrainChecks()
     {
         foreach (var i in _trainCapItems) i.Checked = _settings.TrainCapture;
+        foreach (var i in _trainPauseItems) i.Checked = _settings.TrainPauseHeavy;
+        bool running = TrainRunning;
+        foreach (var i in _trainStartItems)
+            i.Text = running ? L.T("学習の経過を見る...") : L.T("学習を始める...");
+        bool ready = TrainEnv.Ready;
+        foreach (var i in _trainSetupItems)
+        {
+            i.Enabled = !ready && !_trainSetupRunning;
+            i.ToolTipText = ready ? L.T("学習の準備はできています。") : L.F("PyTorch などを {0} に入れます。押すと、入れるものを確かめてから始めます。", Path.Combine(UserModels.Root, "venv"));
+        }
     }
 
     private void ToggleTrainCapture()
@@ -86,6 +186,19 @@ public sealed partial class MainForm
         }
         TrainCapture? tc = _trainCap;
         _trainLive = tc != null && _video.IsRunning && !NoSignalNow && !_testRunning && !_frozen && WindowState != FormWindowState.Minimized;
+        if (_trainJob is { IsRunning: true } tj)
+        {
+            // a training run is going: its progress takes the place of the picture count
+            TrainStatus st = tj.Snapshot();
+            double total = tj.Options.Minutes;
+            double el = st.Phase == TrainStatus.PhaseKind.Training ? Math.Clamp(st.Minutes + (DateTime.UtcNow - st.MinutesAt).TotalMinutes, 0, total) : 0;
+            string t = st.Phase == TrainStatus.PhaseKind.Training ? L.F("学習中: {0:0} / {1:0.#} 分", el, total)
+                : st.Phase == TrainStatus.PhaseKind.Finishing ? L.T("学習: 仕上げ中") : L.T("学習: 準備中");
+            if (!_lblTrain.Visible) _lblTrain.Visible = true;
+            if (_lblTrain.Text != t) _lblTrain.Text = t;
+            _lblTrain.ToolTipText = L.T("自分専用モデルを学習しています。クリックで経過の窓を開きます。");
+            return;
+        }
         bool show = tc != null;
         if (_lblTrain.Visible != show) _lblTrain.Visible = show;
         if (!show) return;

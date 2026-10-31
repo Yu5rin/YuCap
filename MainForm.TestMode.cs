@@ -552,6 +552,7 @@ public sealed partial class MainForm
 
         steps.Add((L.F("機能の確認: {0}", L.T("プロファイルの自動切り替え")), secFunc, () => AutoProfileStep(secFunc)));
         steps.Add((L.F("機能の確認: {0}", L.T("スナップショット一覧")), secFunc, () => FeatureGallery(secFunc)));
+        steps.Add((L.F("機能の確認: {0}", L.T("自分専用モデルの学習")), secFunc, () => FeatureTrain(secFunc)));
         steps.Add((L.T("音声の確認"), secAudio, () => AudioStep(secAudio)));
         steps.Add((L.T("遅延の確認"), secAudio, () => LatencyStep(secAudio, videoOk)));
         steps.Add((L.T("ダイアログの確認"), secDlg, () => DialogStep(secDlg)));
@@ -2124,6 +2125,7 @@ public sealed partial class MainForm
             ShowBurstDialog, ShowAudioBufferSettings, ShowAvSyncDialog, ShowAdjustmentsDialog, ShowCropDialog,
             ShowSnapshotSettings, () => ShowSnapshotGallery(), ShowAbout, ShowShortcuts, ShowDeviceKeywordSettings, ShowHotkeySettings,
             () => AskProfileName(L.T("新しいプロファイル"), string.Empty, null),
+            ShowTrainDialog, () => AuditTrainWindow(false), () => AuditTrainWindow(true),
         };
         Ui.DialogAudit = AuditDialog;
         try

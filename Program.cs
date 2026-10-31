@@ -302,6 +302,11 @@ internal static partial class Program
             RunTrainCaptureProbe(tpDir, tpSec, tpDisp);
             return;
         }
+        if (args.Length > 0 && args[0] == "--train-job-probe")
+        {
+            RunTrainJobProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_train_job_probe"));
+            return;
+        }
         if (args.Length > 0 && args[0] == "--interp-seq-capture")
         {
             int sqFrames = 120; string sqDisp = "HISENSE"; Size sqSize = new(960, 540);
@@ -528,7 +533,7 @@ internal static partial class Program
     {
         "--list-formats", "--dump-menus", "--check-update", "--selftest", "--restart-stress", "--gpu-bench",
         "--live-triple-check", "--native-res-check", "--a4k-check", "--a4k-run", "--chroma-check", "--guard-check", "--refresh-hz-check", "--res-estimate-check",
-        "--nvof-probe", "--nvrtx-probe", "--interp-synth", "--interp-capture", "--dup-probe", "--interp-seq-capture", "--train-capture-probe", "--interp-seq-eval", "--interp-eval",
+        "--nvof-probe", "--nvrtx-probe", "--interp-synth", "--interp-capture", "--dup-probe", "--interp-seq-capture", "--train-capture-probe", "--train-job-probe", "--interp-seq-eval", "--interp-eval",
         "--interp-probe", "--vblank-probe", "--audio-probe", "--hdr-probe", "--render-test",
     };
 

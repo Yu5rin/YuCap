@@ -22,7 +22,7 @@ public sealed partial class MainForm
 
     private void AddStreamMenu(ToolStripMenuItem view)
     {
-        _miStream = new ToolStripMenuItem(L.T("配信用ウィンドウを開く"), null, (_, _) => ToggleStreamWindow());
+        _miStream = new ToolStripMenuItem(L.T("配信用ウィンドウを開く"), null, (_, _) => ToggleStreamWindow()) { Name = "stream" };
         _miStreamSize = new ToolStripMenuItem(L.T("配信用ウィンドウの大きさ"));
         foreach (string key in StreamSizes.Keys)
         {

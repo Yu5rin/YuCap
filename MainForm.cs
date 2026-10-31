@@ -147,6 +147,8 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _cmiTopmost = null!;
     private ToolStripMenuItem _cmiStatusBar = null!;
     private ToolStripMenuItem _cmiMenuBar = null!;
+    private ToolStripMenuItem _cmiMenuBarTop = null!;
+    private readonly List<ToolStripMenuItem> _ctxFull = new();   // the right-click menu's copies of ファイル .. ヘルプ (オプション included), in menu-bar order
 
     private ToolStripMenuItem _videoDevicesRoot = null!;
     private ToolStripMenuItem _audioDevicesRoot = null!;
@@ -305,9 +307,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         KeyPreview = true;
 
         BuildCanvas();
+        BuildContextMenu();     // before BuildMenu: both are made by the same builders, and the fields must end up on the menu bar's items
         BuildMenu();
         BuildStatusBar();
-        BuildContextMenu();
         ApplyMenuFonts();
 
         // Dark chrome: the picture itself is black, and the previous light
@@ -670,7 +672,21 @@ public sealed partial class MainForm : Form, IMessageFilter
         return new Point(x, y);
     }
 
+    /// <summary>
+    /// The menu bar. Each menu is made by its own builder that returns a brand-new item tree, so the right-click menu
+    /// (<see cref="BuildContextMenu"/>) can carry the same menus as submenus. The check/enable state of both copies follows
+    /// from <see cref="UpdateChecks"/> (the fields below point at the bar's copy; <see cref="MirrorMenuState"/> copies it to the other).
+    /// The right-click menu is built first, so these fields end up pointing at the menu bar's items.
+    /// </summary>
     private void BuildMenu()
+    {
+        _menu.Items.AddRange(new ToolStripItem[]
+        {
+            BuildFileMenu(), BuildDeviceMenu(), BuildVideoMenu(), BuildAudioMenu(), BuildViewMenu(), BuildProfilesMenu(), BuildOptionsMenu(), BuildHelpMenu(),
+        });
+    }
+
+    private ToolStripMenuItem BuildFileMenu()
     {
         // ---- ファイル: スナップショット操作と終了 ----
         var file = new ToolStripMenuItem(L.T("ファイル(&F)"));
@@ -682,7 +698,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             ShortcutKeyDisplayString = "Ctrl+C",
         };
-        _miBurst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog());
+        _miBurst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog()) { Name = "burst" };
         var gallery = new ToolStripMenuItem(L.T("スナップショット一覧..."), null, (_, _) => ShowSnapshotGallery())
         {
             ShortcutKeyDisplayString = "Ctrl+G",
@@ -698,20 +714,28 @@ public sealed partial class MainForm : Form, IMessageFilter
         file.DropDownItems.Add(openDir);
         file.DropDownItems.Add(new ToolStripSeparator());
         file.DropDownItems.Add(exit);
+        return file;
+    }
 
+    private ToolStripMenuItem BuildDeviceMenu()
+    {
         // ---- デバイス: 何を取り込むか（映像・音声の機器とモード） ----
         var device = new ToolStripMenuItem(L.T("デバイス(&D)"));
         _videoDevicesRoot = new ToolStripMenuItem(L.T("映像デバイス"));
         _audioDevicesRoot = new ToolStripMenuItem(L.T("音声デバイス"));
-        _videoDevicesRoot.DropDownOpening += (_, _) => RebuildVideoDeviceList();
-        _audioDevicesRoot.DropDownOpening += (_, _) => RebuildAudioDeviceList();
+        var videoDevices = _videoDevicesRoot;
+        var audioDevices = _audioDevicesRoot;
+        videoDevices.DropDownOpening += (_, _) => RebuildVideoDeviceList(videoDevices);
+        audioDevices.DropDownOpening += (_, _) => RebuildAudioDeviceList(audioDevices);
         _videoDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _audioDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _audioOutputRoot = new ToolStripMenuItem(L.T("音声の出力先"));
-        _audioOutputRoot.DropDownOpening += (_, _) => RebuildAudioOutputList();
+        var audioOutput = _audioOutputRoot;
+        audioOutput.DropDownOpening += (_, _) => RebuildAudioOutputList(audioOutput);
         _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _videoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
-        _videoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_videoModeRoot);
+        var videoMode = _videoModeRoot;
+        videoMode.DropDownOpening += (_, _) => RebuildVideoModeList(videoMode);
         _videoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
 
         device.DropDownItems.Add(_videoDevicesRoot);
@@ -722,7 +746,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         device.DropDownItems.Add(new ToolStripSeparator());
         device.DropDownItems.Add(new ToolStripMenuItem(L.T("優先デバイス設定..."), null,
             (_, _) => ShowDeviceKeywordSettings()));
+        return device;
+    }
 
+    private ToolStripMenuItem BuildVideoMenu()
+    {
         // ---- 映像: 絵の見え方（再生・拡大・補間・調整・描画方式） ----
         var video = new ToolStripMenuItem(L.T("映像(&V)"));
         video.DropDownOpening += (_, _) => UpdateChecks();
@@ -739,7 +767,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         video.DropDownItems.Add(BuildHdrSubmenu());
         video.DropDownItems.Add(BuildInterpolationItem());
         video.DropDownItems.Add(_miLowLatency);
-        _miStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle());
+        _miStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle()) { Name = "style" };
         video.DropDownItems.Add(_miStyle);
         video.DropDownItems.Add(new ToolStripSeparator());
         video.DropDownItems.Add(_miAdjust);
@@ -748,7 +776,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         video.DropDownItems.Add(BuildRotationSubmenu());
         video.DropDownItems.Add(new ToolStripSeparator());
         video.DropDownItems.Add(BuildRendererSubmenu());
+        return video;
+    }
 
+    private ToolStripMenuItem BuildAudioMenu()
+    {
         // ---- 音声 ----
         var audio = new ToolStripMenuItem(L.T("音声(&A)"));
         audio.DropDownOpening += (_, _) => UpdateChecks();
@@ -765,10 +797,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         audio.DropDownItems.Add(_miRestoreLevel);
         audio.DropDownItems.Add(new ToolStripSeparator());
         audio.DropDownItems.Add(new ToolStripMenuItem(L.T("音声バッファ設定..."), null, (_, _) => ShowAudioBufferSettings()));
+        return audio;
+    }
 
-        // ---- プロファイル ----
-        var profiles = BuildProfilesMenu();
-
+    private ToolStripMenuItem BuildViewMenu()
+    {
         // ---- 表示: ウィンドウと画面の使い方 ----
         var view = new ToolStripMenuItem(L.T("表示(&W)"));
         view.DropDownOpening += (_, _) => UpdateChecks();
@@ -823,7 +856,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         view.DropDownItems.Add(_miStatusBar);
         view.DropDownItems.Add(_miBorderless);
         view.DropDownItems.Add(_miTopmost);
+        return view;
+    }
 
+    private ToolStripMenuItem BuildOptionsMenu()
+    {
         // ---- オプション: アプリ全体の動作設定 ----
         var options = new ToolStripMenuItem(L.T("オプション(&O)"));
         var snapCfg = new ToolStripMenuItem(L.T("スナップショット設定..."), null, (_, _) => ShowSnapshotSettings());
@@ -862,7 +899,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         options.DropDownItems.Add(BuildTrainSubmenu());
         options.DropDownItems.Add(new ToolStripSeparator());
         options.DropDownItems.Add(lang);
+        return options;
+    }
 
+    private ToolStripMenuItem BuildHelpMenu()
+    {
         // ---- ヘルプ ----
         var help = new ToolStripMenuItem(L.T("ヘルプ(&H)"));
         var shortcuts = new ToolStripMenuItem(L.T("操作一覧..."), null, (_, _) => ShowShortcuts())
@@ -870,14 +911,13 @@ public sealed partial class MainForm : Form, IMessageFilter
             ShortcutKeyDisplayString = "F1",
         };
         _miCheckUpdate = new ToolStripMenuItem(L.T("更新を確認..."), null,
-            async (_, _) => await CheckForUpdatesAsync(manual: true));
+            async (_, _) => await CheckForUpdatesAsync(manual: true)) { Name = "checkupdate" };
         help.DropDownItems.Add(shortcuts);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("テストモード（自動試験）..."), null, (_, _) => ShowTestModeDialog()));
         help.DropDownItems.Add(new ToolStripSeparator());
         help.DropDownItems.Add(_miCheckUpdate);
         help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
-
-        _menu.Items.AddRange(new ToolStripItem[] { file, device, video, audio, view, profiles, options, help });
+        return help;
     }
 
     /// <summary>情報表示 > オフ / FPS だけ / 詳しく (Ctrl+Shift+I cycles through them).</summary>
@@ -1155,6 +1195,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         _lblVolume.Click += (_, _) => ToggleMute();
         _lblState.BorderSides = ToolStripStatusLabelBorderSides.Right;
         _lblState.ForeColor = Ui.Colors.Accent;
+        _lblTrain.Click += (_, _) => { if (TrainRunning) ShowTrainWindow(); };
         var filler = new ToolStripStatusLabel { Spring = true, Text = string.Empty };
         foreach (var l in new[] { _lblInterp, _lblScale, _lblCrisp, _lblTrain })
         {
@@ -1220,7 +1261,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (IsHandleCreated) BeginInvoke(new Action(old.Dispose));   // not while one of its own handlers may still be running
         else old.Dispose();
 
-        // 右クリックには、よく使うものだけ: 画面 → 再生 → 撮影 → 映像 → 表示・プロファイル → ウィンドウ → 終了
+        // 右クリック: 上によく使うもの（全画面 → 再生 → 撮影 → 映像 → 表示・プロファイル → ウィンドウ）、
+        // 区切りの下にメニューバーの中身をそのまま（ファイル〜ヘルプ）、最後に自分専用モデル・メニューバーの表示・終了。
+        // 最大化やメニューバーを隠したままでも、設定や学習まで右クリックから届く。
         _ctx.Items.Add(new ToolStripMenuItem(L.T("全画面表示"), null, (_, _) => ToggleFullscreen())
         {
             ShortcutKeyDisplayString = "F11",
@@ -1233,7 +1276,6 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットを保存"), null, (_, _) => SaveSnapshot()));
         _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットをコピー"), null, (_, _) => CopySnapshotToClipboard()));
-        _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショット一覧..."), null, (_, _) => ShowSnapshotGallery()));
         _ctx.Items.Add(new ToolStripSeparator());
 
         _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
@@ -1241,7 +1283,6 @@ public sealed partial class MainForm : Form, IMessageFilter
         _cmiVideoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         _ctx.Items.Add(_cmiVideoModeRoot);
         _ctx.Items.Add(BuildQualitySubmenu());
-        _ctx.Items.Add(BuildHdrSubmenu());
         _ctx.Items.Add(BuildInterpolationItem());
         _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
         _ctx.Items.Add(_cmiLowLatency);
@@ -1271,6 +1312,18 @@ public sealed partial class MainForm : Form, IMessageFilter
         window.DropDownItems.Add(_cmiStatusBar);
         _ctx.Items.Add(window);
         _ctx.Items.Add(new ToolStripSeparator());
+
+        // メニューバーの中身（それぞれ新しく作った別の項目。状態は UpdateChecks -> MirrorMenuState でそろう）
+        foreach (ToolStripMenuItem sub in new[] { BuildFileMenu(), BuildDeviceMenu(), BuildVideoMenu(), BuildAudioMenu(), BuildViewMenu(), BuildOptionsMenu(), BuildHelpMenu() })
+        {
+            sub.Text = StripMnemonic(sub.Text ?? string.Empty);
+            _ctxFull.Add(sub);
+            _ctx.Items.Add(sub);
+        }
+        _ctx.Items.Add(BuildTrainSubmenu());
+        _ctx.Items.Add(new ToolStripSeparator());
+        _cmiMenuBarTop = new ToolStripMenuItem(L.T("メニューバーを表示"), null, (_, _) => ToggleMenuBar()) { ShortcutKeyDisplayString = "F10" };
+        _ctx.Items.Add(_cmiMenuBarTop);
         _ctx.Items.Add(new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close()));
         _canvas.ContextMenuStrip = _ctx;
         _freezeView.ContextMenuStrip = _ctx;
@@ -1845,6 +1898,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
+        if (!_testRunning && e.CloseReason == CloseReason.UserClosing && !ConfirmCloseDuringTraining()) { e.Cancel = true; return; }
         // An update has already saved settings; re-saving here would capture the
         // torn-down state (no device, window mid-close) over the real settings.
         if (_testRunning)
@@ -1873,6 +1927,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             try { SaveSettings(); } catch { /* ignore */ }
         }
         _uiTimer.Stop();
+        StopTrainingOnClose();
         StreamOnMainClosing();
         _osdTimer.Stop();
         _devTimer.Stop();
@@ -2861,7 +2916,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         foreach (ToolStripItem i in items)
         {
-            i.Font = i == _miCheckUpdate ? MenuFont(dpi, _pendingUpdate != null) : MenuFont(dpi);
+            i.Font = i == _miCheckUpdate || i.Name == "checkupdate" ? MenuFont(dpi, _pendingUpdate != null) : MenuFont(dpi);
             if (i is ToolStripMenuItem m)
             {
                 m.DropDown.Font = MenuFont(dpi);
@@ -2919,9 +2974,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         _nativeResItems.Clear();
         _chromaItems.Clear();
         _restoreItems.Clear();
+        _shadowItems.Clear();
+        _streamSizeItems.Clear();
+        _sigOnItems.Clear();
+        _sigOffItems.Clear();
+        _trainCapItems.Clear();
+        _trainStartItems.Clear();
+        _trainSetupItems.Clear();
+        _trainPauseItems.Clear();
+        _trainCountItems.Clear();
+        _trainChooseRoots.Clear();
+        _ctxFull.Clear();
 
-        BuildMenu();
         BuildContextMenu(dpi);
+        BuildMenu();
         ApplyMenuFonts();
         MainMenuStrip = _menu;
         _menu.Visible = menuWasVisible;
@@ -2996,17 +3062,17 @@ public sealed partial class MainForm : Form, IMessageFilter
         Size displayBefore = _video.DisplayResolution;
         try
         {
-            _video.Quality = QualityOf(_settings.ScalingQuality);
+            _video.Quality = _trainHold ? ScalingQuality.Standard : QualityOf(_settings.ScalingQuality);   // _trainHold: 学習中は映像の重い処理を止める
             _video.Sharpness = _settings.FsrSharpness / 100f;
             _video.NativeResScale = _settings.NativeResScale;
             _video.ChromaGuided = _settings.ChromaGuided;
-            _video.RestoreMode = _settings.RestoreMode;
+            _video.RestoreMode = _trainHold ? "off" : _settings.RestoreMode;
             _video.HdrMode = _settings.HdrMode;
             _video.PixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
             _video.Adjustments = CurrentAdjustments();   // ignored by engines without the capability
             _video.Crop = new Padding(_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
             _video.LowLatency = _settings.LowLatency;    // read by the engine at its next start
-            _video.Interpolation = _settings.Interpolation;
+            _video.Interpolation = _settings.Interpolation && !_trainHold;
             _video.PowerSaveEnabled = !_testRunning || _testPowerSave;   // the test mode often runs on a black source: it must not be put to sleep
         }
         catch (Exception ex)
@@ -4015,13 +4081,13 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     // ---- Device / mode switching ----------------------------------------
 
-    private void RebuildVideoDeviceList()
+    private void RebuildVideoDeviceList(ToolStripMenuItem root)
     {
-        _videoDevicesRoot.DropDownItems.Clear();
+        root.DropDownItems.Clear();
         var devices = VideoEngine.EnumerateDevices();
         if (devices.Count == 0)
         {
-            _videoDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
+            root.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
             return;
         }
         foreach (var d in devices)
@@ -4032,17 +4098,17 @@ public sealed partial class MainForm : Form, IMessageFilter
                 Checked = string.Equals(info.Name, _video.CurrentDeviceName, StringComparison.Ordinal),
             };
             item.Click += (_, _) => SwitchVideoDevice(info);
-            _videoDevicesRoot.DropDownItems.Add(item);
+            root.DropDownItems.Add(item);
         }
     }
 
-    private void RebuildAudioDeviceList()
+    private void RebuildAudioDeviceList(ToolStripMenuItem root)
     {
-        _audioDevicesRoot.DropDownItems.Clear();
+        root.DropDownItems.Clear();
         var devices = AudioEngine.EnumerateDevices();
         if (devices.Count == 0)
         {
-            _audioDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
+            root.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
             return;
         }
         foreach (var d in devices)
@@ -4053,22 +4119,22 @@ public sealed partial class MainForm : Form, IMessageFilter
                 Checked = string.Equals(info.Name, _audio.CurrentDeviceName, StringComparison.Ordinal),
             };
             item.Click += (_, _) => SwitchAudioDevice(info);
-            _audioDevicesRoot.DropDownItems.Add(item);
+            root.DropDownItems.Add(item);
         }
     }
 
     /// <summary>Submenu 音声の出力先: the Windows default plus every active output, rebuilt each time it opens.</summary>
-    private void RebuildAudioOutputList()
+    private void RebuildAudioOutputList(ToolStripMenuItem root)
     {
-        _audioOutputRoot.DropDownItems.Clear();
+        root.DropDownItems.Clear();
         string? chosen = _settings.AudioOutputDeviceId;
         try
         {
             string defName = AudioEngine.DefaultRenderName() ?? L.T("なし");
             var def = new ToolStripMenuItem(L.F("Windows の既定（{0}）", defName)) { Checked = chosen == null };
             def.Click += (_, _) => SwitchAudioOutput(null, null);
-            _audioOutputRoot.DropDownItems.Add(def);
-            _audioOutputRoot.DropDownItems.Add(new ToolStripSeparator());
+            root.DropDownItems.Add(def);
+            root.DropDownItems.Add(new ToolStripSeparator());
 
             var outputs = AudioEngine.EnumerateRenderDevices();
             foreach (var o in outputs)
@@ -4076,17 +4142,17 @@ public sealed partial class MainForm : Form, IMessageFilter
                 var info = o;
                 var item = new ToolStripMenuItem(info.Name) { Checked = chosen != null && info.Id == chosen };
                 item.Click += (_, _) => SwitchAudioOutput(info.Id, info.Name);
-                _audioOutputRoot.DropDownItems.Add(item);
+                root.DropDownItems.Add(item);
             }
             if (chosen != null && !outputs.Any(o => o.Id == chosen))
-                _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（選んだ出力先は接続されていません）")) { Checked = true, Enabled = false });
+                root.DropDownItems.Add(new ToolStripMenuItem(L.T("（選んだ出力先は接続されていません）")) { Checked = true, Enabled = false });
             if (outputs.Count == 0)
-                _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
+                root.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
         }
         catch (Exception ex)
         {
             Log.Info("RebuildAudioOutputList failed: " + ex.Message);
-            _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
+            root.DropDownItems.Add(new ToolStripMenuItem(L.T("（デバイスなし）")) { Enabled = false });
         }
     }
 
@@ -4781,6 +4847,50 @@ public sealed partial class MainForm : Form, IMessageFilter
             item.Checked = (int)item.Tag! == _settings.PipSizePct;
         foreach (var item in _pipPosItems)
             item.Checked = (int)item.Tag! == _settings.PipCorner;
+        _cmiMenuBarTop.Checked = _menu.Visible;
+        UpdateTrainChecks();
+        MirrorMenuState();
+    }
+
+    /// <summary>"ファイル(&amp;F)" -> "ファイル" (the right-click menu has no Alt keys; "(&amp;F)" in a context menu would collide with its own letters).</summary>
+    internal static string StripMnemonic(string text)
+    {
+        int i = text.IndexOf("(&", StringComparison.Ordinal);
+        if (i > 0 && text.EndsWith(")", StringComparison.Ordinal)) text = text.Substring(0, i);
+        return text.Replace("&", string.Empty);
+    }
+
+    /// <summary>
+    /// The right-click menu holds its own copies of the menu bar's menus. <see cref="UpdateChecks"/> keeps the bar's items right; this copies
+    /// their check mark, enabled state, text, shortcut text and tool tip to the twin in the right-click menu (items are paired by position,
+    /// and only when their name or text agree - a drop-down that is filled when it opens may differ between the two for a while).
+    /// </summary>
+    private void MirrorMenuState()
+    {
+        if (_ctxFull.Count == 0 || _menu.Items.Count < 8) return;
+        int[] barIndex = { 0, 1, 2, 3, 4, 6, 7 };       // ファイル デバイス 映像 音声 表示 [プロファイル] オプション ヘルプ
+        for (int i = 0; i < _ctxFull.Count && i < barIndex.Length; i++)
+            if (_menu.Items[barIndex[i]] is ToolStripMenuItem bar)
+                MirrorItems(bar, _ctxFull[i]);
+    }
+
+    private void MirrorItems(ToolStripMenuItem src, ToolStripMenuItem dst)
+    {
+        ToolStripItemCollection a = src.DropDownItems, b = dst.DropDownItems;
+        int n = Math.Min(a.Count, b.Count);
+        for (int i = 0; i < n; i++)
+        {
+            if (a[i] is not ToolStripMenuItem x || b[i] is not ToolStripMenuItem y) continue;
+            bool same = (!string.IsNullOrEmpty(x.Name) && x.Name == y.Name) || x.Text == y.Text;
+            if (!same) continue;
+            if (y.Checked != x.Checked) y.Checked = x.Checked;
+            if (y.Enabled != x.Enabled) y.Enabled = x.Enabled;
+            if (y.Text != x.Text) y.Text = x.Text;
+            if (y.ShortcutKeyDisplayString != x.ShortcutKeyDisplayString) y.ShortcutKeyDisplayString = x.ShortcutKeyDisplayString;
+            if (y.ToolTipText != x.ToolTipText) y.ToolTipText = x.ToolTipText;
+            if (x.Name == "checkupdate" && y.Font != x.Font) y.Font = x.Font;
+            if (x.HasDropDownItems && y.HasDropDownItems) MirrorItems(x, y);
+        }
     }
 
     // ---- Keyboard --------------------------------------------------------

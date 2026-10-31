@@ -27,6 +27,7 @@ public sealed partial class MainForm
         string rootInfo = "", fontInfo = "";
         int fontChecked = 0;
         double fontWorst = 0;
+        int textsChecked = 0, topCount = 0, mismatches = 0;
 
         // pt per 100% of scaling: the same on every monitor when the font really follows the scaling
         double Norm(Font f, int d) => f.SizeInPoints * 96.0 / Math.Max(96, d);
@@ -59,6 +60,22 @@ public sealed partial class MainForm
                     L.English = english;
                     RebuildMenus(dpi);
                     await Wait(50);
+                }
+
+                // every menu bar item is also in the right-click menu, and the two copies agree on check marks / enabled state
+                {
+                    var barTexts = new SortedSet<string>(StringComparer.Ordinal);
+                    var ctxTexts = new HashSet<string>(StringComparer.Ordinal);
+                    CollectMenuTexts(_menu.Items, barTexts);
+                    CollectMenuTexts(_ctx.Items, ctxTexts);
+                    foreach (string t in barTexts)
+                        if (!ctxTexts.Contains(t)) problems.Add($"{lang}メニューバーの「{t}」が右クリックのメニューにありません");
+                    textsChecked += barTexts.Count;
+                    topCount = _ctx.Items.OfType<ToolStripMenuItem>().Count();
+                    UpdateChecks();
+                    int mm = CountMirrorMismatches();
+                    mismatches += mm;
+                    if (mm > 0) problems.Add($"{lang}メニューバーと右クリックのメニューで、チェックや有効・無効が食い違う項目が {mm} 個あります");
                 }
 
                 _ctx.Show(at);
@@ -134,6 +151,8 @@ public sealed partial class MainForm
             RebuildMenus(dpi);
         }
 
+        it.Num("メニューバーの項目名が右クリックにもある", $"{textsChecked} 個（日本語・英語の合計）").Num("右クリックの最上位の項目", $"{topCount} 個")
+          .Num("メニューバーと右クリックの状態の食い違い", $"{mismatches} 個");
         it.Num("開いたメニュー", $"{menusOpened} 個").Num("調べた項目", $"{checkedItems} 個")
           .Num("文字の大きさ", fontInfo).Num("文字を調べた項目", $"{fontChecked} 個（最大のずれ {Math.Round(fontWorst * 100)}%、5% まで許容）")
           .Num("親のメニューの項目の高さ", rootInfo).Num("最大のずれ", $"{Math.Round(worst * 100)}%（15% まで許容）");
@@ -146,6 +165,39 @@ public sealed partial class MainForm
             it.Explanation = string.Join("\n", problems.Distinct().Take(30));
         }
         sec.Items.Add(it);
+    }
+
+    private static void CollectMenuTexts(ToolStripItemCollection items, ISet<string> set)
+    {
+        foreach (ToolStripItem i in items)
+        {
+            if (i is ToolStripSeparator) continue;
+            string t = StripMnemonic(i.Text ?? string.Empty);
+            if (t.Length > 0) set.Add(t);
+            if (i is ToolStripMenuItem m) CollectMenuTexts(m.DropDownItems, set);
+        }
+    }
+
+    /// <summary>Items of the menu bar whose twin in the right-click menu shows another check mark or enabled state (after <see cref="UpdateChecks"/> there must be none).</summary>
+    private int CountMirrorMismatches()
+    {
+        int[] barIndex = { 0, 1, 2, 3, 4, 6, 7 };
+        int n = 0;
+        int Walk(ToolStripMenuItem a, ToolStripMenuItem b)
+        {
+            int c = 0;
+            for (int i = 0; i < Math.Min(a.DropDownItems.Count, b.DropDownItems.Count); i++)
+            {
+                if (a.DropDownItems[i] is not ToolStripMenuItem x || b.DropDownItems[i] is not ToolStripMenuItem y) continue;
+                if (!((!string.IsNullOrEmpty(x.Name) && x.Name == y.Name) || x.Text == y.Text)) continue;
+                if (x.Checked != y.Checked || x.Enabled != y.Enabled) c++;
+                if (x.HasDropDownItems && y.HasDropDownItems) c += Walk(x, y);
+            }
+            return c;
+        }
+        for (int i = 0; i < _ctxFull.Count && i < barIndex.Length; i++)
+            if (_menu.Items[barIndex[i]] is ToolStripMenuItem bar) n += Walk(bar, _ctxFull[i]);
+        return n;
     }
 
     /// <summary>FPS だけ: the dark box hugs the number with the same margin on every side, in the state with one line and with two.</summary>

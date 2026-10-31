@@ -62,6 +62,11 @@ public sealed class AppSettings
     /// <summary>学習用の絵を集める: save full-size source frames while playing (off by default), and the size cap of the folder in GB.</summary>
     public bool TrainCapture { get; set; }
     public int TrainCapGb { get; set; } = 5;
+    /// <summary>アプリの中で学習するときの前回の選び方、と「学習中は映像の重い処理を止める」。</summary>
+    public int TrainMinutes { get; set; } = 30;
+    public string TrainArch { get; set; } = "M";             // "M" | "L"
+    public string TrainLoss { get; set; } = "edge";          // "edge" | "texture"
+    public bool TrainPauseHeavy { get; set; } = true;
     public string RestoreMode { get; set; } = "off";         // "off" | "on" (d3d only): Anime4K Restore (ぼやけ取り) before upscaling           // 色のにじみを抑える (d3d only): luma-guided chroma upsampling in the convert pass
 
     // Picture adjustments (Direct3D renderer only), in slider units; the defaults are neutral.
@@ -254,6 +259,9 @@ public sealed class AppSettings
         A4kModel = (A4kModel ?? "").Trim();
         if (A4kModel != Path.GetFileName(A4kModel)) A4kModel = "";        // a name, never a path
         TrainCapGb = Math.Clamp(TrainCapGb, 1, 500);
+        TrainMinutes = Math.Clamp(TrainMinutes, 1, 600);
+        TrainArch = TrainArch == "L" ? "L" : "M";
+        TrainLoss = TrainLoss == "texture" ? "texture" : "edge";
         FsrSharpness = Math.Clamp(FsrSharpness, 0, 100);
         NativeResScale = NormalizeNativeRes(NativeResScale);
         RestoreMode = NormalizeRestore(RestoreMode);

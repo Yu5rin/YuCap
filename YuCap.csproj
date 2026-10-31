@@ -30,6 +30,11 @@
     <EmbeddedResource Include="Shaders\*.hlsl" LogicalName="Shaders.%(Filename)%(Extension)" />
     <EmbeddedResource Include="third_party/FidelityFX-FSR1/ffx_a.h" LogicalName="Shaders.ffx_a.h" />
     <EmbeddedResource Include="third_party/FidelityFX-FSR1/ffx_fsr1.h" LogicalName="Shaders.ffx_fsr1.h" />
+    <!-- 自分専用モデルの学習用スクリプト: exe に埋め込み、学習のときに %LOCALAPPDATA%\YuCapTrain	ools へ取り出す -->
+    <EmbeddedResource Include="tools\*.py" LogicalName="Tools.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="tools\setup_train_env.ps1" LogicalName="Tools.setup_train_env.ps1" />
+    <EmbeddedResource Include="third_party\Anime4K\Anime4K_Upscale_CNN_x2_*.glsl" LogicalName="Tools.glsl.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="third_party\Anime4K\LICENSE" LogicalName="Tools.glsl.LICENSE" />
   </ItemGroup>
 
 </Project>
