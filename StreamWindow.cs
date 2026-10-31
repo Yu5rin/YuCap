@@ -46,6 +46,8 @@ internal sealed class StreamForm : Form
     private const int WmSetCursor = 0x0020;
     private const int HtClient = 1;
     private const int WmGetMinMaxInfo = 0x0024;
+    private const int WmMouseActivate = 0x0021;
+    private const int MaNoActivate = 3;
     [StructLayout(LayoutKind.Sequential)] private struct Pt { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct MinMaxInfo { public Pt Reserved, MaxSize, MaxPosition, MinTrack, MaxTrack; }
     [DllImport("user32.dll")] private static extern IntPtr SetCursor(IntPtr hCursor);
@@ -93,6 +95,7 @@ internal sealed class StreamForm : Form
             Marshal.StructureToPtr(mm, m.LParam, false);
             return;
         }
+        if (m.Msg == WmMouseActivate) { m.Result = (IntPtr)MaNoActivate; return; }   // a click on it does not activate it either
         if (m.Msg == WmSetCursor && (m.LParam.ToInt64() & 0xFFFF) == HtClient)
         {
             SetCursor(IntPtr.Zero);

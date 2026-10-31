@@ -14,6 +14,17 @@ namespace YuCap;
 public sealed partial class MainForm
 {
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr h, System.Text.StringBuilder sb, int max);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+
+    private static string FgDescribe(IntPtr h)
+    {
+        if (h == IntPtr.Zero) return "なし";
+        var sb = new System.Text.StringBuilder(128);
+        GetWindowText(h, sb, sb.Capacity);
+        GetWindowThreadProcessId(h, out uint pid);
+        return $"「{sb}」(pid {pid}{(pid == (uint)Environment.ProcessId ? "・YuCap" : "")})";
+    }
 
     private bool _testPowerSave;     // the 信号なし step measures with the power saving on
 
@@ -150,6 +161,7 @@ public sealed partial class MainForm
             _settings.StreamWindowSize = "1920x1080";
             IntPtr fgBefore = GetForegroundWindow();
             OpenStreamWindow();
+            IntPtr fgNow = GetForegroundWindow();      // right after Show: what opening the window itself did, before anything else can move the focus
             // the first moments after a window appears: DWM and the window itself settle (one short hitch of the main window's
             // presents was seen here); they are looked at on their own and kept out of the comparison below
             var openTl = new List<long>();
@@ -157,7 +169,10 @@ public sealed partial class MainForm
             for (int t = 0; t < 3500; t += 500) { await Wait(500); long nw = _video.FramesPresented; openTl.Add(nw - po); po = nw; }
             item.Num("開いた直後の 0.5 秒ごとの表示回数（3.5 秒間）", string.Join(",", openTl) + "（60 fps の映像なら 30 前後）");
             IntPtr fgAfter = GetForegroundWindow();
-            bool focusKept = fgBefore == fgAfter && !(_stream != null && fgAfter == _stream.Handle);
+            bool streamIsFg = _stream != null && (fgNow == _stream.Handle || fgAfter == _stream.Handle);
+            bool focusKept = fgBefore == fgNow && !streamIsFg;                       // judged on the moment of opening
+            string fgLater = fgAfter == fgNow ? "" : "（開いた直後は動かず、その後 " + FgDescribe(fgAfter) + " が前に出ました。開いたことが原因ではありません）";
+            Log.Info($"stream focus: before {FgDescribe(fgBefore)}, right after Show {FgDescribe(fgNow)}, after 3.5 s {FgDescribe(fgAfter)}");
             if (_stream == null) throw new InvalidOperationException("配信用ウィンドウを開けませんでした");
             Size want = new(1920, 1080);
             bool sizeOk = _stream.ClientSize == want;
@@ -168,7 +183,7 @@ public sealed partial class MainForm
             bool snapOk = s1 != null && s1.Size == want;
             item.Num("窓の大きさ（指定 1920x1080）", $"{_stream.ClientSize.Width}x{_stream.ClientSize.Height}" + (sizeOk ? "" : "（違います）"))
                 .Num("映像の大きさ（読み戻し）", s1 != null ? $"{s1.Width}x{s1.Height}" : "読み戻せませんでした")
-                .Num("フォーカス", focusKept ? "開いても奪いませんでした" : "開いたときにフォーカスが動きました")
+                .Num("フォーカス", focusKept ? "開いても奪いませんでした" + fgLater : "開いたときにフォーカスが動きました（" + FgDescribe(fgBefore) + " → " + FgDescribe(fgNow) + "）")
                 .Num("配信用ウィンドウに出したコマ数", $"{w.StreamPerSec:0.0} 回/秒（本体の表示 {w.MainPerSec:0.0} 回/秒）")
                 .Num("配信用の描画にかかる CPU 時間（描画スレッド）", _video.StreamCpu is { N: > 0 } sc ? $"平均 {sc.Avg:0.00} ms／最大 {sc.Max:0.00} ms（{sc.N} 回）／ 内訳 {_video.StreamParts}" : "計れませんでした");
             if (!sizeOk) { v = Worst(v, Verdict.Ng); why.Add("窓の大きさが指定どおりになりませんでした。"); }

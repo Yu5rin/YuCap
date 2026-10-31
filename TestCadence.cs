@@ -84,6 +84,24 @@ internal static class CadenceCheck
         return res;
     }
 
+    /// <summary>The usual number of frames between new pictures (median) and how many times the picture stood still far longer than that
+    /// (a hitch or a loading screen, not the game's own rate).</summary>
+    public static (double Typical, int Stalls, int LongestFrames) Gaps(IReadOnlyList<D3DRenderer.TimelineFrame> frames)
+    {
+        var gaps = new List<int>();
+        int since = 0; bool started = false;
+        foreach (D3DRenderer.TimelineFrame f in frames)
+        {
+            if (!f.Dup) { if (started) gaps.Add(since); started = true; since = 1; }
+            else since++;
+        }
+        if (gaps.Count < 4) return (0, 0, 0);
+        var sorted = gaps.OrderBy(g => g).ToList();
+        double med = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : 0.5 * (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]);
+        int stalls = gaps.Count(g => g >= 6 && g > 2.5 * med);
+        return (med, stalls, sorted[^1]);
+    }
+
     /// <summary>How the new pictures follow each other, in frames: "2 コマおき（30 回/秒）" or "1 と 2 コマおきの交互" ...</summary>
     public static string DescribeCadence(IReadOnlyList<D3DRenderer.TimelineFrame> frames, double inputFps)
     {

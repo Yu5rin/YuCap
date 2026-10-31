@@ -442,7 +442,11 @@ public sealed partial class MainForm
             }
             item.Num("新しい絵の出方", CadenceCheck.DescribeCadence(frames, inputFps));
 
-            bool repeats = game < inputFps * 0.9;
+            // judged on the usual spacing of new pictures, not on the averaged rate: one long freeze (a loading screen) pulls the average
+            // far down although the game draws every frame, and nothing repeats then
+            (double typGap, int stalls, int longest) = CadenceCheck.Gaps(frames);
+            bool repeats = typGap >= 1.3 || (typGap == 0 && game < inputFps * 0.9);
+            if (typGap > 0) item.Num("ふだんの新しい絵の間隔", $"{typGap:0.0} コマに 1 回（約 {inputFps / typGap:0.0} 回/秒）" + (stalls > 0 ? $"／ 途中で絵が長く止まった回 {stalls}（最長 {longest} コマ分。読み込みなどの一時的な停止で、ゲームのコマ数ではありません）" : ""));
             CadenceCheck.SimResult oldR = CadenceCheck.Simulate(frames, panel, margin, nominalMs, extraMs, latMs, periodMs, false);
             CadenceCheck.SimResult newR = CadenceCheck.Simulate(frames, panel, margin, nominalMs, extraMs, latMs, periodMs, true);
             item.Num("繰り返しのコマ", $"{frames.Count(f => f.Dup)} / {frames.Count} コマ（直前と同じ絵）")
@@ -457,7 +461,9 @@ public sealed partial class MainForm
             {
                 item.Verdict = Verdict.Info;
                 item.Summary = "ゲームが映像と同じコマ数で描画しているため、この補間は働きません";
-                why.Add($"映像は {inputFps:0} fps、ゲームの新しい絵は {game:0} fps で、繰り返しのコマはほとんどありません。このときの補間は従来と同じ動きで、確認する項目がありません。");
+                why.Add(stalls > 0
+                    ? $"映像は {inputFps:0} fps で、ふだんは毎コマ新しい絵が届いています（繰り返しのコマは、途中で絵が止まった間だけです）。止まった間があるため、ゲームのコマ数の平均は {game:0} fps に下がって見えます。このときの補間は従来と同じ動きで、確認する項目がありません。"
+                    : $"映像は {inputFps:0} fps、ゲームの新しい絵は {game:0} fps で、繰り返しのコマはほとんどありません。このときの補間は従来と同じ動きで、確認する項目がありません。");
                 why.Add("30 fps や 40 fps で描画するゲームを 60 fps で取り込むと、同じ絵が続けて届きます。そのときにこの補間が働きます。");
             }
             else

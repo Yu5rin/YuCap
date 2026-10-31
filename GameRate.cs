@@ -166,6 +166,25 @@ internal sealed class UniqueTimeline
 
     public void Reset() { _n = 0; _pos = 0; _have = false; _cad = false; _shortRun = 0; PeriodTicks = 0; PhaseLagTicks = 0; }
 
+    private readonly double[] _iv = new double[Window], _sorted = new double[Window];
+
+    /// <summary>Mean spacing of the unique pictures of the window, without the stalls: an interval longer than 2.5 times the median one
+    /// (a hitch, a loading screen shorter than the pause that restarts the window) would otherwise lift the period for the next dozen
+    /// pictures and, since "pictures repeat" is decided from it, make a game that draws every frame look like a slow one.</summary>
+    private double RobustPeriod(double nominalTicks)
+    {
+        int m = _n - 1;
+        for (int i = 0; i < m; i++)
+            _iv[i] = _s[(_pos + Window - _n + i + 1) % Window] - _s[(_pos + Window - _n + i) % Window];
+        Array.Copy(_iv, _sorted, m);
+        Array.Sort(_sorted, 0, m);
+        double med = m % 2 == 1 ? _sorted[m / 2] : 0.5 * (_sorted[m / 2 - 1] + _sorted[m / 2]);
+        double limit = Math.Max(2.5 * med, 1.0);
+        double sum = 0; int cnt = 0;
+        for (int i = 0; i < m; i++) if (_iv[i] <= limit) { sum += _iv[i]; cnt++; }
+        return cnt > 0 ? sum / cnt : nominalTicks;
+    }
+
     /// <summary>Time of the next unique picture, which has smoothed arrival <paramref name="smooth"/>.</summary>
     public long Resolve(long smooth, double nominalTicks)
     {
@@ -189,12 +208,7 @@ internal sealed class UniqueTimeline
         if (_n < Window) _n++;
 
         double p = nominalTicks;
-        if (_n >= 3)
-        {
-            long newest = smooth;
-            long oldest = _s[(_pos + Window - _n) % Window];
-            p = (newest - oldest) / (double)(_n - 1);
-        }
+        if (_n >= 3) p = RobustPeriod(nominalTicks);
         PeriodTicks = _n >= 3 ? p : 0;
         double ratio = p / nominalTicks;
         if (!_cad && _n >= 3 && ratio >= 1.3) _cad = true;
