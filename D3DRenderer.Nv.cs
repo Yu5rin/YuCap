@@ -187,7 +187,7 @@ internal sealed partial class D3DRenderer
     }
 
     // ------------------------------------------------------------------ HDR display
-    private ID3D11PixelShader? _psHdr, _psOverlayPq, _psCopy;
+    private ID3D11PixelShader? _psHdr, _psOverlayPq;
     private ID3D11Buffer? _cbHdr;
     private ID3D11Texture2D? _sdrTex;
     private ID3D11ShaderResourceView? _sdrSrv;
@@ -207,20 +207,19 @@ internal sealed partial class D3DRenderer
         {
             _psHdr = Device.CreatePixelShader(b.Hdr);
             _psOverlayPq = Device.CreatePixelShader(b.HdrOverlay);
-            _psCopy = Device.CreatePixelShader(b.HdrCopy);
             _cbHdr = Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         }
         catch (Exception ex)
         {
             Log.Info("D3D: HDR shader could not be created: " + ex.Message.Split('\n')[0]);
-            _psHdr?.Dispose(); _psOverlayPq?.Dispose(); _psCopy?.Dispose(); _cbHdr?.Dispose(); _psHdr = null; _psOverlayPq = null; _psCopy = null; _cbHdr = null;
+            _psHdr?.Dispose(); _psOverlayPq?.Dispose(); _cbHdr?.Dispose(); _psHdr = null; _psOverlayPq = null; _cbHdr = null;
         }
     }
 
     private void DisposeNv()
     {
         FreeHdrTextures();
-        _psHdr?.Dispose(); _psOverlayPq?.Dispose(); _psCopy?.Dispose(); _cbHdr?.Dispose();
+        _psHdr?.Dispose(); _psOverlayPq?.Dispose(); _cbHdr?.Dispose();
         _nvS?.Dispose(); _nvH?.Dispose(); _nvS = _nvH = null;
         _nvOutSrv?.Dispose(); _nvOut?.Dispose(); _nvOutSrv = null; _nvOut = null;
     }
@@ -260,20 +259,13 @@ internal sealed partial class D3DRenderer
         catch { return null; }
     }
 
-    /// <summary>The swap chain is R10G10B10A2 with the SDR colour space because the monitor is in Windows HDR mode and the user's HDR display is off.
-    /// A composition swap chain of B8G8R8A8 on such a monitor is composed by DWM and held to the primary monitor's refresh rate (measured: 60 Hz on a
-    /// 144 Hz TV beside a 59.94 Hz primary); a 10-bit one is presented at the monitor's own rate. The picture is the same sRGB codes, DWM maps them as for any SDR window.</summary>
-    private volatile bool _wideSdr;
-    private bool _wideFailed, _monHdrBusy;
-    /// <summary>Only the composition (vsync) swap chain needs it: a window swap chain is not held back.</summary>
-    private bool WideEligible => _psCopy != null && !_wideFailed && _swap != null && PresentMode == "composition vsync";
+    private bool _monHdrBusy;
 
-    /// <summary>Render thread, before every frame: switch the swap chain between SDR, 10-bit SDR (Windows HDR monitor) and HDR10 to match the request and the monitor.</summary>
+    /// <summary>Render thread, before every frame: switch the swap chain between SDR and HDR10 to match the request and the monitor.</summary>
     private void HdrUpdate()
     {
         int want = HdrModeRequested;
-        bool wideOk = WideEligible;
-        if (want == 0 && _hdrKind == 0 && !wideOk && !_wideSdr) return;
+        if (want == 0 && _hdrKind == 0) return;
         long now = Environment.TickCount64;
         if (_hdrCheckAt == 0)
         {
@@ -291,8 +283,7 @@ internal sealed partial class D3DRenderer
         bool can = want != 0 && _psHdr != null && monHdr && _swap != null;
         int kind = !can ? 0 : (want == 1 && !_hdrRtxBroken ? 1 : 2);
         if (kind == 1 && !RtxHdrReady()) { kind = 2; _hdrRtxWhy = "このドライバー・GPU では RTX Video HDR を使えません"; }
-        bool wide = kind == 0 && monHdr && wideOk;
-        if (kind == _hdrKind && wide == _wideSdr) return;
+        if (kind == _hdrKind) return;
         if (_hdrKind == 0 && kind != 0 && !SetSwapMode(2)) { _hdrNote = "HDR の出力に切り替えられませんでした"; kind = 0; HdrModeRequested = 0; return; }
         if (kind == 1 && !_hdrRtxChecked)
         {
@@ -301,10 +292,7 @@ internal sealed partial class D3DRenderer
             if (!RtxHdrEngaged()) { _hdrRtxBroken = true; kind = 2; _hdrRtxWhy = "RTX Video HDR がこの環境で働かないため（オン / オフで絵が変わらない）"; Log.Info("D3D: RTX Video HDR does not change the picture here - using the simple HDR"); }
             if (kind == _hdrKind) { HdrActiveKind = kind; HdrActiveNote = _hdrNote = _hdrRtxWhy + "、簡易の HDR にしています"; return; }
         }
-        if (kind == 0 && (_hdrKind != 0 || wide != _wideSdr))
-        {
-            if (!SetSwapMode(wide ? 1 : 0) && wide) { _wideFailed = true; Log.Info("D3D: the 10-bit SDR swap chain could not be set up - staying with B8G8R8A8"); }
-        }
+        if (kind == 0 && _hdrKind != 0) SetSwapMode(0);
         if (kind != 0) _hdrNote = kind == 1 ? "" : (want == 1 ? _hdrRtxWhy + "、簡易の HDR にしています" : "");
         else _hdrNote = want != 0 && !monHdr ? "このモニターの HDR がオフです" : "";
         _hdrKind = kind;
@@ -381,7 +369,7 @@ internal sealed partial class D3DRenderer
         catch (Exception ex) { Log.Info("D3D: RTX Video HDR check failed: " + ex.Message.Split((char)10)[0]); return false; }
     }
 
-    /// <summary>0 = B8G8R8A8 + sRGB (SDR), 1 = R10G10B10A2 + sRGB (SDR picture, Windows HDR monitor), 2 = R10G10B10A2 + HDR10 (G2084, BT.2020).</summary>
+    /// <summary>0 = B8G8R8A8 + sRGB (SDR), 2 = R10G10B10A2 + HDR10 (G2084, BT.2020).</summary>
     private bool SetSwapMode(int mode)
     {
         if (_swap == null) return false;
@@ -400,9 +388,8 @@ internal sealed partial class D3DRenderer
             }
             _swap.ResizeBuffers(0, (uint)_swapSize.Width, (uint)_swapSize.Height, mode == 0 ? Format.B8G8R8A8_UNorm : Format.R10G10B10A2_UNorm, _swapFlags).CheckError();
             sc3.SetColorSpace1(cs);
-            _wideSdr = mode == 1;
-            _swapFormatDesc = mode switch { 0 => "B8G8R8A8 / sRGB (SDR)", 1 => "R10G10B10A2 / sRGB (SDR picture; Windows HDR monitor)", _ => "R10G10B10A2 / G2084 BT.2020 (HDR10)" };
-            _swapColorSpace = mode == 2 ? "G2084 / BT.2020 (HDR10), R10G10B10A2" : mode == 1 ? "G22 / sRGB (SDR), R10G10B10A2" : "G22 / sRGB (SDR)";
+            _swapFormatDesc = mode == 0 ? "B8G8R8A8 / sRGB (SDR)" : "R10G10B10A2 / G2084 BT.2020 (HDR10)";
+            _swapColorSpace = mode == 2 ? "G2084 / BT.2020 (HDR10), R10G10B10A2" : "G22 / sRGB (SDR)";
             HdrSwapColorSpace = _swapColorSpace;
             return true;
         }
@@ -410,27 +397,13 @@ internal sealed partial class D3DRenderer
         {
             Log.Info("D3D: switching the swap chain format failed: " + ex.Message.Split('\n')[0]);
             try { _swap.ResizeBuffers(0, (uint)_swapSize.Width, (uint)_swapSize.Height, Format.B8G8R8A8_UNorm, _swapFlags); } catch { }
-            _wideSdr = false; _swapFormatDesc = "B8G8R8A8 / sRGB (SDR)";
+            _swapFormatDesc = "B8G8R8A8 / sRGB (SDR)";
             return false;
         }
     }
     private volatile string _swapFormatDesc = "B8G8R8A8 / sRGB (SDR)";
     /// <summary>The swap chain format and colour space in use (any thread; for the test mode).</summary>
     public string SwapFormatDesc => _swapFormatDesc;
-    /// <summary>The 10-bit SDR swap chain is in use (the monitor is in Windows HDR mode, the HDR display is off).</summary>
-    public bool WideSdrActive => _wideSdr;
-
-    /// <summary>SDR picture -> 10-bit back buffer, codes unchanged.</summary>
-    private void WideCopy(ID3D11ShaderResourceView srcSrv, ID3D11RenderTargetView outRtv, Size size)
-    {
-        SetupTriangle(outRtv, new Rectangle(Point.Empty, size));
-        Ctx.PSSetShader(_psCopy);
-        Ctx.PSSetSampler(0, _point);
-        Ctx.PSSetShaderResource(0, srcSrv);
-        Ctx.Draw(3, 0);
-        Ctx.PSSetShaderResource(0, null!);
-    }
-
     private void WriteHdrCb()
     {
         WriteCb(_cbHdr!, new Vector4(HdrPaperWhite, Math.Max(HdrPaperWhite, HdrPeak), HdrKnee, 0));
@@ -466,8 +439,7 @@ internal sealed partial class D3DRenderer
         using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))
         {
             // straight into the HDR10 back buffer: the driver applies RTX Video HDR to a video-processor output that is a swap-chain buffer
-            if (_hdrKind != 0) HdrConvert(_hdrKind, _sdrTex!, _sdrSrv!, bb, rtv, _swapSize);
-            else WideCopy(_sdrSrv!, rtv, _swapSize);
+            HdrConvert(_hdrKind, _sdrTex!, _sdrSrv!, bb, rtv, _swapSize);
             _gpu?.End();
             if (_hdrKind == 1 && _hdrRtxReadback) { _hdrRtxReadback = false; _hdrRtxRaw = ReadTexBytes(bb, _swapSize.Width, _swapSize.Height, 4); }
             if (_hdrKind != 0 && overlays != null && overlays.Length > 0) { WriteHdrCb(); Ctx.PSSetConstantBuffer(1, _cbHdr); }
@@ -586,42 +558,6 @@ internal sealed partial class D3DRenderer
             uint v = BitConverter.ToUInt32(raw, ((H / 2) * W + x) * 4);
             float r = (v & 0x3FF) / 1023f, g = ((v >> 10) & 0x3FF) / 1023f, bl = ((v >> 20) & 0x3FF) / 1023f;
             res[i] = Math.Max(PqToNits(r), Math.Max(PqToNits(g), PqToNits(bl)));
-        }
-        return res;
-    }
-
-    /// <summary>Render thread, 10-bit SDR swap chain only: draw vertical grey bars (sRGB codes) through the live path (<see cref="WideCopy"/>), read the back
-    /// buffer before Present and return each bar as an 8-bit code (10-bit value / 1023 x 255). Null when the swap chain is not the 10-bit SDR one.</summary>
-    internal float[]? WideLiveCheck(int[] codes, out string why)
-    {
-        why = "";
-        if (!_wideSdr || _swap == null || _swapSize.Width <= 0) { why = "10bit の SDR 出力になっていません"; return null; }
-        int W = _swapSize.Width, H = _swapSize.Height;
-        EnsureHdrTextures(_swapSize);
-        var px = new byte[W * H * 4];
-        for (int x = 0; x < W; x++)
-        {
-            byte c = (byte)codes[Math.Min(codes.Length - 1, x * codes.Length / W)];
-            px[x * 4] = px[x * 4 + 1] = px[x * 4 + 2] = c; px[x * 4 + 3] = 255;
-        }
-        for (int y = 1; y < H; y++) Buffer.BlockCopy(px, 0, px, y * W * 4, W * 4);
-        var h = GCHandle.Alloc(px, GCHandleType.Pinned);
-        try { Ctx.UpdateSubresource(_sdrTex!, 0, null, h.AddrOfPinnedObject(), (uint)(W * 4), 0); }
-        finally { h.Free(); }
-        byte[] raw;
-        using (ID3D11Texture2D bb = _swap.GetBuffer<ID3D11Texture2D>(0))
-        using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))
-        {
-            WideCopy(_sdrSrv!, rtv, _swapSize);
-            raw = ReadTexBytes(bb, W, H, 4);
-        }
-        Ctx.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
-        var res = new float[codes.Length];
-        for (int i = 0; i < codes.Length; i++)
-        {
-            int x = (i * 2 + 1) * W / (codes.Length * 2);
-            uint v = BitConverter.ToUInt32(raw, ((H / 2) * W + x) * 4);
-            res[i] = Math.Max(v & 0x3FF, Math.Max((v >> 10) & 0x3FF, (v >> 20) & 0x3FF)) / 1023f * 255f;
         }
         return res;
     }

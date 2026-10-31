@@ -1129,6 +1129,12 @@ internal sealed partial class D3DRenderer : IDisposable
         EnsureClientTextures(client);
     }
 
+    /// <summary>ResizeBuffers to the current size. Measured (--vblank-probe --exp triggers) to make DWM re-evaluate the swap chain at a cost of one frame.</summary>
+    public void NudgeSwapChain()
+    {
+        if (_swapSize.Width > 0 && _swapSize.Height > 0) Resize(_swapSize);
+    }
+
     /// <summary>Compose into the back buffer and present. Returns the Present result.</summary>
     public Result PresentFrame(Rectangle dst, ScalingQuality quality, bool pixelPerfect, float sharpness, int nativeH = 0,
         OverlayLayer[]? overlays = null)
@@ -1136,7 +1142,7 @@ internal sealed partial class D3DRenderer : IDisposable
         if (_swap == null) { _gpu?.Cancel(); return Result.Fail; }
         EnsureClientTextures(_swapSize);
         HdrUpdate();     // the swap chain follows the HDR request / the monitor's HDR state
-        if (_hdrKind != 0 || _wideSdr) return PresentFrameHdr(dst, quality, pixelPerfect, sharpness, nativeH, overlays);
+        if (_hdrKind != 0) return PresentFrameHdr(dst, quality, pixelPerfect, sharpness, nativeH, overlays);
         _gpu?.Begin();   // no-op when the render loop already opened the span before Convert
         using (ID3D11Texture2D bb = _swap.GetBuffer<ID3D11Texture2D>(0))
         using (ID3D11RenderTargetView rtv = Device.CreateRenderTargetView(bb))
@@ -2391,7 +2397,7 @@ internal sealed partial class D3DRenderer : IDisposable
         Beat.Dispose();
         InterpFree();
         A4kFree();
-        FreeOverlays(); FreeCrisp(); StreamFree(); FreeHdrTextures(); _hdrKind = 0; _wideSdr = false; _monHdr = null; _hdrCheckAt = 0;
+        FreeOverlays(); FreeCrisp(); StreamFree(); FreeHdrTextures(); _hdrKind = 0; _monHdr = null; _hdrCheckAt = 0;
         _interRtv?.Dispose(); _interSrv?.Dispose(); _inter?.Dispose();
         _lastComposed?.Dispose();
         _orientedRtv?.Dispose(); _orientedSrv?.Dispose(); _oriented?.Dispose();

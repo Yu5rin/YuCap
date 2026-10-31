@@ -202,14 +202,10 @@ public sealed class D3DVideoEngine : IVideoEngine
         return res;
     }
     public string SwapFormat => _s?.Renderer?.SwapFormatDesc ?? string.Empty;
-    public bool WideSdrActive => _s?.Renderer?.WideSdrActive ?? false;
-    public float[]? WideLiveCheck(int[] codes, out string why)
+    public void NudgeDisplay()
     {
-        float[]? res = null; string w = "映像が動いていません";
         Session? s = _s;
-        if (s != null && s.Alive) s.Run(r => { res = r.WideLiveCheck(codes, out w); return null; }, 20000, needFrame: false, out _, allowNull: true);
-        why = w;
-        return res;
+        if (s != null && s.Alive) s.Run(r => { r.NudgeSwapChain(); return null; }, 3000, needFrame: false, out _, allowNull: true);
     }
     public double MeasureVsr()
     {

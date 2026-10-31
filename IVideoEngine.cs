@@ -254,10 +254,9 @@ public interface IVideoEngine : IDisposable
     float[]? HdrLiveCheck(int[] codes, out int kind, out string why) { kind = 0; why = "Direct3D 描画ではありません"; return null; }
     /// <summary>The swap chain format and colour space in use (Direct3D); empty otherwise.</summary>
     string SwapFormat => string.Empty;
-    /// <summary>The picture is presented through a 10-bit SDR swap chain because the monitor is in Windows HDR mode (a B8G8R8A8 one is held to the primary's refresh rate there).</summary>
-    bool WideSdrActive => false;
-    /// <summary>Test mode: grey bars (sRGB codes) through the 10-bit SDR path, read back as 8-bit codes; null when that path is not in use.</summary>
-    float[]? WideLiveCheck(int[] codes, out string why) { why = "Direct3D 描画ではありません"; return null; }
+    /// <summary>Make Windows (DWM) look at the video swap chain again (ResizeBuffers to the same size): the nudge for a monitor that stays held to the
+    /// primary monitor's refresh rate after something that overlapped the video went away. Blocks until the render thread has done it; call off the UI thread.</summary>
+    void NudgeDisplay() { }
     /// <summary>Test mode: VSR on versus off on a test picture, mean absolute difference (0..255); negative when it could not run.</summary>
     double MeasureVsr() => -1;
     /// <summary>Test mode: a synthetic NV12 picture through the real convert pass with a chosen colour description and chroma mode

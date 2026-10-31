@@ -357,7 +357,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         InitAvAuto();
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); GuardOsdTick(); AutoProfileTick(); SignalTick(); StreamTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); GuardOsdTick(); AutoProfileTick(); DisplayRateTick(); SignalTick(); StreamTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
         _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.

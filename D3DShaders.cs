@@ -45,7 +45,7 @@ internal static class D3DShaders
         public byte[] Dup = Array.Empty<byte>();
         // SDR -> HDR10 (Shaders/hdr.hlsl). A failure only disables the HDR display.
         public bool HdrOk;
-        public byte[] Hdr = Array.Empty<byte>(), HdrOverlay = Array.Empty<byte>(), HdrCopy = Array.Empty<byte>();
+        public byte[] Hdr = Array.Empty<byte>(), HdrOverlay = Array.Empty<byte>();
     }
 
     private static readonly object Gate = new();
@@ -122,7 +122,6 @@ internal static class D3DShaders
                 string hdr = Resource("hdr.hlsl");
                 b.Hdr = Compile(hdr, "main", "hdr.hlsl", "ps_5_0");
                 b.HdrOverlay = Compile(hdr, "overlay", "hdr.hlsl", "ps_5_0");
-                b.HdrCopy = Compile(hdr, "copy", "hdr.hlsl", "ps_5_0");
                 b.HdrOk = true;
             }
             catch (Exception ex)

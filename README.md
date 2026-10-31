@@ -378,12 +378,19 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
   （ウィンドウのスワップチェーンでも同じ）。テストモードは測定の間だけ見出しを隠す。
   表示のタイミングは映像のあるモニターの `IDXGIOutput::WaitForVBlank` に合わせる（`VBlankBeat.cs`）。
   `D3DKMTWaitForVerticalBlankEvent` はこの構成でサブのモニターでもメインの間隔を返すため使わない（`--vblank-probe` で確かめられる）。
-- **Windows の HDR がオンのモニターでは、8bit（B8G8R8A8）の合成スワップチェーンはメインの更新（約 60 Hz）に抑えられる。** メイン 59.94 Hz の SDR・
-  サブ 144 Hz の HDR オンのテレビで、何も重ねなくても B8G8R8A8 の合成スワップチェーンは 60 fps、R10G10B10A2（色空間は SDR のまま、または HDR10）・
-  R16G16B16A16_FLOAT（scRGB）は 144 fps（`--vblank-probe` の `composition,hdr10` / `composition,scrgb` / `composition,rgb10sdr`）。
-  そこで、HDR 表示がオフでも、そのモニターが Windows の HDR のときは 10bit（R10G10B10A2・sRGB）のスワップチェーンに切り替える（`D3DRenderer.Nv.cs` の
-  `HdrUpdate` / `SetSwapMode(1)`）。絵の値は変えず、Windows が他の SDR のウィンドウと同じ「SDR コンテンツの明るさ」に置き直すので見た目は同じ。
-  HDR のないモニター（メインなど）へ動かすと 8bit に戻る（モニターの状態は 1 秒ごとに別スレッドで調べる）。静止画は SDR のまま。
+- **Windows の HDR がオンでも、何も重ならなければ 8bit（B8G8R8A8）の合成スワップチェーンはモニター本来の速さで表示される。** 以前は
+  「HDR オンのモニターでは B8G8R8A8 が 60 fps に抑えられ、R10G10B10A2 なら 144 fps」と考え、10bit の SDR スワップチェーンに切り替えていたが、
+  測り間違いだった（取り消した）。メイン 59.94 Hz の SDR・サブ 144 Hz の HDR オンのテレビで、順序をランダムにして繰り返し測ると
+  B8G8R8A8 も R10G10B10A2 も、合成でもウィンドウでも、何も重ならなければ 144 fps、何かが重なると（どの形式でも）60 fps
+  （`--vblank-probe <出力> --exp format,variants --display HISENSE --reps 3`）。以前の「60 fps」は、測定の途中で重ねた窓や、
+  外から映像に重なっていたもの（別のアプリのウィンドウなど）の影響が、形式の違いに見えていたもの。
+  重なりが消えれば、同じプロセスの中ではすぐ（250 ms 以内）144 fps に戻る（重ねる窓の種類 layered / opaque / メニュー、消し方 破棄 / 隠す /
+  最小化 / 画面外 / 不透明度 0 のどれでも）。重なっていないのに別のプロセスの開始直後から 20〜100 秒以上 60 fps のままだったことが 2 回あったが、
+  そのとき映像の上にウィンドウはなく（`VideoOverlap`）、再現できていない。原因は未確認（外部のキャプチャなどの疑い）。
+  対策として、フレーム補間が働いていて更新がメインの速さのまま 3 秒続き、映像に重なるウィンドウがないときだけ、`ResizeBuffers` を同じ大きさで
+  呼ぶ（`MainForm.DisplayRate.cs` の `DisplayRateTick`、`NudgeDisplay`）。重なりがあるときは、そのウィンドウ名をログに書くだけ。
+  効くかどうかは、再現できた状態で測れていない。テストモードは測定の前に更新が出ているかを確かめ、出ていなければ最大 5 秒待って、
+  重なっているウィンドウの名前を報告する。
 - **通知・情報表示・テストの見出しは、Direct3D 描画では映像の中（スワップチェーン）に描く。** 映像の上に子ウィンドウを
   重ねると Windows は直接表示（direct flip）をやめて合成するため、上の段落のとおりサブのモニターが 144 Hz から約 60 Hz に
   落ちる。そこで `OsdOverlay` / `InfoOverlay` / `TestCaption`（`OverlayControl`）は配置・状態・描画コードをそのまま持ちつつ、

@@ -58,10 +58,3 @@ float4 overlay(float4 pos : SV_Position) : SV_Target
     float3 q = Pq(To2020(S2L(rgb) * hp.x));
     return float4(q * a, a);
 }
-
-// Windows HDR is on for the monitor but the user's HDR display is off: the picture goes into a 10-bit back buffer (a composition swap chain
-// of B8G8R8A8 is held to the primary monitor's refresh rate by DWM on such monitors). Unchanged sRGB codes, so DWM maps them like any SDR window.
-float4 copy(float4 pos : SV_Position) : SV_Target
-{
-    return float4(tex.Load(int3(int2(pos.xy), 0)).rgb, 1.0);
-}

@@ -495,7 +495,7 @@ public sealed partial class MainForm
             steps.Add((L.F("表示の計測: {0}", L.T("フレーム補間の画質（実際の映像）")), secRender, () => InterpLiveStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("ゲームのコマ数に合わせた補間")), secRender, () => InterpCadenceStep(secRender, modes)));
             steps.Add((L.F("表示の計測: {0}", L.T("重ねた表示による更新の低下")), secRender, () => OverlayCapStep(secRender, modes)));
-            steps.Add((L.F("表示の計測: {0}", L.T("HDR モニターでの出力形式と更新")), secRender, () => WideSdrStep(secRender, modes)));
+            steps.Add((L.F("表示の計測: {0}", L.T("重なりが消えたあとの更新の戻り")), secRender, () => OverlapRecoveryStep(secRender, modes)));
 
             // 4. notices, with low latency off and on
             CaptureMode? m1080 = PickMode(modes, 1920, 1080, maxFps: 60) ?? PickMode(modes, 1920, 1080, 0);
@@ -1086,6 +1086,16 @@ public sealed partial class MainForm
         double nominalFps = _video.NegotiatedFps > 0 ? _video.NegotiatedFps : c.Mode.Fps;
         var (rateStable, rateSeen) = await WaitStableRate(nominalFps);
 
+        // Is the monitor presenting at its full rate before the measurement starts? (A window over the video makes Windows hold a faster monitor to the
+        // primary's rate; that is then named in the report instead of showing up as an unexplained low number.)
+        GateResult? gate = null;
+        if (rateStable && _topt.Target.RefreshHz > 0 && _video.SupportsNativeRes && !_topt.Target.Primary && (Displays.List().FirstOrDefault(d => d.Primary)?.RefreshHz ?? 0) < _topt.Target.RefreshHz - 10)
+        {
+            double gPanel = _topt.Target.RefreshHz;
+            bool gInterp = c.Interp && _video.InterpolationState is { Active: true };
+            gate = await DisplayGate(gInterp ? gPanel : Math.Min(nominalFps, gPanel));
+        }
+
         _video.BeginMeasure();
         List<RenderStats> st;
         RenderMeasurement? meas;
@@ -1116,6 +1126,9 @@ public sealed partial class MainForm
         item.Num("映像", $"{ModeLabel(c.Mode)}  → {_topt.Target.Bounds.Width}x{_topt.Target.Bounds.Height} に拡大")
             .Num("拡大の画質", c.Quality == ScalingQuality.Fsr ? "FSR（高画質）" : c.Quality == ScalingQuality.Anime4K ? "くっきり（Anime4K）" : "標準")
             .Num("表示方式", meas != null && meas.PresentMode.Length > 0 ? meas.PresentMode : "?");
+        if (gate != null && (gate.WaitedSec > 0 || !gate.Recovered))
+            item.Num("計測の直前の更新", $"{gate.Rate:0.0} fps" + (gate.Recovered ? $"（期待に届くまで {gate.WaitedSec:0.0} 秒待ちました{(gate.Nudged ? "。スワップチェーンの再設定をしました" : "")}）" : "（5 秒待っても期待に届きませんでした）") +
+                (gate.Overlap.Length > 0 ? $"。映像に重なっていたウィンドウ: {gate.Overlap}" : ""));
         if (!rateStable)
             item.Num("取り込みの安定待ち", $"モード切り替えの後、約 3 秒待っても映像が指定の {nominalFps:0} fps に落ち着きませんでした（直前の 1 秒で {rateSeen:0.0} fps）。そのまま計測しています");
 
@@ -1151,7 +1164,21 @@ public sealed partial class MainForm
                 (c.Interp ? "映像が来ない間は補間する元がないため、表示されたコマ数が期待に届いていません。補間の不具合ではなく、このモードの取り込みの限界です。"
                           : "表示の不具合ではなく、このモードの取り込みの限界です（入力側の出力設定がこのモードのコマ数と合っていない場合や、USB の転送量が足りない場合に起きます）。"));
         }
-        else if (shownRatio < 0.90) { v = Worst(v, Verdict.Ng); why.Add("表示されたコマ数が期待の 9 割に届いていません。"); }
+        else if (shownRatio < 0.90)
+        {
+            string ovNow = DescribeVideoOverlap(out int ovCount);
+            string ovSeen = gate != null && gate.Overlap.Length > 0 ? gate.Overlap : ovCount > 0 ? ovNow : string.Empty;
+            if (ovSeen.Length > 0)
+            {
+                // not YuCap's doing: another window over the video makes Windows compose it, and a faster monitor is then held to the primary's rate
+                v = Worst(v, Verdict.Warn);
+                why.Add($"表示されたコマ数が期待の 9 割に届いていませんが、映像に別のウィンドウが重なっています: {ovSeen}。Windows は重なりがあると映像を合成して表示し、メインのモニターより速いモニターでもメインの速さに抑えます。重なりを消して試験し直してください。");
+            }
+            else
+            {
+                v = Worst(v, Verdict.Ng); why.Add("表示されたコマ数が期待の 9 割に届いていません。" + (gate is { Recovered: false } ? "計測の前から更新が出ていませんでした（映像に重なっているウィンドウは見つかりませんでした）。" : ""));
+            }
+        }
         else if (shownRatio < 0.98) { v = Worst(v, Verdict.Warn); why.Add("表示されたコマ数がわずかに足りません。"); }
 
         // ---- GPU ----

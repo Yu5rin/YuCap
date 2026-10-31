@@ -363,7 +363,8 @@ internal static partial class Program
         }
         if (args.Length > 0 && args[0] == "--vblank-probe")
         {
-            RunVBlankProbe(args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_vblank_probe.txt"));
+            string vbOut = args.Length > 1 && !args[1].StartsWith("--") ? args[1] : Path.Combine(Path.GetTempPath(), "yucap_vblank_probe.txt");
+            if (Array.IndexOf(args, "--exp") >= 0) RunVBlankExperiments(vbOut, args); else RunVBlankProbe(vbOut);
             return;
         }
         if (args.Length > 0 && args[0] == "--audio-probe")
