@@ -3,6 +3,11 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)、
 バージョンは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [1.16.2] - 2026-11-01
+
+### 修正
+- 映像が戻る瞬間（PS2 のリセットのあとなど）に、省電力と通常の描画が短い間に何度も入れ替わり、わずかにカクつくことがある問題を直しました
+
 ## [1.16.1] - 2026-11-01
 
 ### 修正
