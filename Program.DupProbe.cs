@@ -20,6 +20,7 @@ internal static partial class Program
     {
         var log = new List<string>();
         var rows = new List<string> { "frame,t_ms,mean,max,c1,c2,same" };
+        var sigRows = new List<string> { "frame,t_ms,mean,c1,c2,dark,lit,nonblack,state" };
         Form form = NewProbeWindow("YuCap dup-probe", out VideoBox canvas);
         var engine = new D3DVideoEngine();
         form.Shown += (_, _) =>
@@ -62,13 +63,18 @@ internal static partial class Program
                         }
                     };
                 }
+                r.SignalSink = (fn, arrival, sum, c1, c2, dark, lit, nb) =>
+                {
+                    lock (sigRows)
+                        sigRows.Add($"{fn},{(arrival - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:0.0},{sum / 64.0 / DupMath.ThumbPixels:0.0000},{c1},{c2},{dark},{lit},{nb},{r.Signal.State}");
+                };
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 int sec = 0;
                 while (sw.Elapsed.TotalSeconds < seconds)
                 {
                     PumpFor(1000);
                     sec++;
-                    log.Add($"t={sec}s in={(engine.Stats?.InputFps ?? 0):0.0} gameFps={engine.GameFps:0.0} reliable={engine.GameFpsReliable} still={engine.PictureStill} uniquePeriod={r.UniquePeriodMs:0.0}ms answerLat={r.AnswerLatencyMs:0.0}ms extraHold={r.CadenceExtraHoldMs():0.0}ms");
+                    log.Add($"t={sec}s signal={r.Signal.State} changes={r.Signal.Changes} saving={engine.PowerSaving} in={(engine.Stats?.InputFps ?? 0):0.0} gameFps={engine.GameFps:0.0} reliable={engine.GameFpsReliable} still={engine.PictureStill} uniquePeriod={r.UniquePeriodMs:0.0}ms answerLat={r.AnswerLatencyMs:0.0}ms extraHold={r.CadenceExtraHoldMs():0.0}ms");
                 }
                 r.DupSink = null;
                 lock (rows)
@@ -92,7 +98,7 @@ internal static partial class Program
             finally
             {
                 try { engine.Dispose(); } catch { }
-                try { lock (rows) File.WriteAllLines(outPath, rows); File.WriteAllLines(Path.ChangeExtension(outPath, ".txt"), log); } catch { }
+                try { lock (rows) File.WriteAllLines(outPath, rows); File.WriteAllLines(Path.ChangeExtension(outPath, ".txt"), log); lock (sigRows) File.WriteAllLines(Path.ChangeExtension(outPath, ".sig.csv"), sigRows); } catch { }
                 form.BeginInvoke(new Action(form.Close));
             }
         };

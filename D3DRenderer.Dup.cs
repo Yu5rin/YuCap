@@ -86,6 +86,9 @@ internal sealed partial class D3DRenderer
     /// <summary>Test hook: called for every answer (capture/render thread, under FrameLock): frame number, arrival tick, sum*64, max*64, counts, verdict "same".</summary>
     public Action<long, long, uint, uint, uint, uint, bool>? DupSink { get; set; }
 
+    /// <summary>Probe hook: frame number, arrival, sum*64, c1, c2, dark, lit, non-black counts.</summary>
+    public Action<long, long, uint, uint, uint, uint, uint, uint>? SignalSink { get; set; }
+
     private void DupInit(D3DShaders.Bytecode b)
     {
         if (!b.DupOk) return;
@@ -176,7 +179,7 @@ internal sealed partial class D3DRenderer
             {
                 // the oldest answer never came: give it up (that frame counts as a new picture)
                 DupTicket lost = _tk[_tkHead]!;
-                DupTaken(lost, false, 0, 0, 0, 0, 0, 0);
+                DupTaken(lost, false, 0, 0, 0, 0, 0, 0, 0);
                 _tkHead = (_tkHead + 1) % TicketCount; _tkCount--;
             }
             bool hasPrev = _thumbValid && _thumbW == w && _thumbH == h;
@@ -218,16 +221,17 @@ internal sealed partial class D3DRenderer
             DupTicket tk = _tk[_tkHead]!;
             Result hr = Ctx.Map(tk.Staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.DoNotWait, out MappedSubresource m);
             if (hr.Failure) break;                         // still drawing (or lost): look again later
-            uint sum, max, c1, c2, dark, lit;
+            uint sum, max, c1, c2, dark, lit, nb;
             try
             {
                 sum = (uint)Marshal.ReadInt32(m.DataPointer, 0); max = (uint)Marshal.ReadInt32(m.DataPointer, 4);
                 c1 = (uint)Marshal.ReadInt32(m.DataPointer, 8); c2 = (uint)Marshal.ReadInt32(m.DataPointer, 12);
                 dark = (uint)Marshal.ReadInt32(m.DataPointer, 16); lit = (uint)Marshal.ReadInt32(m.DataPointer, 20);
+                nb = (uint)Marshal.ReadInt32(m.DataPointer, 24);
             }
             finally { Ctx.Unmap(tk.Staging, 0); }
             _tkHead = (_tkHead + 1) % TicketCount; _tkCount--;
-            DupTaken(tk, true, sum, max, c1, c2, dark, lit);
+            DupTaken(tk, true, sum, max, c1, c2, dark, lit, nb);
         }
     }
 
@@ -248,14 +252,16 @@ internal sealed partial class D3DRenderer
     /// <summary>Frames submitted so far (replay: the number the next frame will follow).</summary>
     internal long FramesSubmitted { get { lock (FrameLock) return _frameNo; } }
 
-    private void DupTaken(DupTicket tk, bool known, uint sum, uint max, uint c1, uint c2, uint dark, uint lit)
+    private void DupTaken(DupTicket tk, bool known, uint sum, uint max, uint c1, uint c2, uint dark, uint lit, uint nb)
     {
         if (known)
         {
-            // "Is the console sending a picture?": the card's own No Signal screen is mostly black with a little bright text and never changes.
-            bool message = SignalMath.MessageLike(dark, lit);
-            bool still = tk.HasPrev && SignalMath.Still(sum, c2);
-            Signal.Feed(tk.Arrival, message, SignalMath.BlackAll(dark, lit), still);
+            // "Is the console sending a picture?" (see Signal.cs): the card's own No Signal screen is mostly black with a little bright text
+            // and, being drawn by the card, repeats bit-exactly; a picture that comes through a converter never does.
+            var f = new SignalFrame(SignalMath.MessageLike(dark, lit), SignalMath.BlackAll(nb), tk.HasPrev && SignalMath.Exact(sum, c1),
+                tk.HasPrev && !SignalMath.Still(sum, c2));
+            Signal.Feed(tk.Arrival, f);
+            SignalSink?.Invoke(tk.FrameNo, tk.Arrival, sum, c1, c2, dark, lit, nb);
         }
         bool same = known && tk.HasPrev && DupMath.Same(sum, max, c1, c2);
         bool unique = !same;

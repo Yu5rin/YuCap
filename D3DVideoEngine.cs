@@ -767,7 +767,7 @@ public sealed class D3DVideoEngine : IVideoEngine
             bool wasAuto = false;
             int lastEst = -1, count = 0, decidedEst = -1;
             Size lastSize = Size.Empty;
-            long nextAt = 0;
+            long nextAt = 0, sigSeen = 0;
             while (!_stopping)
             {
                 Thread.Sleep(100);
@@ -786,6 +786,14 @@ public sealed class D3DVideoEngine : IVideoEngine
                 }
                 D3DRenderer? r = _r;
                 if (r == null || !r.HasFrame || _e._rotation is 90 or 270 || PowerSaving) continue;
+                // The signal came or went (a console reset, another game): what was judged may be about something else. The shrink in use stays
+                // until three new samples agree on a decision, but the old decision no longer counts as settled.
+                long sigNow = r.Signal.Changes;
+                if (sigNow != sigSeen)
+                {
+                    sigSeen = sigNow; lastEst = -1; count = 0; decidedEst = -1; nextAt = now + 800;
+                    Log.Info("D3D: native-res auto: signal changed - judging again");
+                }
                 // A new picture size (mode, crop, device) is judged at once, however settled the last decision was.
                 Size cur = r.OrientedSize;
                 if (lastSize != Size.Empty && cur.Width > 0 && cur != lastSize && nextAt > now) nextAt = now;
@@ -1365,6 +1373,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                 // No signal for a while (the card shows its own message): do almost nothing until a real picture is back. The
                 // loop then only looks every 30 ms and, once per 500 ms, converts and presents the card's (unchanging) picture.
                 long loopNow = Stopwatch.GetTimestamp();
+                r.Signal.Silent(loopNow);          // frames that stopped arriving are "no signal" too
                 bool saving = _e.PowerSaveEnabled && r.Signal.SavingPower(loopNow);
                 if (saving != _powerSaving)
                 {

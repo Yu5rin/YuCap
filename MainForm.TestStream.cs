@@ -341,11 +341,62 @@ public sealed partial class MainForm
         return b;
     }
 
+    /// <summary>A PS2-like picture through an analog-to-HDMI converter: a 4:3 dark 480p picture pillarboxed in the 16:9 frame (black bars),
+    /// a very dark background with a small bright logo, optionally a tiny animation, and the converter's noise (a few levels, new every frame).</summary>
+    private static Bitmap SynthPs2Dark(int w, int h, int phase, bool anim, bool noise)
+    {
+        var b = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.Clear(Color.Black);
+            int pw = h * 4 / 3, px0 = (w - pw) / 2;
+            using (var br = new SolidBrush(Color.FromArgb(14, 14, 22))) g.FillRectangle(br, px0, 0, pw, h);
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+            using var f = new Font("Arial", h / 14f, FontStyle.Bold, GraphicsUnit.Pixel);
+            g.DrawString("PlayStation 2", f, Brushes.White, px0 + pw * 0.2f, h * 0.45f);
+            if (anim) g.FillEllipse(Brushes.White, px0 + pw * 0.2f + (phase * 3) % (pw * 0.5f), h * 0.7f, h / 30f, h / 30f);
+        }
+        if (noise)
+        {
+            BitmapData bd = b.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            try
+            {
+                var buf = new byte[bd.Stride * h];
+                System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, buf, 0, buf.Length);
+                var rnd = new Random(phase * 7919 + 13);
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        int i = y * bd.Stride + x * 4, d = rnd.Next(-3, 4);
+                        buf[i] = (byte)Math.Clamp(buf[i] + d, 0, 255); buf[i + 1] = (byte)Math.Clamp(buf[i + 1] + d, 0, 255); buf[i + 2] = (byte)Math.Clamp(buf[i + 2] + d, 0, 255);
+                    }
+                System.Runtime.InteropServices.Marshal.Copy(buf, 0, bd.Scan0, buf.Length);
+            }
+            finally { b.UnlockBits(bd); }
+        }
+        return b;
+    }
+
+    private static double MeanLuma(Bitmap bmp)
+    {
+        BitmapData bd = bmp.LockBits(new Rectangle(Point.Empty, bmp.Size), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            var a = new byte[bd.Stride * bmp.Height];
+            System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, a, 0, a.Length);
+            double s = 0;
+            for (int y = 0; y < bmp.Height; y += 2)
+                for (int x = 0; x < bmp.Width; x += 2) { int i = y * bd.Stride + x * 4; s += 0.114 * a[i] + 0.587 * a[i + 1] + 0.299 * a[i + 2]; }
+            return s / ((bmp.Height / 2) * (bmp.Width / 2));
+        }
+        finally { bmp.UnlockBits(bd); }
+    }
+
     private sealed record SigSeq(string Name, Func<int, Bitmap> Frame, double Seconds);
 
     /// <summary>Replays pictures through a headless renderer (the real thumbnail pass on the GPU) on a simulated clock at 30 fps.
     /// Returns the time of each state change and the power-saving flags at checkpoints.</summary>
-    private static (List<(double T, SignalState S)> Changes, List<(double T, bool Saving)> Saving, SignalState Final, string? Error)
+    private static (List<(double T, SignalState S)> Changes, List<(double T, bool Saving)> Saving, SignalState Final, string? Error, int Checked, int Stale)
         ReplaySignal(List<SigSeq> seqs)
     {
         var changes = new List<(double, SignalState)>();
@@ -356,13 +407,13 @@ public sealed partial class MainForm
         {
             r.CreateDevice();
             r.CreateShaders();
-            if (!r.DupAvailable) return (changes, saving, SignalState.Unknown, "同じ絵の検出に使うシェーダーを作れませんでした");
+            if (!r.DupAvailable) return (changes, saving, SignalState.Unknown, "同じ絵の検出に使うシェーダーを作れませんでした", 0, 0);
             long simNow = freq;     // start away from 0 (0 means "not set" in the detector)
             r.ClockOverride = () => simNow;
             double t = 0;
-            SignalState last = SignalState.Unknown;
+            SignalState last = SignalState.Unknown, last0 = SignalState.Unknown;
             bool lastSaving = false;
-            int n = 0;
+            int n = 0, checkedN = 0, stale = 0;
             foreach (SigSeq s in seqs)
             {
                 int frames = (int)Math.Round(s.Seconds * 30);
@@ -380,14 +431,27 @@ public sealed partial class MainForm
                         if (st != last) { changes.Add((t, st)); last = st; }
                         bool sv = r.Signal.SavingPower(simNow);
                         if (sv != lastSaving) { saving.Add((t, sv)); lastSaving = sv; }
+                        if (i == 0 || i == 2 || i == 15 || (i % 30) == 0 || (st != last0 && last0 != SignalState.Unknown))
+                        {
+                            // what the render loop would show (power saving or not): convert the newest frame and compare it with the picture just delivered
+                            r.Convert(0, false, VideoAdjustments.Neutral, default);
+                            float[]? lum = r.ReplayPresentedLuma(8, out int pw, out int ph);
+                            if (lum != null && pw > 0)
+                            {
+                                double m = 0; foreach (float v in lum) m += v; m /= lum.Length;
+                                checkedN++;
+                                if (Math.Abs(m - MeanLuma(bmp)) > 2.5) stale++;
+                            }
+                        }
+                        last0 = st;
                         t += 1.0 / 30; n++;
                     }
                 }
                 finally { foreach (Bitmap b in cache.Values) b.Dispose(); }
             }
-            return (changes, saving, last, null);
+            return (changes, saving, last, null, checkedN, stale);
         }
-        catch (Exception ex) { return (changes, saving, SignalState.Unknown, ex.Message); }
+        catch (Exception ex) { return (changes, saving, SignalState.Unknown, ex.Message, 0, 0); }
     }
 
     private async Task FeatureSignal(TestSection sec, List<CaptureMode> modes, CaptureMode? mode)
@@ -418,14 +482,37 @@ public sealed partial class MainForm
         // B: a plain black picture (what the card sends with nothing connected) counts after 3 s; C: a dark scene that moves never does
         var rB = await Task.Run(() => ReplaySignal(new List<SigSeq>
         {
-            new("black", _ => SynthBlack(W, H), 5.0),
+            new("black", _ => SynthBlack(W, H), 6.0),
             new("moving-game", p => SynthGameFrame(W, H, p), 2.5),
         }));
         var rC = await Task.Run(() => ReplaySignal(new List<SigSeq> { new("moving-dark", p => SynthDarkMoving(W, H, p), 6.0) }));
-        if (rA.Error != null || rB.Error != null || rC.Error != null)
+        // PS2-like: dark, pillarboxed 480p with a small logo and a converter's noise: it is a picture, never "no signal"
+        var rD = await Task.Run(() => ReplaySignal(new List<SigSeq>
+        {
+            new("moving-ps2-logo", p => SynthPs2Dark(W, H, p, false, true), 5.0),
+            new("moving-ps2-anim", p => SynthPs2Dark(W, H, p, true, true), 5.0),
+        }));
+        // a reset of the console: game -> black 2 s -> dark boot logo (noisy) -> game. No restart, no "no signal" at all.
+        var rE = await Task.Run(() => ReplaySignal(new List<SigSeq>
+        {
+            new("moving-game", p => SynthGameFrame(W, H, p), 3.0),
+            new("black", _ => SynthBlack(W, H), 2.0),
+            new("moving-ps2-logo", p => SynthPs2Dark(W, H, p, false, true), 3.0),
+            new("moving-game", p => SynthGameFrame(W, H, p), 2.0),
+        }));
+        // the same after the card's own message had put it into no signal and power saving (7.5 s): the boot logo must bring the signal back within 0.5 s
+        const double RT = 7.5 + 2.0;     // the boot logo appears here
+        var rF = await Task.Run(() => ReplaySignal(new List<SigSeq>
+        {
+            new("card", _ => SynthCardMessage(W, H), 7.5),
+            new("black", _ => SynthBlack(W, H), 2.0),
+            new("moving-ps2-logo", p => SynthPs2Dark(W, H, p, false, true), 3.0),
+            new("moving-game", p => SynthGameFrame(W, H, p), 2.0),
+        }));
+        if (rA.Error != null || rB.Error != null || rC.Error != null || rD.Error != null || rE.Error != null || rF.Error != null)
         {
             item.Verdict = Verdict.Info; item.Summary = "[情報] 検出の確認ができませんでした";
-            item.Explanation = "理由: " + (rA.Error ?? rB.Error ?? rC.Error);
+            item.Explanation = "理由: " + (rA.Error ?? rB.Error ?? rC.Error ?? rD.Error ?? rE.Error ?? rF.Error);
             sec.Items.Add(item);
             return;
         }
@@ -437,28 +524,44 @@ public sealed partial class MainForm
         double? svOff = rA.Saving.Where(s => !s.Saving && s.T >= T1 - 1e-6 && s.T < T1 + 0.5).Select(s => (double?)s.T).FirstOrDefault();
         bool aNo = tNo is >= 1.9 and <= 2.5;
         bool aSave = sv1 is { } sv && tNo is { } tn && sv >= tn + 4.9 && sv <= tn + 5.4;
-        bool aSig = tSig is { } ts && ts >= T1 + 1.4 && ts <= T1 + 2.0;
+        bool aSig = tSig is { } ts && ts >= T1 + 0.1 && ts <= T1 + 0.6;
         bool aSaveEnds = svOff != null;
         bool aNo2 = tNo2 is { } t2 && t2 >= T2 + 1.9 && t2 <= T2 + 2.6;
         item.Num("電源オフ（黒地に白い文字を静止）", tNo is { } a ? $"{a:0.0} 秒で「信号なし」と判定（2 秒以上続いたら）" : "判定されませんでした")
             .Num("省電力に入る", sv1 is { } b ? $"{b:0.0} 秒（信号なしから約 5 秒後）" : "入りませんでした")
-            .Num("電源オン（動く映像に切り替え）", tSig is { } c ? $"{c - T1:0.0} 秒で「信号あり」（1.5 秒続いたら）／ 省電力は{(aSaveEnds ? "すぐ止まりました" : "止まりませんでした")}" : "「信号あり」になりませんでした")
+            .Num("電源オン（動く映像に切り替え）", tSig is { } c ? $"{c - T1:0.0} 秒で「信号あり」（0.25 秒続いたら）／ 省電力は{(aSaveEnds ? "すぐ止まりました" : "止まりませんでした")}" : "「信号あり」になりませんでした")
             .Num("もう一度電源オフ", tNo2 is { } d ? $"{d - T2:0.0} 秒で「信号なし」" : "判定されませんでした");
         if (!aNo) { v = Worst(v, Verdict.Ng); why.Add("カードの「No Signal」画面を、2 秒前後で「信号なし」と判定できませんでした。"); }
         if (!aSave) { v = Worst(v, Verdict.Ng); why.Add("信号なしが約 5 秒続いたあとの省電力に入る時刻が合いません。"); }
-        if (!aSig) { v = Worst(v, Verdict.Ng); why.Add("動く映像が来たあと、1.5 秒前後で「信号あり」に変われませんでした。"); }
+        if (!aSig) { v = Worst(v, Verdict.Ng); why.Add("動く映像が来たあと、0.6 秒以内に「信号あり」に変われませんでした。"); }
         if (!aSaveEnds) { v = Worst(v, Verdict.Ng); why.Add("映像が戻っても省電力がすぐに止まりませんでした。"); }
         if (!aNo2) { v = Worst(v, Verdict.Ng); why.Add("電源を切り直したとき、もう一度「信号なし」と判定できませんでした。"); }
 
         double? tBlack = rB.Changes.Where(c => c.S == SignalState.NoSignal).Select(c => (double?)c.T).FirstOrDefault();
         double? tBlackEnd = rB.Changes.Where(c => c.S == SignalState.Signal).Select(c => (double?)c.T).FirstOrDefault();
-        bool bOk = tBlack is >= 2.9 and <= 3.6 && tBlackEnd is { } be && be >= 5.0 + 1.4 && be <= 5.0 + 2.0;
+        bool bOk = tBlack is >= 4.9 and <= 5.6 && tBlackEnd is { } be && be >= 6.0 + 0.1 && be <= 6.0 + 0.6;
         bool cNever = !rC.Changes.Any(c => c.S == SignalState.NoSignal);
-        item.Num("真っ黒な画面（何もつないでいないとき）", tBlack is { } bk ? $"{bk:0.0} 秒で「信号なし」（3 秒続いたら）／ 映像が来て {((tBlackEnd ?? 0) - 5.0):0.0} 秒で「信号あり」" : "「信号なし」にならなかった")
+        item.Num("真っ黒な画面（何もつないでいないとき）", tBlack is { } bk ? $"{bk:0.0} 秒で「信号なし」（5 秒続いたら）／ 映像が来て {((tBlackEnd ?? 0) - 6.0):0.0} 秒で「信号あり」" : "「信号なし」にならなかった")
             .Num("暗くて動く場面", cNever ? "「信号なし」とは判定されませんでした（静止していないため）" : "「信号なし」と誤判定されました");
-        if (!bOk) { v = Worst(v, Verdict.Ng); why.Add("真っ黒な画面を、3 秒前後で「信号なし」と判定し、映像が来たら「信号あり」に戻すことができませんでした。"); }
+        if (!bOk) { v = Worst(v, Verdict.Ng); why.Add("真っ黒な画面を、5 秒前後で「信号なし」と判定し、映像が来たら「信号あり」に戻すことができませんでした。"); }
         if (!cNever) { v = Worst(v, Verdict.Ng); why.Add("暗くて動く場面を「信号なし」と誤判定しました。"); }
-        if (bOk && cNever) why.Add("動いている場面は、暗くても「信号なし」になりません。ただし、ゲームの真っ黒な画面が 3 秒以上続くときや、暗くて文字だけがある静止した画面（読み込み中の表示など）は、カードの画面と区別できず「信号なし」になることがあります。そのため「信号が来たら全画面にする」は既定でオフです。");
+        bool dNever = !rD.Changes.Any(c => c.S == SignalState.NoSignal) && rD.Final == SignalState.Signal
+            && rD.Changes.Where(c => c.S == SignalState.Signal).Select(c => c.T).FirstOrDefault() <= 0.6;
+        bool eNever = !rE.Changes.Any(c => c.S == SignalState.NoSignal) && rE.Final == SignalState.Signal;
+        double? fBack = rF.Changes.Where(c => c.S == SignalState.Signal && c.T >= RT - 1e-6).Select(c => (double?)c.T).FirstOrDefault();
+        double? fSaveOff = rF.Saving.Where(s2 => !s2.Saving && s2.T >= RT - 1e-6).Select(s2 => (double?)s2.T).FirstOrDefault();
+        bool fOk = rF.Changes.Any(c => c.S == SignalState.NoSignal) && fBack is { } fb && fb - RT <= 0.5 && fSaveOff is { } fs && fs - RT <= 0.5 && rF.Final == SignalState.Signal;
+        int checkedAll = rA.Checked + rE.Checked + rF.Checked, staleAll = rA.Stale + rE.Stale + rF.Stale;
+        bool newest = checkedAll > 0 && staleAll == 0;
+        item.Num("暗い 4:3 の画面＋小さなロゴ＋コンバーターのノイズ（PS2 風）", dNever ? "「信号なし」にならず、すぐ「信号あり」になりました" : "「信号なし」と誤判定されたか、「信号あり」になりませんでした")
+            .Num("リセット（映像 → 真っ黒 2 秒 → 暗い起動ロゴ → ゲーム）", eNever ? "「信号なし」にならず、「信号あり」のままでした" : "「信号なし」になってしまいました")
+            .Num("信号なし・省電力のあとで暗い起動ロゴが来たとき", fOk ? $"{fBack - RT:0.00} 秒で「信号あり」、省電力は {Math.Max(0, (fSaveOff ?? RT) - RT):0.00} 秒で止まりました" : "0.5 秒以内に戻れませんでした")
+            .Num("省電力のあいだに表示する絵", newest ? $"いつも最新のコマと一致（{checkedAll} 回確認）" : $"古い絵が出ました（{staleAll}/{checkedAll} 回）");
+        if (!dNever) { v = Worst(v, Verdict.Ng); why.Add("暗い 4:3 のレトロ機の画面（小さなロゴ・ノイズ付き）を「信号なし」と誤判定したか、「信号あり」にできませんでした。"); }
+        if (!eNever) { v = Worst(v, Verdict.Ng); why.Add("ゲーム機のリセット（真っ黒 → 暗い起動ロゴ）で「信号なし」になってしまいました。"); }
+        if (!fOk) { v = Worst(v, Verdict.Ng); why.Add("信号なしのあと、暗い起動ロゴが来ても 0.5 秒以内に「信号あり」へ戻れませんでした。"); }
+        if (!newest) { v = Worst(v, Verdict.Ng); why.Add("省電力のあいだに、最新のコマではない古い絵が表示される場合がありました。"); }
+        if (bOk && cNever) why.Add("動いている場面は、暗くても「信号なし」になりません。ただし、ゲームの真っ黒な画面が 5 秒以上続くときや、ノイズのまったくない（コマごとにビット単位で同じ）暗い静止画面は、カードの画面と区別できず「信号なし」になることがあります。そのため「信号が来たら全画面にする」は既定でオフです。");
 
         // ---- live: reach the card's own message by asking for a mode the console is not sending, then measure with / without saving ----
         string measured = "試せませんでした";
