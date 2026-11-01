@@ -58,6 +58,8 @@ public sealed class SignalDetector
     public const double SignalSec = 0.25;
     public const double SilentSec = 2.0;
     public const double PowerSaveAfterSec = 5.0;
+    /// <summary>After a hit ended the power saving, it only starts again after this long without any hit (single repeated frames of a slower game do not count).</summary>
+    public const double PowerSaveReentrySec = 2.0;
 
     private readonly object _gate = new();
     private SignalState _state = SignalState.Unknown;
@@ -125,10 +127,17 @@ public sealed class SignalDetector
     public long Changes { get { lock (_gate) return _changes; } }
 
     /// <summary>No signal for more than <see cref="PowerSaveAfterSec"/>, and the card's message (or black) is still what arrives: the
-    /// renderer can stop all expensive work. Ends with the first frame that is anything else or differs from the one before.</summary>
+    /// renderer can stop all expensive work. Ends with the first frame that is anything else or differs from the one before, and does not resume before
+    /// <see cref="PowerSaveReentrySec"/> without such a frame (no flapping on a game that repeats every other frame).</summary>
     public bool SavingPower(long now)
     {
-        lock (_gate) return _state == SignalState.NoSignal && _lastEmpty && now - _noSignalSince >= Ticks(PowerSaveAfterSec);
+        lock (_gate)
+        {
+            if (_state != SignalState.NoSignal || !_lastEmpty || now - _noSignalSince < Ticks(PowerSaveAfterSec)) return false;
+            // a hit since the no-signal verdict ended the saving: stay in normal rendering until the picture has been quiet for a full re-entry period
+            if (_lastHit > _noSignalSince && now - _lastHit < Ticks(PowerSaveReentrySec)) return false;
+            return true;
+        }
     }
 
     /// <summary>Test hook: start over.</summary>

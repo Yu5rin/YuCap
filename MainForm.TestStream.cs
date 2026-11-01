@@ -310,6 +310,15 @@ public sealed partial class MainForm
         return b;
     }
 
+    /// <summary>The card's message with the dot nudged by a pixel or two per phase: still message-like, but not the same picture as the one before.</summary>
+    private static Bitmap SynthCardMessageNudged(int w, int h, int phase)
+    {
+        var b = SynthCardMessage(w, h);
+        using Graphics g = Graphics.FromImage(b);
+        g.FillRectangle(Brushes.White, 4 + (phase % 2) * 3, 4, 3, 3);
+        return b;
+    }
+
     private static Bitmap SynthGameFrame(int w, int h, int phase)
     {
         var b = new Bitmap(w, h, PixelFormat.Format32bppArgb);
@@ -422,7 +431,7 @@ public sealed partial class MainForm
                 {
                     for (int i = 0; i < frames; i++)
                     {
-                        int key = s.Name.StartsWith("moving") ? i % 24 : 0;
+                        int key = s.Name.StartsWith("alt") ? (i / 2) % 24 : s.Name.StartsWith("moving") ? i % 24 : 0;
                         if (!cache.TryGetValue(key, out Bitmap? bmp)) cache[key] = bmp = s.Frame(key);
                         simNow = freq + (long)(t * freq);
                         long no = r.ReplaySubmit(bmp, simNow, simNow);
@@ -509,10 +518,19 @@ public sealed partial class MainForm
             new("moving-ps2-logo", p => SynthPs2Dark(W, H, p, false, true), 3.0),
             new("moving-game", p => SynthGameFrame(W, H, p), 2.0),
         }));
-        if (rA.Error != null || rB.Error != null || rC.Error != null || rD.Error != null || rE.Error != null || rF.Error != null)
+        // a 30 fps game in a 60 fps stream, seen as the card's message: pictures alternate changed / repeated for 0.2 s after the power saving began
+        // (too short to be "signal"). The saving must end once and not come back for a full re-entry period (2 s) without a changed frame.
+        const double GT = 7.5, GB = 0.2;
+        var rG = await Task.Run(() => ReplaySignal(new List<SigSeq>
+        {
+            new("card", _ => SynthCardMessage(W, H), GT),
+            new("alt-card", p => SynthCardMessageNudged(W, H, p), GB),
+            new("card", _ => SynthCardMessage(W, H), 3.0),
+        }));
+        if (rA.Error != null || rB.Error != null || rC.Error != null || rD.Error != null || rE.Error != null || rF.Error != null || rG.Error != null)
         {
             item.Verdict = Verdict.Info; item.Summary = "[情報] 検出の確認ができませんでした";
-            item.Explanation = "理由: " + (rA.Error ?? rB.Error ?? rC.Error ?? rD.Error ?? rE.Error ?? rF.Error);
+            item.Explanation = "理由: " + (rA.Error ?? rB.Error ?? rC.Error ?? rD.Error ?? rE.Error ?? rF.Error ?? rG.Error);
             sec.Items.Add(item);
             return;
         }
@@ -549,17 +567,26 @@ public sealed partial class MainForm
             && rD.Changes.Where(c => c.S == SignalState.Signal).Select(c => c.T).FirstOrDefault() <= 0.6;
         bool eNever = !rE.Changes.Any(c => c.S == SignalState.NoSignal) && rE.Final == SignalState.Signal;
         double? fBack = rF.Changes.Where(c => c.S == SignalState.Signal && c.T >= RT - 1e-6).Select(c => (double?)c.T).FirstOrDefault();
-        double? fSaveOff = rF.Saving.Where(s2 => !s2.Saving && s2.T >= RT - 1e-6).Select(s2 => (double?)s2.T).FirstOrDefault();
+        // the saving may already be off at RT (a changed frame ended it earlier and it has not resumed yet): then it is off at once
+        bool fSavingAtRt = rF.Saving.Where(s2 => s2.T < RT - 1e-6).Select(s2 => s2.Saving).DefaultIfEmpty(false).Last();
+        double? fSaveOff = fSavingAtRt ? rF.Saving.Where(s2 => !s2.Saving && s2.T >= RT - 1e-6).Select(s2 => (double?)s2.T).FirstOrDefault() : RT;
         bool fOk = rF.Changes.Any(c => c.S == SignalState.NoSignal) && fBack is { } fb && fb - RT <= 0.5 && fSaveOff is { } fs && fs - RT <= 0.5 && rF.Final == SignalState.Signal;
+        // G: saving on at ~7.0, off once when the first changed frame arrives, back on only >= 2 s after the last changed frame (never within the burst)
+        var gs = rG.Saving;
+        double gLastHit = GT + GB;
+        bool gOk = gs.Count == 3 && gs[0].Saving && !gs[1].Saving && gs[2].Saving && gs[1].T >= GT - 1e-6 && gs[1].T <= GT + 0.1
+            && gs[2].T >= gLastHit - 0.1 + SignalDetector.PowerSaveReentrySec && rG.Changes.All(c => c.S != SignalState.Signal);
         int checkedAll = rA.Checked + rE.Checked + rF.Checked, staleAll = rA.Stale + rE.Stale + rF.Stale;
         bool newest = checkedAll > 0 && staleAll == 0;
         item.Num("暗い 4:3 の画面＋小さなロゴ＋コンバーターのノイズ（PS2 風）", dNever ? "「信号なし」にならず、すぐ「信号あり」になりました" : "「信号なし」と誤判定されたか、「信号あり」になりませんでした")
             .Num("リセット（映像 → 真っ黒 2 秒 → 暗い起動ロゴ → ゲーム）", eNever ? "「信号なし」にならず、「信号あり」のままでした" : "「信号なし」になってしまいました")
             .Num("信号なし・省電力のあとで暗い起動ロゴが来たとき", fOk ? $"{fBack - RT:0.00} 秒で「信号あり」、省電力は {Math.Max(0, (fSaveOff ?? RT) - RT):0.00} 秒で止まりました" : "0.5 秒以内に戻れませんでした")
+            .Num("省電力のあと、1 コマおきに変わる映像が来たとき（30 fps のゲームの合間）", gOk ? $"省電力は {gs[1].T:0.00} 秒で 1 回だけ止まり、{gs[2].T - gs[1].T:0.0} 秒後まで入り直しませんでした" : $"省電力の切り替わりが想定と違います（{gs.Count} 回: {string.Join(", ", gs.Select(x => (x.Saving ? "入 " : "切 ") + x.T.ToString("0.00")))}）")
             .Num("省電力のあいだに表示する絵", newest ? $"いつも最新のコマと一致（{checkedAll} 回確認）" : $"古い絵が出ました（{staleAll}/{checkedAll} 回）");
         if (!dNever) { v = Worst(v, Verdict.Ng); why.Add("暗い 4:3 のレトロ機の画面（小さなロゴ・ノイズ付き）を「信号なし」と誤判定したか、「信号あり」にできませんでした。"); }
         if (!eNever) { v = Worst(v, Verdict.Ng); why.Add("ゲーム機のリセット（真っ黒 → 暗い起動ロゴ）で「信号なし」になってしまいました。"); }
         if (!fOk) { v = Worst(v, Verdict.Ng); why.Add("信号なしのあと、暗い起動ロゴが来ても 0.5 秒以内に「信号あり」へ戻れませんでした。"); }
+        if (!gOk) { v = Worst(v, Verdict.Ng); why.Add("1 コマおきに変わる映像で、省電力が入ったり切れたりを繰り返しました（止まったあと 2 秒は入り直さない想定です）。"); }
         if (!newest) { v = Worst(v, Verdict.Ng); why.Add("省電力のあいだに、最新のコマではない古い絵が表示される場合がありました。"); }
         if (bOk && cNever) why.Add("動いている場面は、暗くても「信号なし」になりません。ただし、ゲームの真っ黒な画面が 5 秒以上続くときや、ノイズのまったくない（コマごとにビット単位で同じ）暗い静止画面は、カードの画面と区別できず「信号なし」になることがあります。そのため「信号が来たら全画面にする」は既定でオフです。");
 
