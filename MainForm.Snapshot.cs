@@ -347,7 +347,7 @@ public sealed partial class MainForm
 
     private void ShowSnapshotSettings()
     {
-        using var dlg = Ui.NewDialog(L.T("スナップショット設定"), 460);
+        using var dlg = Ui.NewDialog(L.T("スナップショットの設定"), 460);
 
         var txtDir = new TextBox { Text = SnapshotDirectory, ReadOnly = true };
         var browse = Ui.Btn(L.T("参照..."));

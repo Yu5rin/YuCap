@@ -2436,7 +2436,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowDeviceKeywordSettings()
     {
-        using var dlg = Ui.NewDialog(L.T("優先デバイス設定"), 380);
+        using var dlg = Ui.NewDialog(L.T("優先デバイスの設定"), 380);
 
         var txt = new TextBox { Text = _settings.DeviceKeyword };
         var grid = Ui.Grid()
@@ -4107,7 +4107,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowAudioBufferSettingsCore()
     {
-        using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 440);
+        using var dlg = Ui.NewDialog(L.T("音声バッファの設定"), 440);
 
         var num = Ui.Number(AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs,
             Math.Clamp(_audio.BufferMilliseconds, AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs), 100);

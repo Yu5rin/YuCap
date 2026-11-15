@@ -246,7 +246,7 @@ public sealed partial class MainForm
         List<DisplayInfo> all = Displays.List();
         if (all.Count == 0) return;
 
-        using var dlg = Ui.NewDialog(L.T("テストモード（自動試験）"), 480);
+        using var dlg = Ui.NewDialog(L.T("動作テスト（自動）"), 480);
         var stack = Ui.Stack();
         stack.Add(Ui.Caption(L.T("試験するモニター:")));
         var combo = stack.Add(Ui.Combo(), before: 4);

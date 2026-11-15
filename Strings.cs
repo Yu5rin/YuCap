@@ -428,7 +428,7 @@ internal static class L
         ["PiP"] = "PiP",
 
         // ---- Dialogs ----
-        ["音声バッファ設定"] = "Audio buffer settings",
+        ["音声バッファの設定"] = "Audio buffer settings",
         ["安全のための余裕 (ms):"] = "Safety margin (ms):",
         ["プリセット:"] = "Presets:",
         ["低遅延 20"] = "Low 20",
@@ -444,7 +444,7 @@ internal static class L
         ["バージョンをコピー"] = "Copy version",
         ["バージョンをコピーしました"] = "Version copied",
         ["Windows の自動実行の設定を変更できませんでした（アクセスが拒否されました）。"] = "Could not change the \"Run at Windows startup\" setting (access was denied).",
-        ["スナップショット設定"] = "Snapshot settings",
+        ["スナップショットの設定"] = "Snapshot settings",
         ["保存先:"] = "Folder:",
         ["参照..."] = "Browse...",
         ["形式:"] = "Format:",
@@ -456,7 +456,7 @@ internal static class L
         ["間隔（秒）:"] = "Interval (s):",
         ["枚数:"] = "Count:",
         ["開始"] = "Start",
-        ["優先デバイス設定"] = "Preferred device",
+        ["優先デバイスの設定"] = "Preferred device",
         ["キーワード:"] = "Keyword:",
         ["デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）"] =
             "Devices whose name contains this word are\nauto-selected at startup. (default: JVA14)",
@@ -714,7 +714,7 @@ internal static class L
 
         // ---- Test mode (automatic test) ----
         ["動作テスト（自動）..."] = "Self-test...",
-        ["テストモード（自動試験）"] = "Test mode (automatic test)",
+        ["動作テスト（自動）"] = "Self-test",
         ["試験するモニター:"] = "Monitor to test:",
         ["所要時間の目安: 約 {0} 分"] = "Estimated time: about {0} min",
         ["試験中は画面が何度も切り替わります。Esc でいつでも中止できます。終了すると設定は元に戻ります。"] =
