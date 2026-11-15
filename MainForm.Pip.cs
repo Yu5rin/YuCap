@@ -408,7 +408,50 @@ public sealed partial class MainForm
             if (key is Keys.C or Keys.V or Keys.X or Keys.Z or Keys.Y or Keys.A) return true;
         }
         if (mods == Keys.Alt && key is Keys.F4 or Keys.Tab or Keys.Escape or Keys.Space) return true;
+        if (mods == Keys.Control && key is Keys.Escape) return true;                       // Start menu
+        if (mods == (Keys.Control | Keys.Shift) && key is Keys.Escape) return true;       // Task Manager
+        if (mods == (Keys.Control | Keys.Alt) && key is Keys.Delete) return true;         // secure attention
         return false;
+    }
+
+    /// <summary>A combo the hotkey dialog cannot take at all: no modifier (the key would stop typing / working
+    /// everywhere), or Shift alone with anything but a function key (it would stop capital letters and symbols).
+    /// A modifier on its own is not a combo either.</summary>
+    private static bool NeedsCtrlOrAlt(Keys combo)
+    {
+        Keys mods = combo & Keys.Modifiers;
+        Keys key = combo & Keys.KeyCode;
+        if (key is Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.LWin or Keys.RWin) return true;
+        if ((mods & (Keys.Control | Keys.Alt)) != Keys.None) return false;
+        return !(mods == Keys.Shift && key is >= Keys.F1 and <= Keys.F24);
+    }
+
+    /// <summary>The name of YuCap's own fixed shortcut a combo would take over (configured hotkeys are matched first
+    /// in ProcessCmdKey), or null. Keys without Ctrl/Alt are never accepted, so only modified shortcuts are listed.</summary>
+    private static string? BuiltInShortcutName(Keys combo)
+    {
+        if (ProfileIndexForKey(combo) != null) return L.T("プロファイルを切り替える");
+        return combo switch
+        {
+            Keys.Control | Keys.S => L.T("スナップショットを保存"),
+            Keys.Control | Keys.C => L.T("スナップショットをコピー"),
+            Keys.Control | Keys.G => L.T("スナップショット一覧"),
+            Keys.Control | Keys.T => L.T("常に前面に表示"),
+            Keys.Control | Keys.B => L.T("ウィンドウ枠を非表示"),
+            Keys.Control | Keys.D0 or Keys.Control | Keys.NumPad0 => L.T("ズームをリセット"),
+            Keys.Control | Keys.Shift | Keys.I => L.T("情報表示の切替（オフ → FPS だけ → 詳しく）"),
+            _ => null,
+        };
+    }
+
+    /// <summary>Ctrl (+ Shift) with a letter or digit: other apps commonly use these (Ctrl+F, Ctrl+W, Ctrl+Shift+N ...),
+    /// and a global hotkey takes the key away from all of them while YuCap runs.</summary>
+    private static bool IsCommonAppCombo(Keys combo)
+    {
+        Keys mods = combo & Keys.Modifiers;
+        Keys key = combo & Keys.KeyCode;
+        if (mods != Keys.Control && mods != (Keys.Control | Keys.Shift)) return false;
+        return key is >= Keys.A and <= Keys.Z or >= Keys.D0 and <= Keys.D9;
     }
 
     private void ShowHotkeySettings()
@@ -424,6 +467,8 @@ public sealed partial class MainForm
 
         const int tbX = 165, tbWidth = 175;
         int clearX = tbX + tbWidth + Ui.Gap;
+        string hintText = L.T("欄を選んでキーの組み合わせを押してください。［解除］または Backspace で割り当てを外せます。");
+        Label? hint = null;
 
         (TextBox tb, Button clear) MakeRow(string label, int y, Keys initial, Action<Keys> set)
         {
@@ -452,9 +497,16 @@ public sealed partial class MainForm
                 // whole dialog. Backspace/Delete DO reach KeyDown normally and
                 // serve as the keyboard-only way to unassign a combo.
                 if (e.KeyCode is Keys.Back or Keys.Delete) { Clear(); return; }
-                // Ignore presses of a modifier alone; require Ctrl/Alt/Shift.
-                if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu) return;
-                if (e.Modifiers == Keys.None) return;
+                // A modifier on its own is the start of a combo: wait for the rest.
+                if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.LWin or Keys.RWin) return;
+                // A key without Ctrl/Alt would be taken from typing everywhere: say why nothing was assigned
+                // instead of ignoring the press.
+                if (NeedsCtrlOrAlt(e.KeyData))
+                {
+                    if (hint != null) hint.Text = L.F("{0} は使えません。Ctrl か Alt を押しながら、ほかのキーを押してください。", FormatHotkey(e.KeyData));
+                    return;
+                }
+                if (hint != null) hint.Text = hintText;
                 set(e.KeyData);
                 tb.Text = FormatHotkey(e.KeyData);
             };
@@ -475,19 +527,21 @@ public sealed partial class MainForm
         var (tbStyle, _) = MakeRow("なめらか ⇔ 低遅延:", Ui.Pad + 180, styleCombo, k => styleCombo = k);
 
         int hintY = Ui.Pad + 180 + 36;
-        Ui.Hint(L.T("欄を選んでキーの組み合わせを押してください。［解除］または Backspace で割り当てを外せます。"),
-            Ui.Pad, hintY, 440 - 2 * Ui.Pad);
+        hint = Ui.Hint(hintText, Ui.Pad, hintY, 440 - 2 * Ui.Pad);
+        dlg.Controls.Add(hint);   // was built but never added, so the instructions were never shown
 
         Ui.AddOkCancel(dlg);
         var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 100);
         reset.Click += (_, _) =>
         {
-            snapCombo = Keys.Control | Keys.Alt | Keys.S;
-            muteCombo = Keys.Control | Keys.Alt | Keys.M;
-            pipCombo = Keys.Control | Keys.Alt | Keys.P;
-            volUpCombo = Keys.Control | Keys.Alt | Keys.Up;
-            volDownCombo = Keys.Control | Keys.Alt | Keys.Down;
-            styleCombo = Keys.Control | Keys.Shift | Keys.L;
+            var defaults = new AppSettings();   // the one place the defaults are defined
+            snapCombo = (Keys)defaults.HotkeySnapshot;
+            muteCombo = (Keys)defaults.HotkeyMute;
+            pipCombo = (Keys)defaults.HotkeyPip;
+            volUpCombo = (Keys)defaults.HotkeyVolumeUp;
+            volDownCombo = (Keys)defaults.HotkeyVolumeDown;
+            styleCombo = (Keys)defaults.HotkeyStyle;
+            if (hint != null) hint.Text = hintText;
             tbStyle.Text = FormatHotkey(styleCombo);
             tbVolUp.Text = FormatHotkey(volUpCombo);
             tbVolDown.Text = FormatHotkey(volDownCombo);
@@ -501,9 +555,19 @@ public sealed partial class MainForm
         // must send the user back into the same dialog with their typed values
         // intact, not close it — ShowDialog can be called again on the same
         // (undisposed) Form, and none of the controls' state is reset in between.
+        // While the dialog is open the registered combos must reach the text boxes: a registered global hotkey is
+        // delivered as WM_HOTKEY instead of a key press, which would fire the action under the dialog (mute, a
+        // snapshot, PiP) and leave the box unchanged - an assigned combo could never be moved to another action.
+        UnregisterGlobalHotkeys();
         while (true)
         {
-            if (dlg.ShowDialog(this) != DialogResult.OK) { dlg.Dispose(); return; }
+            if (dlg.ShowDialog(this) != DialogResult.OK)
+            {
+                dlg.Dispose();
+                if (_settings.GlobalHotkeys) RegisterGlobalHotkeys(announce: false);   // put back what was there
+                else SyncPipHotkey();
+                return;
+            }
 
             // Reject the same combo assigned to two actions: RegisterHotKey
             // would only fail on the second one, and telling the user "another
@@ -528,6 +592,21 @@ public sealed partial class MainForm
                     "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 continue;
             }
+
+            // Allowed, but it takes a key away from something: say what, and let the user decide.
+            var clashes = new List<string>();
+            foreach (Keys c in all)
+            {
+                if ((c & Keys.KeyCode) == Keys.None) continue;
+                if (BuiltInShortcutName(c) is string builtIn)
+                    clashes.Add(L.F("{0}: YuCap の「{1}」が使えなくなります", FormatHotkey(c), builtIn));
+                else if (IsCommonAppCombo(c))
+                    clashes.Add(L.F("{0}: ほかのアプリでもよく使うキーです。どこからでも効くようにすると、そのアプリでは使えなくなります", FormatHotkey(c)));
+            }
+            if (clashes.Count > 0 && MessageBox.Show(this,
+                    L.F("次のキーは、ほかの操作と重なります。\n\n{0}\n\nこのまま割り当てますか？", string.Join("\n", clashes)),
+                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                continue;
             break;
         }
         dlg.Dispose();

@@ -184,8 +184,13 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(akOut, "report.txt"), akText, new System.Text.UTF8Encoding(true));
             return;
         }
-        if (args.Length > 3 && args[0] == "--a4k-run")
+        if (args.Length > 0 && args[0] == "--a4k-run")
         {
+            if (args.Length < 4)
+            {
+                RejectCommandLine("--a4k-run <S|M|L|model.hlsl> <picture.png> <out.f32> [--half] [--bench]");
+                return;
+            }
             // Headless (GPU only): the raw float32 x2 output of one network for one picture, for the comparison with PyTorch.
             //   --a4k-run <S|M|L|model.hlsl> <picture.png> <out.f32> [--half] [--bench]   (--half: float16 intermediates as in the viewer; default float32; --bench: also the GPU ms of the x2 stage)
             File.WriteAllText(args[3] + ".txt", A4kUserTest.DumpRaw(args[1], args[2], args[3], args.Length > 4 && args.Contains("--half"), args.Length > 4 && args.Contains("--bench")), new System.Text.UTF8Encoding(true));
@@ -420,7 +425,14 @@ internal static partial class Program
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        ParseOptions(args);
+        // Anything the viewer does not know (a typo, or a diagnostic switch this build does not have) must not start the full
+        // viewer: it would take the capture device, never exit (a calling script hangs) and could apply an update.
+        string? badArg = ParseOptions(args);
+        if (badArg != null)
+        {
+            RejectCommandLine(badArg);
+            return;
+        }
 
         // The capture device is exclusive — a second instance could only fail to
         // open it (or steal it), so allow one instance at a time. Rather than
@@ -502,16 +514,43 @@ internal static partial class Program
         Watchdog.Start();
 
         // Keep the app alive even if a device throws unexpectedly during runtime.
+        // A fault on a timer repeats every tick, and the message box's own loop keeps the timers running: one box per
+        // exception would stack a new box twice a second. So: one box at a time, each distinct error shown once
+        // (with the choice to quit), repeats only logged - in full a few times, then as a count.
+        var crashSeen = new Dictionary<string, int>();
+        bool crashBoxOpen = false;
         Application.ThreadException += (s, e) =>
         {
-            LogCrash(e.Exception);
-            // Describe(), not e.Exception.Message: the raw message can be a bare
-            // HRESULT string (e.g. "Exception from HRESULT: 0xC00D3E85"), which
-            // means nothing to a user. Full detail still goes to error.log below.
-            MessageBox.Show(
-                L.F("予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。", Errors.Describe(e.Exception)),
-                "YuCap - " + L.T("エラー"),
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Exception ex = e.Exception;
+            string key = ex.GetType().FullName + "|" + ex.TargetSite + "|" + ex.Message;
+            crashSeen.TryGetValue(key, out int seen);
+            crashSeen[key] = ++seen;
+            if (seen <= 3) LogCrash(ex);
+            else if (seen is 10 or 100 or 1000 || seen % 10000 == 0) Log.Info($"CRASH repeated {seen} times: {ex.GetType().Name}: {ex.Message}");
+            if (seen > 1 || crashBoxOpen) return;
+            crashBoxOpen = true;
+            try
+            {
+                // Owned by the main window when there is one, so the box is not hidden behind a fullscreen YuCap.
+                Form? owner = null;
+                foreach (Form f in Application.OpenForms)
+                    if (f is MainForm && f.IsHandleCreated && !f.IsDisposed) { owner = f; break; }
+                // Describe(), not e.Exception.Message: the raw message can be a bare
+                // HRESULT string (e.g. "Exception from HRESULT: 0xC00D3E85"), which
+                // means nothing to a user. Full detail still goes to error.log below.
+                string text = L.F("予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。同じエラーがまた起きたときは、表示せずに記録だけします。\n\nYuCap を終了しますか？（［いいえ］で使い続けます）",
+                    Errors.Describe(ex));
+                DialogResult answer = owner != null
+                    ? MessageBox.Show(owner, text, "YuCap - " + L.T("エラー"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2)
+                    : MessageBox.Show(text, "YuCap - " + L.T("エラー"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (answer == DialogResult.Yes)
+                {
+                    Log.Info("quitting after an unexpected error (user's choice)");
+                    Application.Exit();
+                }
+            }
+            catch (Exception boxEx) { Log.Info("error box failed: " + boxEx.Message); }
+            finally { crashBoxOpen = false; }
         };
 
         Application.Run(new MainForm());
@@ -520,7 +559,11 @@ internal static partial class Program
         // are not cleared here — the next launch sees version <= current and
         // cleans up. Never applied when the setting is off or the version was
         // skipped (TryGetVerifiedStaged checks the latter).
-        if (!Updater.AppliedThisSession && !Options.TestMode && Settings.UpdateCheckOnStartup
+        // Not while Windows is shutting down: the process can be killed between the two renames of the swap, which would leave
+        // no YuCap.exe at all. The staged file stays, and the next start applies it (the crash-recovery path above).
+        bool shuttingDown = GetSystemMetrics(SmShuttingDown) != 0;
+        if (shuttingDown) Log.Info("update: Windows is shutting down - the staged update is applied at the next start");
+        if (!shuttingDown && !Updater.AppliedThisSession && !Options.TestMode && Settings.UpdateCheckOnStartup
             && TryGetVerifiedStaged(out string exitStaged) && Updater.CanWriteToInstallDir())
         {
             try { Updater.Apply(exitStaged, relaunch: false, expectedSha256: Settings.StagedUpdateSha256); }
@@ -580,11 +623,15 @@ internal static partial class Program
         catch (Exception ex) { Log.Info("could not save settings after clearing staged update: " + ex.Message); }
     }
 
-    private static void ParseOptions(string[] args)
+    /// <summary>Apply the viewer's switches to <see cref="Options"/>. Returns null when every argument was understood, otherwise
+    /// the offending part (an unknown switch, or a switch whose value is missing or malformed) for the error message.</summary>
+    private static string? ParseOptions(string[] args)
     {
         for (int i = 0; i < args.Length; i++)
         {
-            switch (args[i].ToLowerInvariant())
+            string a = args[i];
+            string? next = i + 1 < args.Length ? args[i + 1] : null;
+            switch (a.ToLowerInvariant())
             {
                 case "--fullscreen": Options.Fullscreen = true; break;
                 case "--borderless": Options.Borderless = true; break;
@@ -593,18 +640,57 @@ internal static partial class Program
                 case "--test-mode": Options.TestMode = true; break;
                 case "--quick": Options.TestQuick = true; break;
                 case "--display":
-                    if (i + 1 < args.Length) Options.TestDisplay = args[++i];
+                    if (string.IsNullOrWhiteSpace(next) || next.StartsWith("--", StringComparison.Ordinal)) return a + " <N>";
+                    Options.TestDisplay = args[++i];
                     break;
                 case "--volume":
-                    if (i + 1 < args.Length && int.TryParse(args[++i], out int v))
-                        Options.Volume = Math.Clamp(v, 0, AudioEngine.MaxVolumePercent);
+                    if (next == null || !int.TryParse(next, out int v)) return a + " " + (next ?? "<0-500>");
+                    Options.Volume = Math.Clamp(v, 0, AudioEngine.MaxVolumePercent);
+                    i++;
                     break;
                 case "--mode":
-                    if (i + 1 < args.Length) Options.Mode = ParseMode(args[++i]);
+                    CaptureMode? mode = next == null ? null : ParseMode(next);
+                    if (mode == null) return a + " " + (next ?? "<1080p120>");
+                    Options.Mode = mode;
+                    i++;
+                    break;
+                case Updater.PostUpdateArg:
+                    // Handled before the single-instance check (the pid of the build that was just replaced).
+                    if (next == null || !int.TryParse(next, out _)) return a + " " + (next ?? "<pid>");
+                    i++;
+                    break;
+                default:
+                    // Plain words are left alone as before (nothing reads them); anything that looks like a switch is an error.
+                    if (a.StartsWith("-", StringComparison.Ordinal) || a.StartsWith("/", StringComparison.Ordinal)) return a;
                     break;
             }
         }
+        return null;
     }
+
+    /// <summary>A command line the viewer cannot run: say so (on the redirected error stream when a script runs YuCap, otherwise
+    /// in a message box) and end with exit code 2, without starting the viewer, touching the settings or applying an update.</summary>
+    private static void RejectCommandLine(string detail)
+    {
+        Log.Info("command line rejected: " + detail);
+        string text = L.F("コマンドラインの指定が正しくないため、起動しませんでした。\n\n{0}\n\n使える指定は YuCap.exe --help で確認できます。", detail);
+        bool redirected = false;
+        try { redirected = Console.IsErrorRedirected || Console.IsOutputRedirected; } catch { /* no console */ }
+        if (redirected)
+        {
+            try { Console.Error.WriteLine(text); } catch { /* ignore */ }
+        }
+        else
+        {
+            MessageBox.Show(text, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        Environment.ExitCode = 2;
+    }
+
+    private const int SmShuttingDown = 0x2000;   // SM_SHUTTINGDOWN
+
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int index);
 
     /// <summary>Parse "1080p120", "1440p60", "4k30" or "1920x1080@120".</summary>
     internal static CaptureMode? ParseMode(string s)

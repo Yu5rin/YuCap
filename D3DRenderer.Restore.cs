@@ -26,7 +26,9 @@ internal sealed partial class D3DRenderer
     private readonly List<A4kTex?> _restInter = new();
     private A4kTex? _restOut;
     private RestoreKey _restKey;
-    private bool _restHaveKey, _restBroken;
+    private bool _restHaveKey, _restBroken;   // _restBroken: the shaders do not compile (for the life of this renderer)
+    private long _restRetryAt;                // a pass failed (typically out of video memory): no pre-pass until this tick
+    private int _restRetryDelayMs = A4kRetryFirstMs;
     private ID3D11PixelShader[]? _restPs;
     private char _restPsLetter;
 
@@ -37,6 +39,11 @@ internal sealed partial class D3DRenderer
     private bool RestoreWanted(ScalingQuality quality, bool shrunk)
     {
         if (_restBroken || GuardNoRestore) return false;
+        if (_restRetryAt != 0)
+        {
+            if (Environment.TickCount64 < _restRetryAt) return false;
+            _restRetryAt = 0;
+        }
         if (RestoreForce) return quality != ScalingQuality.Standard;
         return RestoreMode == 1 && quality != ScalingQuality.Standard && !shrunk;
     }
@@ -80,21 +87,45 @@ internal sealed partial class D3DRenderer
                 for (int k = 0; k < p.Inputs.Length; k++) Ctx.PSSetShaderResource((uint)k, null!);
             }
             _restKey = key; _restHaveKey = true;
+            if (_restRetryDelayMs != A4kRetryFirstMs || _scalerNote != null)
+            {
+                _restRetryDelayMs = A4kRetryFirstMs;
+                if (!_a4kBroken && _a4kRetryAt == 0) _scalerNote = null;
+            }
             return true;
         }
         catch (Exception ex)
         {
-            Log.Info("D3D: Anime4K Restore failed - " + ex.Message.Split('\n')[0]);
-            _restBroken = true; _restHaveKey = false;
+            _restHaveKey = false;
+            if (_restPs == null)
+            {
+                // the shaders themselves are unusable: that does not get better by waiting
+                _restBroken = true;
+                _scalerNote ??= "ぼやけ取りを使えないため、止めています";
+                Log.Info("D3D: Anime4K Restore unavailable - " + ex.Message.Split('\n')[0]);
+            }
+            else
+            {
+                Log.Info($"D3D: Anime4K Restore failed - {ex.Message.Split('\n')[0]} - off for {_restRetryDelayMs / 1000} s");
+                _restRetryAt = Environment.TickCount64 + _restRetryDelayMs;
+                _restRetryDelayMs = Math.Min(A4kRetryMaxMs, _restRetryDelayMs * 2);
+                try { RestoreFreeTextures(); } catch { }
+                _scalerNote ??= "ぼやけ取りを実行できなかったため、止めています";
+            }
             return false;
         }
     }
 
-    private void RestoreFree()
+    private void RestoreFreeTextures()
     {
         foreach (var t in _restInter) t?.Dispose();
         _restInter.Clear();
         _restOut?.Dispose(); _restOut = null; _restHaveKey = false;
+    }
+
+    private void RestoreFree()
+    {
+        RestoreFreeTextures();
         if (_restPs != null) { foreach (var p in _restPs) p.Dispose(); _restPs = null; }
     }
 

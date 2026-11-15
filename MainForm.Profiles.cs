@@ -176,11 +176,12 @@ public sealed partial class MainForm
 
     private async void ApplyProfile(VideoProfile profile, bool auto = false)
     {
-        if (_engineSwapping) return;
+        if (_engineSwapping || _engineSwitchBusy) { Log.Info("ApplyProfile: another switch is running"); return; }
+        _engineSwitchBusy = true;
         _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
         try { await ApplyProfileCoreAsync(profile, auto); }
         catch (Exception ex) { Log.Info("ApplyProfile: " + ex); }
-        finally { _devOpBusy--; }
+        finally { _devOpBusy--; _engineSwitchBusy = false; }
     }
 
     private async Task ApplyProfileCoreAsync(VideoProfile profile, bool auto = false)
@@ -520,11 +521,12 @@ public sealed partial class MainForm
     /// </summary>
     private async void ToggleLowLatency()
     {
-        if (_engineSwapping) return;
+        if (_engineSwapping || _engineSwitchBusy) { Log.Info("ToggleLowLatency: another switch is running"); UpdateChecks(); return; }
+        _engineSwitchBusy = true;
         _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
         try { await ToggleLowLatencyCoreAsync(); }
         catch (Exception ex) { Log.Info("ToggleLowLatency: " + ex); }
-        finally { _devOpBusy--; }
+        finally { _devOpBusy--; _engineSwitchBusy = false; }
     }
 
     private async Task ToggleLowLatencyCoreAsync()

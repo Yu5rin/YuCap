@@ -345,41 +345,121 @@ public static class SettingsStore
     /// </summary>
     public static bool LastLoadFailed { get; private set; }
 
+    /// <summary>
+    /// True when settings.json exists but could not be READ at start (held by a backup tool, antivirus or a sync client,
+    /// or no permission) - as opposed to read but corrupt. The real file is then intact, so nothing may be saved over it
+    /// this session: <see cref="Save"/> does nothing while this is set (the defaults this session runs with would
+    /// replace every profile, hotkey and device choice).
+    /// </summary>
+    public static bool SaveBlocked { get; private set; }
+
+    /// <summary>Previous version of settings.json, kept by every <see cref="Save"/>; tried when settings.json is corrupt.</summary>
+    private static string BackupPath => FilePath + ".bak";
+
+    private const int ReadTries = 5;
+    private const int ReadRetryMs = 200;
+    private const int KeepBadCopies = 5;
+
     public static AppSettings Load()
     {
         string path = FilePath;
-        try
+        string? text = null;
+        for (int attempt = 1; ; attempt++)
         {
-            if (!File.Exists(path))
+            try
             {
-                // First run — not a failure.
+                if (!File.Exists(path))
+                {
+                    // First run — not a failure.
+                    LastLoadFailed = false;
+                    return Fresh();
+                }
+                text = File.ReadAllText(path);
+                break;
+            }
+            catch (FileNotFoundException)
+            {
                 LastLoadFailed = false;
                 return Fresh();
             }
-            AppSettings? loaded = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path));
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt < ReadTries)
+                {
+                    Log.Info($"settings: read failed ({ex.GetType().Name}: {ex.Message.Split('\n')[0]}) - retry {attempt}/{ReadTries - 1}");
+                    Thread.Sleep(ReadRetryMs);
+                    continue;
+                }
+                // Held or unreadable, but not shown to be corrupt: run with defaults and leave the real file alone.
+                LastLoadFailed = true;
+                SaveBlocked = true;
+                Log.Info($"settings: could not read {path} ({ex.Message.Split('\n')[0]}) - running with defaults; the file will NOT be overwritten this session");
+                return Fresh();
+            }
+        }
+
+        if (TryParse(text, out AppSettings? loaded, out string? why))
+        {
             LastLoadFailed = false;
-            loaded ??= new AppSettings();
-            loaded.Normalize();
-            return loaded;
+            return loaded!;
+        }
+
+        // The file was read but is corrupt (e.g. truncated by a power loss mid-write). Keep the evidence instead of
+        // silently discarding it, so the user has something to hand us if they notice lost settings.
+        PreserveBadFile(path, why);
+
+        // The previous save is kept as settings.json.bak: usually only one change older than the broken file.
+        try
+        {
+            if (File.Exists(BackupPath) && TryParse(File.ReadAllText(BackupPath), out AppSettings? fromBackup, out string? bakWhy))
+            {
+                Log.Info("settings: restored the previous version from " + BackupPath);
+                LastLoadFailed = false;
+                return fromBackup!;
+            }
+        }
+        catch (Exception ex) { Log.Info("settings: backup unreadable - " + ex.Message.Split('\n')[0]); }
+
+        LastLoadFailed = true;
+        return Fresh();
+    }
+
+    private static bool TryParse(string text, out AppSettings? settings, out string? why)
+    {
+        settings = null;
+        why = null;
+        try
+        {
+            settings = JsonSerializer.Deserialize<AppSettings>(text) ?? new AppSettings();
+            settings.Normalize();
+            return true;
         }
         catch (Exception ex)
         {
-            // The file exists but is unreadable/corrupt (e.g. truncated by a power
-            // loss mid-write). Keep the evidence instead of silently discarding it,
-            // so the user has something to hand us if they notice lost settings.
-            LastLoadFailed = true;
-            try
-            {
-                string bad = Path.Combine(Path.GetDirectoryName(path)!, "settings.bad.json");
-                if (File.Exists(bad)) File.Delete(bad);
-                File.Move(path, bad);
-                Log.Info($"settings: load failed ({ex.Message}); moved unreadable file to {bad}");
-            }
-            catch (Exception moveEx)
-            {
-                Log.Info($"settings: load failed ({ex.Message}); could not preserve bad file — {moveEx.Message}");
-            }
-            return Fresh();
+            why = ex.GetType().Name + ": " + ex.Message.Split('\n')[0];
+            settings = null;
+            return false;
+        }
+    }
+
+    /// <summary>Move a corrupt settings.json aside under a time-stamped name (the last few are kept; a later failure no longer
+    /// deletes the only copy of the earlier one).</summary>
+    private static void PreserveBadFile(string path, string? why)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(path)!;
+            string bad = Path.Combine(dir, $"settings.bad-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+            if (File.Exists(bad)) File.Delete(bad);
+            File.Move(path, bad);
+            Log.Info($"settings: load failed ({why}); moved unreadable file to {bad}");
+            var old = new DirectoryInfo(dir).EnumerateFiles("settings.bad*.json")
+                .OrderByDescending(f => f.LastWriteTimeUtc).Skip(KeepBadCopies).ToList();
+            foreach (FileInfo f in old) { try { f.Delete(); } catch { /* ignore */ } }
+        }
+        catch (Exception moveEx)
+        {
+            Log.Info($"settings: load failed ({why}); could not preserve bad file — {moveEx.Message}");
         }
     }
 
@@ -394,19 +474,30 @@ public static class SettingsStore
 
     public static void Save(AppSettings settings)
     {
+        if (SaveBlocked)
+        {
+            Log.Info("settings: not saved - settings.json could not be read at start, so it is left as it is");
+            return;
+        }
         string path = FilePath;
         string tmp = path + ".tmp";
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllText(tmp, JsonSerializer.Serialize(settings,
+            byte[] data = new System.Text.UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(settings,
                 new JsonSerializerOptions { WriteIndented = true }));
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(data, 0, data.Length);
+                fs.Flush(flushToDisk: true);   // on disk before the rename: a power loss must not leave an empty file in place
+            }
 
             // Swap the temp file in atomically so a crash/power loss mid-write
             // can never leave settings.json half-written. File.Replace (and plain
             // File.Move onto a nonexistent target) are atomic renames on NTFS.
+            // The version being replaced is kept as settings.json.bak (Load falls back to it).
             if (File.Exists(path))
-                File.Replace(tmp, path, null);
+                File.Replace(tmp, path, BackupPath, ignoreMetadataErrors: true);
             else
                 File.Move(tmp, path);
         }

@@ -61,6 +61,9 @@ public sealed partial class MainForm
         if (!_isFullscreen) _sigAutoFullscreen = false;           // the user left it (or it was never entered by us)
         SignalState st = _video.IsRunning ? _video.SignalState : SignalState.Unknown;
         if (st == SignalState.Unknown || st == _sigLast) return;
+        // A dialog is open (a live-preview one may be showing this very picture): act on the change once it is
+        // closed - the state is compared again then, so a change that has gone away by then does nothing.
+        if (ModalOpen && !_testRunning) return;
         SignalState prev = _sigLast;
         _sigLast = st;
         Log.Info($"signal: {prev} -> {st}");

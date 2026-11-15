@@ -125,6 +125,18 @@ public sealed class AudioEngine : IDisposable
     private int _slewRate = 48000;    // capture sample rate the pending frames are counted in
     private long _slewStepsTotal;     // packets that had frames added / removed (diagnostics)
 
+    // Clock drift between the capture card and the output (50-300 ppm is ordinary) moves the backlog slowly away from
+    // the target. It is held by repeating / skipping single frames (see Splice), at most 1.5 % and normally 1 frame per
+    // packet, instead of cutting out or splicing in a whole block. The hard trim / silence pad remain for large errors.
+    private double _driftEma;         // slowly smoothed backlog at packet arrival (ms); 0 = not seeded
+    private bool _driftActive;        // correcting (hysteresis: starts beyond DriftStartMs, ends within DriftStopMs)
+    private long _driftFramesTotal;   // frames repeated (+) / skipped (-) for drift since Start() (diagnostics)
+    private long _lastUnderruns;      // Underruns at the previous packet: a rise means the output really ran dry
+    private const double DriftStartMs = 4.0, DriftStopMs = 1.0;
+
+    /// <summary>Net frames repeated (+) or skipped (-) to hold the backlog against clock drift since Start() (diagnostics).</summary>
+    public long DriftCorrectedFrames => Interlocked.Read(ref _driftFramesTotal);
+
     /// <summary>Delay change that is still being worked off (ms, signed: + = more delay to come); 0 when settled.</summary>
     public double SlewPendingMs { get { lock (_slewGate) return _slewFrames * 1000.0 / Math.Max(1, _slewRate); } }
 
@@ -168,6 +180,15 @@ public sealed class AudioEngine : IDisposable
             if (_slewFrames == 0) _extraEffMs = _extraDelayMs;
             _slewStepsTotal++;
         }
+        return Splice(src, ref len, block, n, add);
+    }
+
+    /// <summary>Repeat (<paramref name="add"/>) or skip <paramref name="n"/> single frames spread evenly over the packet:
+    /// a resampling by n / frames for the length of one packet, with no gap and no cut.</summary>
+    private static byte[] Splice(byte[] src, ref int len, int block, int n, bool add)
+    {
+        int frames = block > 0 ? len / block : 0;
+        if (n <= 0 || frames < 2 * (n + 1)) return src;
         int seg = frames / (n + 1);
         var dst = new byte[len + (add ? n * block : 0)];
         int sp = 0, dp = 0;
@@ -493,6 +514,7 @@ public sealed class AudioEngine : IDisposable
             RenderDeviceName = renderDevice.FriendlyName;
             _lastPacketTick = 0; _packetMs = 10; _latencyEma = 0; _backlogEma = 0; _gotData = false; Volatile.Write(ref _latencyTick, 0);
             lock (_slewGate) { _extraEffMs = _extraDelayMs; _slewFrames = 0; _slewRate = Math.Max(1, capture.WaveFormat.SampleRate); }
+            _driftEma = 0; _driftActive = false; _lastUnderruns = 0; Interlocked.Exchange(ref _driftFramesTotal, 0);
             _output = output;
             _captureDevice = captureDevice;
             _renderDevice = renderDevice;
@@ -558,19 +580,18 @@ public sealed class AudioEngine : IDisposable
         if (buffer == null) return;
         try { UpdateLatency(buffer); } catch { /* measurement only */ }
 
-        // Capture and render run on independent clocks, so the backlog drifts —
+        // Capture and render run on independent clocks, so the backlog drifts -
         // and nothing pulls it back down on its own. The setting is therefore
         // treated as a LATENCY TARGET that is actively held, not just an upper
-        // bound: previously the delay was free to wander up to 2x the setting
-        // (400ms at the default) before anything trimmed it, which is the lag
-        // you can hear. Trim early, and only the excess (oldest samples) —
-        // ClearBuffer() would leave a whole buffer of silence instead.
+        // bound. Small, slow errors (clock drift, a changed setting within the
+        // allowance) are worked off inaudibly by HoldDrift below; the hard trim
+        // here is only the safety net for a large excess (a stalled output, a
+        // burst from the card), and discards only the excess (oldest samples).
         // The A/V-sync delay is part of that target, so it is held, not trimmed away.
         double extra = ExtraDelayInForceMs;
         double target = Math.Max(MinBufferMs, BufferMilliseconds) + extra;
         double buffered = buffer.BufferedDuration.TotalMilliseconds;
-        // Hysteresis so normal jitter doesn't cause constant micro-trims.
-        double allowance = target + Math.Max(20.0, target * 0.25);
+        double allowance = target + Math.Max(60.0, target * 0.5);
         if (buffered > allowance)
         {
             WaveFormat wf = buffer.WaveFormat;
@@ -581,27 +602,67 @@ public sealed class AudioEngine : IDisposable
                 if (_dropScratch == null || _dropScratch.Length < excess)
                     _dropScratch = new byte[excess];
                 buffer.Read(_dropScratch, 0, excess);  // discards from the front
+                buffered = buffer.BufferedDuration.TotalMilliseconds;
+                _driftEma = buffered;
             }
         }
 
-        // The cushion (margin + A/V-sync delay) is queued audio, and an under-run (render clock a touch
-        // faster than capture, or the very first packet) eats into it. Top it back up with silence once
-        // it has really been lost; a hysteresis avoids a gap every packet. The silence is the cushion.
+        // The cushion (margin + A/V-sync delay) is queued audio, and an under-run eats into it. Top it back up
+        // with silence when the output has really run dry since the last packet (the gap is already audible, so
+        // the silence costs nothing extra) or when the deficit is too large to be walked back gently. A slow
+        // loss (the output clock a touch faster) is left to HoldDrift. The very first packet builds the cushion.
+        long underruns = Underruns;
+        bool ranDry = underruns != _lastUnderruns;
+        _lastUnderruns = underruns;
         double lost = target - buffered;
-        if (!_gotData || lost > Math.Max(10.0, target * 0.3))
+        if (!_gotData || (lost > Math.Max(10.0, target * 0.3) && (ranDry || lost > Math.Max(20.0, target * 0.5))))
         {
             WaveFormat wf = buffer.WaveFormat;
             int pad = (int)(lost * wf.AverageBytesPerSecond / 1000.0);
             pad -= pad % wf.BlockAlign;
-            if (pad > 0) buffer.AddSamples(new byte[pad], 0, pad);
+            if (pad > 0)
+            {
+                buffer.AddSamples(new byte[pad], 0, pad);
+                buffered = buffer.BufferedDuration.TotalMilliseconds;
+                _driftEma = buffered;
+            }
         }
         _gotData = true;
 
         byte[] data = e.Buffer;
         int dataLen = e.BytesRecorded;
-        try { data = ApplySlew(data, ref dataLen, buffer.WaveFormat); }
+        try
+        {
+            data = ApplySlew(data, ref dataLen, buffer.WaveFormat);
+            // A pending A/V-sync slew already moves the backlog on purpose; drift is held only when none ran.
+            if (ReferenceEquals(data, e.Buffer))
+                data = HoldDrift(data, ref dataLen, buffer.WaveFormat, buffered, target);
+        }
         catch { data = e.Buffer; dataLen = e.BytesRecorded; }
         buffer.AddSamples(data, 0, dataLen);
+    }
+
+    /// <summary>Capture thread: keep the smoothed backlog on <paramref name="target"/> by repeating (backlog too small)
+    /// or skipping (too large) single frames of this packet. Proportional to the error: 1 frame per packet near the
+    /// target (~0.2 % for a 10 ms packet, far more than any clock drift needs), up to frames/64 (1.5 %, the A/V-sync
+    /// slew rate) from 40 ms off.</summary>
+    private byte[] HoldDrift(byte[] src, ref int len, WaveFormat wf, double buffered, double target)
+    {
+        lock (_slewGate) { if (_slewFrames != 0) { _driftEma = 0; return src; } }
+        // ~0.5 s time constant at 10 ms packets, so the render's pull phase against the packet phase averages out.
+        _driftEma = _driftEma <= 0 ? buffered : _driftEma * 0.98 + buffered * 0.02;
+        double err = _driftEma - target;   // + = more delay than wanted
+        double abs = Math.Abs(err);
+        if (_driftActive ? abs < DriftStopMs : abs < DriftStartMs) { _driftActive = false; return src; }
+        _driftActive = true;
+        int block = wf.BlockAlign;
+        int frames = block > 0 ? len / block : 0;
+        if (frames < 128) return src;
+        int n = Math.Max(1, (int)(frames / 64.0 * Math.Min(1.0, abs / 40.0)));
+        bool add = err < 0;
+        byte[] dst = Splice(src, ref len, block, n, add);
+        if (!ReferenceEquals(dst, src)) Interlocked.Add(ref _driftFramesTotal, add ? n : -n);
+        return dst;
     }
 
     /// <summary>Volume as a percentage. Above 100% is software gain; the soft

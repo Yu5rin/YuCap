@@ -164,14 +164,29 @@ public sealed partial class MainForm
             else
                 try { old.Dispose(); } catch { /* going away anyway */ }
             _canvas.ResetHandle();
-            _video = VideoEngines.Create(renderer);
+            IVideoEngine created = _video = VideoEngines.Create(renderer);
             UpdateOverlayMode();
             _video.Attach(_canvas.Handle);
             _video.SetRotation(_settings.Rotation);
             _video.SetMirror(_settings.Mirror);
             _engineSwapping = false;
             if (_currentVideoInfo != null)
-                await StartVideoAsync(_currentVideoInfo, modeOverride ?? _cliMode ?? _savedMode);
+            {
+                try { await StartVideoAsync(_currentVideoInfo, modeOverride ?? _cliMode ?? _savedMode); }
+                catch (OperationCanceledException)
+                {
+                    // The video was stopped on purpose while the new engine was starting (the card was unplugged, the PC
+                    // went to sleep, the window is closing). The swap itself worked: the new engine is in place, and
+                    // whoever stopped the video brings it back (recovery, resume). Not a failure - no fallback, no box.
+                    Log.Info($"ReplaceEngine({renderer}): start superseded");
+                    if (ReferenceEquals(_video, created) && !IsDisposed)
+                    {
+                        ApplyRenderOptions();
+                        _settings.Renderer = renderer;
+                    }
+                    return null;
+                }
+            }
             ApplyRenderOptions();
             _settings.Renderer = renderer;
             return null;

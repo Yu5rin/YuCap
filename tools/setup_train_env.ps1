@@ -2,7 +2,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\setup_train_env.ps1
 # %LOCALAPPDATA%\YuCapTrain\venv に Python の仮想環境を作り、PyTorch（NVIDIA GPU 用）・numpy・pillow を入れます。
 # 入るのはその場所だけです（リポジトリ・システムの Python には何も入れません）。消すときは %LOCALAPPDATA%\YuCapTrain を削除してください。
-# 通信先: https://download.pytorch.org （PyTorch 本体、約 2 GB）と https://pypi.org （numpy・pillow）。YuCap 本体はここでは通信しません。
+# 通信先: https://download.pytorch.org （PyTorch 本体、約 3 GB）と https://pypi.org （numpy・pillow）。YuCap 本体はここでは通信しません。
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -11,6 +11,9 @@ $venv = Join-Path $root 'venv'
 $logs = Join-Path $root 'logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 $log = Join-Path $logs 'setup.log'
+# YuCap treats the environment as ready only when this marker exists; it is written at the very end, after every step succeeded.
+$marker = Join-Path $venv '.yucap-ready'
+Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $marker
 function Say($m) { Write-Host $m; Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 's'), $m) -Encoding UTF8 }
 
 # 1. Python 3.10-3.12 を探す（無ければ入れずに案内して終わります）
@@ -18,6 +21,11 @@ $py = $null
 foreach ($v in '3.12', '3.11', '3.10') {
     $p = & py "-$v" -c "import sys; print(sys.executable)" 2>$null
     if ($LASTEXITCODE -eq 0 -and $p) { $py = $p.Trim(); break }
+}
+if (-not $py) {
+    # Python without the py launcher (Microsoft Store, or installed with the launcher unchecked)
+    $p = & python -c "import sys; v = sys.version_info[:2]; print(sys.executable) if (3, 10) <= v <= (3, 12) else sys.exit(1)" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $p) { $py = ($p | Select-Object -First 1).Trim() }
 }
 if (-not $py) {
     Say 'Python 3.10 - 3.12 が見つかりません。https://www.python.org/downloads/ から入れてから、もう一度実行してください。'
@@ -35,7 +43,15 @@ $cuda = [double]("{0}.{1}" -f $Matches[1], $Matches[2])
 $tag = if ($cuda -ge 13.0) { 'cu130' } elseif ($cuda -ge 12.8) { 'cu128' } else { 'cu126' }
 Say "ドライバーの CUDA $cuda -> PyTorch の $tag 版を入れます"
 
-# 3. 仮想環境
+# 3. 仮想環境（前回の準備が途中で終わっていて、入れたものが読み込めないときは作り直します）
+$oldPy = Join-Path $venv 'Scripts\python.exe'
+if (Test-Path $oldPy) {
+    & $oldPy -c "import torch, torchvision" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Say '前回の準備が途中で終わっていたので、仮想環境を作り直します'
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $venv
+    }
+}
 if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
     & $py -m venv $venv
     if ($LASTEXITCODE -ne 0) { Say '仮想環境を作れませんでした'; exit 1 }
@@ -43,7 +59,7 @@ if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
 $vp = Join-Path $venv 'Scripts\python.exe'
 
 # 4. インストール（PyTorch は cu 版の置き場所だけから取る: 他の置き場所の CPU 版が選ばれないように）
-Say 'PyTorch を入れています（約 2 GB。数分かかります）...'
+Say 'PyTorch を入れています（約 3 GB。数分かかります）...'
 & $vp -m pip install --upgrade pip 2>&1 | Out-File -Append -Encoding utf8 $log
 & $vp -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/$tag" 2>&1 | Out-File -Append -Encoding utf8 $log
 if ($LASTEXITCODE -ne 0) { Say "PyTorch を入れられませんでした。$log を見てください"; exit 1 }
@@ -54,4 +70,7 @@ if ($LASTEXITCODE -ne 0) { Say "numpy / pillow を入れられませんでした
 $chk = & $vp -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-')"
 Say "確認: $chk"
 if ($chk -notmatch 'True') { Say 'GPU が使えません。ドライバーを更新してください。'; exit 1 }
-Say "できました。学習: powershell -ExecutionPolicy Bypass -File tools\train_model.ps1"
+Set-Content -LiteralPath $marker -Value $chk -Encoding UTF8
+if (-not (Test-Path -LiteralPath $marker)) { Say "準備の完了を記録できませんでした（$marker）"; exit 1 }
+Say 'できました。YuCap に戻って「学習を始める」から学習できます。'
+exit 0

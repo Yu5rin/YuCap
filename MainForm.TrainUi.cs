@@ -34,7 +34,12 @@ public sealed partial class MainForm
     {
         if (_testRunning && Ui.DialogAudit == null) return;
         if (TrainRunning && Ui.DialogAudit == null) { ShowTrainWindow(); return; }
-        if (!TrainEnv.Ready && Ui.DialogAudit == null) { OfferTrainSetup(); return; }
+        if (!TrainEnv.Ready && Ui.DialogAudit == null)
+        {
+            if (TrainEnv.Partial) CheckPartialTrainEnv(ok => { if (ok) ShowTrainDialog(); else OfferTrainSetup(true); });
+            else OfferTrainSetup(true);
+            return;
+        }
 
         using var dlg = Ui.NewDialog(L.T("自分専用モデルの学習"), 520, 470);
         var stack = Ui.Stack();
@@ -402,7 +407,8 @@ public sealed partial class MainForm
     // ---- environment ---------------------------------------------------------------------------------------------------
 
     /// <summary>学習の準備をする: explains exactly what is downloaded and asks, then runs tools\setup_train_env.ps1 in a visible console.</summary>
-    private void OfferTrainSetup()
+    /// <param name="envChecked">True when a venv left without the ready marker was already checked (and found incomplete) just now.</param>
+    private void OfferTrainSetup(bool envChecked = false)
     {
         if (_trainSetupRunning) { ShowOsd(L.T("学習の準備を実行中です（黒い窓を見てください）")); return; }
         if (TrainEnv.Ready)
@@ -410,8 +416,18 @@ public sealed partial class MainForm
             MessageBox.Show(this, L.T("学習の準備はできています。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        if (TrainEnv.Partial && !envChecked)
+        {
+            CheckPartialTrainEnv(ok =>
+            {
+                if (ok) MessageBox.Show(this, L.T("学習の準備はできています。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else OfferTrainSetup(true);
+            });
+            return;
+        }
         string venv = Path.Combine(UserModels.Root, "venv");
-        string text = L.T("自分専用モデルを学習するための環境を作ります。次のものをダウンロードします。") + "\n\n"
+        string text = (TrainEnv.Partial ? L.T("前回の学習の準備が最後まで終わっていません（PyTorch などを読み込めません）。準備をやり直します。") + "\n\n" : string.Empty)
+            + L.T("自分専用モデルを学習するための環境を作ります。次のものをダウンロードします。") + "\n\n"
             + L.T("・PyTorch（NVIDIA GPU 用の CUDA 版）、numpy、pillow") + "\n"
             + L.T("・取得元: download.pytorch.org（PyTorch）と PyPI（numpy・pillow）") + "\n"
             + L.T("・大きさ: 約 3 GB（数分から数十分）") + "\n"
@@ -431,7 +447,7 @@ public sealed partial class MainForm
                     {
                         _trainSetupRunning = false;
                         UpdateTrainChecks();
-                        if (TrainEnv.Ready) ShowOsd(L.T("学習の準備ができました"), OsdLongMilliseconds);
+                        if (code == 0 && TrainEnv.Ready) ShowOsd(L.T("学習の準備ができました"), OsdLongMilliseconds);
                         else MessageBox.Show(this, L.T("学習の準備が終わりませんでした。黒い窓の最後の表示を見てください。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }));
                 }
@@ -446,11 +462,41 @@ public sealed partial class MainForm
         }
     }
 
+    private bool _trainEnvChecking;
+
+    /// <summary>A venv without the ready marker (an interrupted set-up, or one made by an older YuCap): import the packages on a
+    /// worker (importing torch takes seconds) and continue on the UI thread with the result.</summary>
+    private void CheckPartialTrainEnv(Action<bool> then)
+    {
+        ShowOsd(L.T("学習の環境を確かめています..."));
+        if (_trainEnvChecking) return;
+        _trainEnvChecking = true;
+        Task.Run(() => TrainEnv.ConfirmByImport()).ContinueWith(t =>
+        {
+            bool ok = t.Status == TaskStatus.RanToCompletion && t.Result;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    _trainEnvChecking = false;
+                    UpdateTrainChecks();
+                    if (!IsDisposed) then(ok);
+                }));
+            }
+            catch { /* closing */ }
+        }, TaskScheduler.Default);
+    }
+
     // ---- closing -------------------------------------------------------------------------------------------------------
+
+    /// <summary>Set while a close that the user already confirmed (the update path asks before swapping the exe) is under way,
+    /// so <see cref="ConfirmCloseDuringTraining"/> does not ask a second time.</summary>
+    private bool _trainCloseConfirmed;
 
     /// <summary>False when the user chose to keep YuCap open because a training run is going.</summary>
     private bool ConfirmCloseDuringTraining()
     {
+        if (_trainCloseConfirmed) return true;    // already asked (before an update swapped the exe)
         if (!TrainRunning || _testRunning) return true;
         if (MessageBox.Show(this, L.T("学習が動いています。終了すると学習は中止されます。終了しますか？"), "YuCap",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return false;
@@ -459,6 +505,10 @@ public sealed partial class MainForm
 
     private void StopTrainingOnClose()
     {
+        // The picture collector grabs from the video engine on its own thread: stop it before the engine goes away.
+        TrainCapture? cap = _trainCap;
+        _trainCap = null;
+        if (cap != null && !cap.StopAndWait(2000)) Log.Info("train capture: the collector did not stop within 2 s on close");
         try { _trainWin?.Close(); } catch { /* ignore */ }
         try { _trainJob?.Dispose(); } catch { /* ignore */ }     // kills the python process tree
         _trainJob = null;
@@ -510,7 +560,10 @@ internal sealed class TrainWindow : Form
         AutoScaleMode = AutoScaleMode.Font;
         AutoScaleDimensions = new SizeF(7F, 15F);
         ClientSize = new Size(520, 240);
-        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { /* default icon */ }
+        // Icon and fonts made here are GDI objects of this window: released when it is disposed (it is created anew each time).
+        var owned = new List<IDisposable>();
+        Disposed += (_, _) => { foreach (IDisposable d in owned) { try { d.Dispose(); } catch { /* ignore */ } } };
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); if (Icon != null) owned.Add(Icon); } catch { /* default icon */ }
 
         _root.Dock = DockStyle.Fill;
         _root.ColumnCount = 1;
@@ -532,6 +585,7 @@ internal sealed class TrainWindow : Form
 
         _title.AutoSize = true;
         _title.Font = new Font(Font, FontStyle.Bold);
+        owned.Add(_title.Font);
         Row(_title, 2);
         Row(_status, 4);
         _bar.Anchor = AnchorStyles.Left | AnchorStyles.Right;
@@ -554,7 +608,7 @@ internal sealed class TrainWindow : Form
                 var l = new Label { AutoSize = true, Margin = new Padding(0, 1, c == 0 ? 8 : 16, 1), Anchor = c == 0 ? AnchorStyles.Left : AnchorStyles.Right };
                 l.Text = r == 0 ? heads[c] : c == 0 ? rows[r - 1] : "-";
                 if (r == 0) l.ForeColor = SystemColors.GrayText;
-                if (r == 3) l.Font = new Font(Font, FontStyle.Bold);
+                if (r == 3) { l.Font = new Font(Font, FontStyle.Bold); owned.Add(l.Font); }
                 _cells[r, c] = l;
                 grid.Controls.Add(l, c, r);
             }
@@ -573,6 +627,7 @@ internal sealed class TrainWindow : Form
         _log.ScrollBars = ScrollBars.Vertical;
         _log.WordWrap = true;
         _log.Font = new Font("Consolas", 8.5f);
+        owned.Add(_log.Font);
         _log.Height = 170;
         _log.MinimumSize = new Size(10, 170);
         _log.Anchor = AnchorStyles.Left | AnchorStyles.Right;

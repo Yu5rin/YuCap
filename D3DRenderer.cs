@@ -158,6 +158,8 @@ internal sealed partial class D3DRenderer : IDisposable
     public Size SwapSize => _swapSize;
 
     [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")]
     private static extern void RtlMoveMemory(IntPtr dst, IntPtr src, UIntPtr len);
 
     // =====================================================================
@@ -185,6 +187,7 @@ internal sealed partial class D3DRenderer : IDisposable
         using (ID3D11Multithread mt = Device.QueryInterface<ID3D11Multithread>())
             mt.SetMultithreadProtected(true);
         Log.Info($"D3D: device created, feature level {got}");
+        NvRetryAfterNewDevice();
     }
 
     public void CreateShaders()
@@ -389,6 +392,7 @@ internal sealed partial class D3DRenderer : IDisposable
         if (_swap2 != null)
         {
             _swap2.MaximumFrameLatency = 1;
+            CloseLatencyWaitable();
             LatencyWaitable = _swap2.FrameLatencyWaitableObject;
         }
         Log.Info($"D3D: present mode = {PresentMode}, {client.Width}x{client.Height}");
@@ -541,8 +545,9 @@ internal sealed partial class D3DRenderer : IDisposable
 
     /// <summary>Render thread: size the ring for <paramref name="delayMs"/> at <paramref name="fps"/>
     /// (fps x delay + 3 slots, so the frame that is due always still exists while newer ones
-    /// keep arriving, plus one frame of backlog), or free it when the delay is 0. The ring only grows while a delay is
-    /// active, so dragging a slider does not reallocate textures at every step.
+    /// keep arriving, plus one frame of backlog), or free it when the delay is 0. The ring grows at once but shrinks only
+    /// once the smaller size has held for a couple of seconds, so dragging a slider does not reallocate textures at every
+    /// step - and a long delay that was turned down again does not keep its video memory for the rest of the session.
     /// Returns true when the active/inactive state or the size changed.</summary>
     public bool ConfigureRing(int delayMs, int fps)
     {
@@ -555,11 +560,31 @@ internal sealed partial class D3DRenderer : IDisposable
                 return true;
             }
             int need = (int)Math.Ceiling((fps > 0 ? fps : 60) * delayMs / 1000.0) + 3 + Volatile.Read(ref _ringExtra);
-            if (need == _ringNeed) return false;
+            if (need == _ringNeed) { TrimRing(); return false; }
             if (_ringNeed == 0) _shownSeq = _ringSeq;   // nothing in the ring is "pending" yet
+            _ringShrinkAt = need < _ring.Count ? Environment.TickCount64 + 2000 : 0;
             _ringNeed = need;
             return true;
         }
+    }
+
+    private long _ringShrinkAt;   // Environment.TickCount64 from which slots beyond _ringNeed are freed (0 = nothing to do)
+
+    /// <summary>Free the slots beyond <see cref="_ringNeed"/>, oldest first: in a full ring these are exactly the frames the next
+    /// writes would overwrite, so the pictures that can still be shown (the newest _ringNeed) stay. Under FrameLock.</summary>
+    private void TrimRing()
+    {
+        if (_ringShrinkAt == 0 || Environment.TickCount64 < _ringShrinkAt) return;
+        _ringShrinkAt = 0;
+        int before = _ring.Count;
+        while (_ring.Count > _ringNeed)
+        {
+            int oldest = 0;
+            for (int i = 1; i < _ring.Count; i++) if (_ring[i].Seq < _ring[oldest].Seq) oldest = i;
+            _ring[oldest].Free();
+            _ring.RemoveAt(oldest);
+        }
+        if (_ring.Count != before) Log.Info($"D3D: delay ring shrunk {before} -> {_ring.Count} slots");
     }
 
     private int _ringExtra;
@@ -574,6 +599,7 @@ internal sealed partial class D3DRenderer : IDisposable
         foreach (Slot s in _ring) s.Free();
         _ring.Clear();
         _ringNeed = 0;
+        _ringShrinkAt = 0;
     }
 
     /// <summary>The slot to write next: a new one while the ring is filling, else the oldest.</summary>
@@ -2388,6 +2414,15 @@ internal sealed partial class D3DRenderer : IDisposable
 
     public void Dispose() => DisposeAll(releaseDevice: true);
 
+    /// <summary>The frame-latency waitable belongs to the caller (IDXGISwapChain2::GetFrameLatencyWaitableObject): one kernel
+    /// handle per swap chain, which nothing else closes. Render thread (the only thread that waits on it).</summary>
+    private void CloseLatencyWaitable()
+    {
+        IntPtr h = LatencyWaitable;
+        LatencyWaitable = IntPtr.Zero;
+        if (h != IntPtr.Zero) { try { CloseHandle(h); } catch { } }
+    }
+
     /// <summary>Release everything. With <paramref name="releaseDevice"/> false the device and
     /// context are left alone (the capture thread may still be inside them — leaking is the
     /// safe choice there).</summary>
@@ -2407,6 +2442,7 @@ internal sealed partial class D3DRenderer : IDisposable
         _swap2?.Dispose(); _swap2 = null;
         DisposeComposition();
         _swap?.Dispose(); _swap = null;
+        CloseLatencyWaitable();
         if (!releaseDevice) return;
 
         lock (FrameLock) { FreeRing(); DisposeFrameTextures(); DupFree(); }

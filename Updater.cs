@@ -72,21 +72,29 @@ internal static class Updater
     }
 
     /// <summary>
-    /// Hosts allowed for both the release-check endpoint and the asset download
-    /// URL. The release response carries the SHA256 we verify the download
-    /// against, so if an arbitrary host could serve that response, it could
-    /// supply a malicious exe and a matching hash in the same breath — the
-    /// verification would prove nothing. Restricting both to GitHub's own
-    /// hosts keeps the hash check meaningful.
+    /// Where the release-check endpoint and the asset download URL may point. The release response carries the SHA256 we
+    /// verify the download against, so if an arbitrary source could serve that response, it could supply a malicious exe
+    /// and a matching hash in the same breath — the verification would prove nothing.
     /// </summary>
-    private static bool IsTrustedHost(Uri uri)
-    {
-        string host = uri.Host;
-        return host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase)
-            || host.Equals("github.com", StringComparison.OrdinalIgnoreCase)
-            || host.Equals("objects.githubusercontent.com", StringComparison.OrdinalIgnoreCase)
-            || host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase);
-    }
+    /// <remarks>Limiting the host is not enough: any GitHub account (or raw/gist content) could then serve a "release" with a
+    /// matching hash. So both are limited to this repository: the check to its releases API, the asset to its release
+    /// downloads (GitHub then redirects the download to its own storage host, which is fine - the request was for this
+    /// repository's asset, and the hash from this repository's release is verified afterwards).</remarks>
+    private const string RepoApiPrefix = "/repos/Yu5rin/YuCap/releases";
+    private const string RepoDownloadPrefix = "/Yu5rin/YuCap/releases/download/";
+
+    private static bool IsTrustedEndpoint(Uri uri) =>
+        uri.Scheme == Uri.UriSchemeHttps
+        && uri.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase)
+        && uri.IsDefaultPort
+        && (uri.AbsolutePath.Equals(RepoApiPrefix, StringComparison.OrdinalIgnoreCase)
+            || uri.AbsolutePath.StartsWith(RepoApiPrefix + "/", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsTrustedAsset(Uri uri) =>
+        uri.Scheme == Uri.UriSchemeHttps
+        && uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase)
+        && uri.IsDefaultPort
+        && uri.AbsolutePath.StartsWith(RepoDownloadPrefix, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Version of the running build, ignoring any build metadata.</summary>
     public static Version CurrentVersion
@@ -118,9 +126,9 @@ internal static class Updater
             Log.Info($"update: refusing non-HTTPS endpoint '{apiUrl}'");
             return new UpdateCheckResult(null, L.T("更新の確認先が不正です。"));
         }
-        if (!IsTrustedHost(uri))
+        if (!IsTrustedEndpoint(uri))
         {
-            Log.Info($"update: refusing untrusted endpoint host '{uri.Host}'");
+            Log.Info($"update: refusing endpoint outside the YuCap repository '{uri.Host}{uri.AbsolutePath}'");
             return new UpdateCheckResult(null, L.T("更新の確認先が不正です。"));
         }
 
@@ -166,9 +174,9 @@ internal static class Updater
                 // Same trust requirement as the check endpoint: the SHA256 we
                 // verify against comes from this same response, so an asset
                 // hosted anywhere else would make that verification meaningless.
-                if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? assetUri) || !IsTrustedHost(assetUri))
+                if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? assetUri) || !IsTrustedAsset(assetUri))
                 {
-                    Log.Info($"update: asset URL host not trusted — ignoring ({url})");
+                    Log.Info($"update: asset URL is not a YuCap release download — ignoring ({url})");
                     continue;
                 }
                 long size = a.TryGetProperty("size", out JsonElement s) ? s.GetInt64() : 0;
@@ -286,6 +294,11 @@ internal static class Updater
         return DownloadCoreAsync(info, progress, ct);
     }
 
+    /// <summary>No data for this long during the download = the connection stalled.</summary>
+    private static readonly TimeSpan DownloadIdleLimit = TimeSpan.FromSeconds(60);
+    /// <summary>Upper bound for the whole download (the exe is tens of MB; this allows for a very slow line).</summary>
+    private static readonly TimeSpan DownloadTotalLimit = TimeSpan.FromMinutes(20);
+
     private static async Task<string> DownloadCoreAsync(UpdateInfo info, IProgress<int>? progress,
         CancellationToken ct)
     {
@@ -293,25 +306,43 @@ internal static class Updater
         Directory.CreateDirectory(dir);
         string path = StagedPath(info.Version.ToString());
 
+        // HttpClient.Timeout covers only the response headers (ResponseHeadersRead): a connection that stalls afterwards would
+        // wait forever, and the caller's "check in flight" flag with it. So every read has an idle limit, and the whole
+        // download an overall one.
+        using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        stall.CancelAfter(DownloadTotalLimit);
         try
         {
             using HttpResponseMessage resp = await Http
-                .GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct)
+                .GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, stall.Token)
                 .ConfigureAwait(false);
             resp.EnsureSuccessStatusCode();
             long total = resp.Content.Headers.ContentLength ?? info.Size;
 
-            await using Stream net = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            await using Stream net = await resp.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
             await using var file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
             var buffer = new byte[81920];
             long done = 0;
-            int read;
-            while ((read = await net.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+            while (true)
             {
-                await file.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                int read;
+                using (var idle = CancellationTokenSource.CreateLinkedTokenSource(stall.Token))
+                {
+                    idle.CancelAfter(DownloadIdleLimit);
+                    read = await net.ReadAsync(buffer, idle.Token).ConfigureAwait(false);
+                }
+                if (read <= 0) break;
+                await file.WriteAsync(buffer.AsMemory(0, read), stall.Token).ConfigureAwait(false);
                 done += read;
-                if (total > 0) progress?.Report((int)(done * 100 / total));
+                if (total > 0) progress?.Report((int)Math.Min(100, done * 100 / total));
             }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Our own limit, not the caller's cancel: report it as a failure (a cancel is silent for the caller).
+            DiscardStaging();
+            Log.Info("update: download stalled or took too long - aborted");
+            throw new TimeoutException("update download stalled");
         }
         catch
         {
@@ -397,6 +428,10 @@ internal static class Updater
         string? cur = ExePath;
         if (cur == null) throw new UserFacingException(L.T("実行ファイルの場所を特定できません。"));
         string old = cur + OldSuffix, fresh = cur + ".new";
+
+        // The delayed clean-up of the previous update's .old must not fire in the middle of this swap and delete the .old
+        // that this swap is about to create (the way back if the new build does not start).
+        Interlocked.Exchange(ref _oldTimer, null)?.Dispose();
 
         // (1) stage next to the target and verify the copy
         try

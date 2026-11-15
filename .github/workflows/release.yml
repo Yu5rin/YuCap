@@ -8,7 +8,7 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:        # lets a release be re-run from the Actions tab
+  workflow_dispatch:        # re-run from the Actions tab: choose the TAG (not a branch) in "Use workflow from"
 
 permissions:
   contents: write           # required to create the release
@@ -23,6 +23,31 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      - name: Refuse to overwrite an existing release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A re-run for a tag whose release already exists would put the skeleton back over the
+          # edited body and upload a rebuilt exe (a different SHA256 than the one already published),
+          # and with draft: true a published release could go back to draft. Delete the release
+          # first (or bump the version) if it really has to be rebuilt.
+          if ("${{ github.ref_type }}" -ne "tag") {
+            Write-Error "Run this workflow from a tag (v1.2.3), not from the branch ${{ github.ref_name }}."
+            exit 1
+          }
+          $out = gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" --json tagName 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "A release for ${{ github.ref_name }} already exists. It is left untouched."
+            exit 1
+          }
+          if ($out -notmatch 'release not found') {
+            Write-Error "Could not tell whether a release for ${{ github.ref_name }} exists: $out"
+            exit 1
+          }
+          Write-Host "No release for ${{ github.ref_name }} yet."
+          exit 0
 
       - name: Verify the tag matches the project version
         shell: pwsh

@@ -142,7 +142,7 @@ internal sealed class VideoLatencyTracker
     private readonly long[] _content = new long[Ring];
     private readonly long[] _vb = new long[Ring];   // vblank index the present followed (-1 = none / used)
     private long _lastStatsTick;
-    private int _count;
+    private long _count;               // presents recorded (long: an int would go negative after 2^31 frames, ~170 days at 144 fps)
     private double _ema;
     private long _lastSampleTick;
     private volatile bool _estimated;
@@ -171,7 +171,7 @@ internal sealed class VideoLatencyTracker
     public void Shown(uint presentCount, long contentTicks, long returnedTick, long vblankIndex = -1)
     {
         if (contentTicks == 0) return;
-        int i = _count++ % Ring;
+        int i = (int)(_count++ % Ring);
         _pc[i] = presentCount;
         _content[i] = contentTicks;
         _vb[i] = vblankIndex;
@@ -200,10 +200,10 @@ internal sealed class VideoLatencyTracker
         {
             var r = swap.GetFrameStatistics(out FrameStatistics fs);
             if (r.Failure || fs.SyncQPCTime == 0) return;
-            int n = Math.Min(_count, Ring);
+            int n = (int)Math.Min(_count, Ring);
             for (int k = 0; k < n; k++)
             {
-                int i = (_count - 1 - k) % Ring;
+                int i = (int)((_count - 1 - k) % Ring);
                 if (_pc[i] != fs.PresentCount) continue;
                 double ms = (fs.SyncQPCTime - _content[i]) * 1000.0 / Stopwatch.Frequency;
                 _pc[i] = uint.MaxValue;   // count each shown frame once
@@ -227,10 +227,10 @@ internal sealed class VideoLatencyTracker
         long now = Stopwatch.GetTimestamp();
         if (now - Volatile.Read(ref _lastStatsTick) < Stopwatch.Frequency / 2) return;   // real statistics are flowing
         double periodTicks = periodMs * Stopwatch.Frequency / 1000.0;
-        int n = Math.Min(_count, Ring);
+        int n = (int)Math.Min(_count, Ring);
         for (int k = 0; k < n; k++)
         {
-            int i = (_count - 1 - k) % Ring;
+            int i = (int)((_count - 1 - k) % Ring);
             long vb = _vb[i];
             if (vb < 0) continue;
             if (count <= vb) continue;                        // the next vblank has not happened yet

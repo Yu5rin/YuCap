@@ -37,18 +37,30 @@ internal static class Log
     {
         string? path = _path;
         if (path == null) return;
+        _mayRotate = true;   // this process owns the log from now on: it may also rotate while running (see Info)
         try
         {
-            lock (Gate)
-            {
-                var fi = new FileInfo(path);
-                if (!fi.Exists || fi.Length <= 2_000_000) return;
-                string old = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, "yucap.old.log");
-                if (File.Exists(old)) File.Delete(old);
-                File.Move(path, old);
-            }
+            lock (Gate) RotateLocked(path, 2_000_000);
         }
         catch { /* keep appending to the big file rather than lose the log */ }
+    }
+
+    /// <summary>Set by <see cref="RotateIfLarge"/> in the single-instance owner only.</summary>
+    private static volatile bool _mayRotate;
+    private static int _linesSinceCheck;
+    /// <summary>A session that logs in a loop for days must not grow the log without limit: the owner rotates at this size
+    /// while running (checked every <see cref="CheckEveryLines"/> lines). Larger than the start-up limit so that one
+    /// session's start stays in the current file as long as possible.</summary>
+    private const long SessionLimitBytes = 4_000_000;
+    private const int CheckEveryLines = 256;
+
+    private static void RotateLocked(string path, long limit)
+    {
+        var fi = new FileInfo(path);
+        if (!fi.Exists || fi.Length <= limit) return;
+        string old = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, "yucap.old.log");
+        if (File.Exists(old)) File.Delete(old);
+        File.Move(path, old);
     }
 
     public static void Info(string message)
@@ -59,10 +71,23 @@ internal static class Log
             lock (Gate)
             {
                 // Shared write access: a command-line run next to the viewer (or two processes starting together) can both log.
-                using var fs = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-                byte[] line = new System.Text.UTF8Encoding(false).GetBytes(
-                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [T{Environment.CurrentManagedThreadId}] {message}\r\n");
-                fs.Write(line, 0, line.Length);
+                bool rotate = false;
+                using (var fs = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    byte[] line = new System.Text.UTF8Encoding(false).GetBytes(
+                        $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [T{Environment.CurrentManagedThreadId}] {message}\r\n");
+                    fs.Write(line, 0, line.Length);
+                    if (_mayRotate && ++_linesSinceCheck >= CheckEveryLines)
+                    {
+                        _linesSinceCheck = 0;
+                        rotate = fs.Length > SessionLimitBytes;
+                    }
+                }
+                if (rotate)
+                {
+                    try { RotateLocked(_path, SessionLimitBytes); }
+                    catch { /* keep appending to the big file */ }
+                }
             }
         }
         catch { /* logging must never break the app */ }

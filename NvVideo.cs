@@ -35,6 +35,8 @@ internal sealed class NvVideoProc : IDisposable
     private ID3D11VideoProcessorOutputView? _outView;
 
     public static string LastFailure = "";
+    /// <summary>The last <see cref="TryCreate"/> failed because the render GPU is not NVIDIA (will not change for this process).</summary>
+    public static bool LastFailureFinal;
     public static string LastHdrQuery = "";
     /// <summary>Experiment hooks (probe only): colour spaces given to the stream / output when HDR is on.</summary>
     public static ColorSpaceType? ExpStreamCs, ExpOutputCs;
@@ -50,12 +52,13 @@ internal sealed class NvVideoProc : IDisposable
     /// <summary>NVIDIA adapter + video processor available; null otherwise (LastFailure says why).</summary>
     public static NvVideoProc? TryCreate(ID3D11Device dev, ID3D11DeviceContext ctx)
     {
+        LastFailureFinal = false;
         try
         {
             using (IDXGIDevice dx = dev.QueryInterface<IDXGIDevice>())
             using (IDXGIAdapter ad = dx.GetAdapter())
             {
-                if (ad.Description.VendorId != 0x10DE) { LastFailure = "NVIDIA 以外の GPU です"; return null; }
+                if (ad.Description.VendorId != 0x10DE) { LastFailure = "NVIDIA 以外の GPU です"; LastFailureFinal = true; return null; }
             }
             ID3D11VideoDevice? vd = dev.QueryInterfaceOrNull<ID3D11VideoDevice>();
             ID3D11VideoContext? vc = ctx.QueryInterfaceOrNull<ID3D11VideoContext>();

@@ -37,6 +37,7 @@ internal sealed class VBlankBeat : IDisposable
     private const int RetryFirstMs = 8000, RetryMaxMs = 60000;
     private bool _verified;              // the period of this output was compared with the display's refresh rate
     private int _fast, _errors;
+    private int _rateMismatch;           // consecutive once-a-second checks where the reported refresh rate disagreed with the period
     private string? _lastLogged;
     private long _count, _lastQpc;
     private int _epoch;
@@ -138,6 +139,28 @@ internal sealed class VBlankBeat : IDisposable
         return true;
     }
 
+    /// <summary>A refresh-rate change on the same monitor keeps the HMONITOR, so <see cref="Resolve"/> does not run, and
+    /// the in-band smoothing in <see cref="Wait"/> cannot follow a jump of more than 30% (60 -> 144 Hz stays 16.7 ms;
+    /// 144 -> 60 Hz is read as two vblanks per wait). Compare the measured period with the rate Windows reports and,
+    /// when they disagree on two checks in a row, measure the output again.</summary>
+    private void CheckRefreshChange(IntPtr hwnd)
+    {
+        double known = Volatile.Read(ref _periodMs);
+        if (_out == null || _failed || !_verified || known <= 1) { _rateMismatch = 0; return; }
+        int hz = Displays.RefreshHzOfWindow(hwnd);
+        if (hz < 20) { _rateMismatch = 0; return; }
+        double want = 1000.0 / hz;
+        // Same tolerance as Verify (15%, plus the 59 vs 59.94 Hz rounding).
+        if (known >= want / 1.15 - 0.3 && known <= want * 1.15 + 0.3) { _rateMismatch = 0; return; }
+        if (++_rateMismatch < 2) return;
+        _rateMismatch = 0;
+        _verified = false; _fast = 0; _errors = 0;
+        Volatile.Write(ref _periodMs, 0);
+        Volatile.Write(ref _lastQpc, 0);
+        Interlocked.Increment(ref _epoch);   // vblank indices before and after the change are not on the same clock
+        Log1($"D3D: pacing beat = vblank of {_name} - display rate changed ({known:0.00} ms measured, {hz} Hz reported), measuring again");
+    }
+
     private void Fail(string why)
     {
         _failed = true;
@@ -156,6 +179,7 @@ internal sealed class VBlankBeat : IDisposable
             _nextCheck = tick + 1000;
             IntPtr mon = MonitorFromWindow(hwnd, 2 /* MONITOR_DEFAULTTONEAREST */);
             if (mon != _monitor) Resolve(device, mon);
+            else CheckRefreshChange(hwnd);
         }
         IDXGIOutput? o = _out;
         if (o != null && _failed && tick >= _retryAt)

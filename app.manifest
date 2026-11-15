@@ -2,6 +2,16 @@
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity version="1.0.0.0" name="YuCap.app" type="win32" />
 
+  <!-- Run with the user's own rights and never under file/registry virtualisation (a custom manifest replaces the SDK's
+       default one, which carried this): the updater's "can I write next to the exe?" test must see the real folder. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <!-- Windows 10 / 11 -->
@@ -9,5 +19,12 @@
     </application>
   </compatibility>
 
-  <!-- DPI awareness is configured in code via Application.SetHighDpiMode(PerMonitorV2). -->
+  <!-- Paths over 260 characters for the Win32 calls that honour it (when long paths are enabled in Windows).
+       DPI awareness is deliberately NOT declared here: it is configured in code via
+       Application.SetHighDpiMode(PerMonitorV2), and the WinForms analyzer (WFAC010) flags a manifest setting. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
 </assembly>

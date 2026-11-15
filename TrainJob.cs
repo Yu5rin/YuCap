@@ -38,7 +38,65 @@ internal static class TrainEnv
         }
     }
 
-    public static bool Ready => File.Exists(PythonExe);
+    /// <summary>Written by tools\setup_train_env.ps1 only after every step (pip installs and the GPU check) succeeded. A python.exe without
+    /// it is a set-up that was interrupted (console closed, network or disk failure during the 3 GB download) - or one made by an older
+    /// YuCap, which <see cref="ConfirmByImport"/> recognises.</summary>
+    public static string ReadyMarker => Path.Combine(UserModels.Root, "venv", ".yucap-ready");
+
+    private static bool PythonOverridden => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("YUCAP_TRAIN_PYTHON"));
+
+    /// <summary>The set-up finished (the override used by the test mode counts as finished when its python exists).</summary>
+    public static bool Ready => File.Exists(PythonExe) && (PythonOverridden || File.Exists(ReadyMarker));
+
+    /// <summary>The venv exists but the set-up was not confirmed as finished.</summary>
+    public static bool Partial => !Ready && File.Exists(PythonExe);
+
+    /// <summary>For a <see cref="Partial"/> venv: import the packages training needs; when that works (a venv made before the marker
+    /// existed), write the marker so the check is not repeated. Blocks for up to <paramref name="timeoutMs"/> (importing torch takes
+    /// several seconds) - call it off the UI thread.</summary>
+    public static bool ConfirmByImport(int timeoutMs = 120000)
+    {
+        if (Ready) return true;
+        if (!File.Exists(PythonExe)) return false;
+        try
+        {
+            var psi = new ProcessStartInfo(PythonExe)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("import torch, torchvision, numpy, PIL; print('ok', torch.__version__)");
+            using Process p = Process.Start(psi) ?? throw new InvalidOperationException(PythonExe);
+            var outTask = p.StandardOutput.ReadToEndAsync();
+            var errTask = p.StandardError.ReadToEndAsync();
+            if (!p.WaitForExit(timeoutMs))
+            {
+                try { p.Kill(true); } catch { /* gone */ }
+                Log.Info("train: environment check timed out");
+                return false;
+            }
+            p.WaitForExit();
+            string output = outTask.Result.Trim();
+            if (p.ExitCode != 0 || !output.StartsWith("ok", StringComparison.Ordinal))
+            {
+                string err = errTask.Result.Trim();
+                if (err.Length > 400) err = err.Substring(err.Length - 400);
+                Log.Info($"train: environment incomplete (exit {p.ExitCode}) - {err}");
+                return false;
+            }
+            File.WriteAllText(ReadyMarker, output + Environment.NewLine);
+            Log.Info("train: environment confirmed by import - " + output);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Info("train: environment check failed - " + ex.Message);
+            return false;
+        }
+    }
 
     /// <summary>Names a model may not have: the built-in networks of train_upscaler.py's registry.</summary>
     private static readonly string[] Reserved = { "orig", "original", "m", "s", "l", "origm", "origs", "origl", "best", "last" };
@@ -115,6 +173,8 @@ internal static class TrainEnv
         psi.ArgumentList.Add("-Command");
         psi.ArgumentList.Add(cmd);
         Directory.CreateDirectory(UserModels.Root);
+        // The script writes the marker again only when every step succeeds.
+        try { File.Delete(ReadyMarker); } catch { /* the script deletes it too */ }
         Process p = Process.Start(psi) ?? throw new InvalidOperationException("powershell.exe");
         p.EnableRaisingEvents = true;
         p.Exited += (_, _) =>
@@ -292,6 +352,7 @@ internal sealed class TrainJob : IDisposable
     private Process? _proc;
     private TrainEnv.KillJob? _job;
     private StreamWriter? _file;
+    private readonly object _fileLock = new();   // stdout and stderr callbacks write concurrently; StreamWriter is not thread-safe
     private string _ctx = string.Empty;       // which table the next rows belong to: "before" | "final" | "other"
     private volatile bool _cancelled;
     private bool _disposed;
@@ -325,8 +386,22 @@ internal sealed class TrainJob : IDisposable
         }
     }
 
-    /// <summary>The newest checkpoint of the best state exists (so a stopped run can still be turned into a model).</summary>
-    public bool HasBestCheckpoint => File.Exists(Path.Combine(TrainEnv.RunsDir, Options.Name, "ckpt_best.pt"));
+    /// <summary>A checkpoint of the best state written by THIS run exists (so a stopped run can still be turned into a model).
+    /// A file from an earlier run under the same name does not count: offering it would export the old run (possibly another
+    /// network size) and report its numbers as this run's result.</summary>
+    public bool HasBestCheckpoint
+    {
+        get
+        {
+            var f = new FileInfo(Path.Combine(TrainEnv.RunsDir, Options.Name, "ckpt_best.pt"));
+            return f.Exists && WrittenByThisRun(f);
+        }
+    }
+
+    /// <summary>When the last <c>train</c> (not <c>finalize</c>) run of this job started (UTC).</summary>
+    private DateTime _trainStartedAt = DateTime.MinValue;
+
+    private bool WrittenByThisRun(FileInfo f) => f.LastWriteTimeUtc >= _trainStartedAt.AddSeconds(-2);
 
     /// <summary>Start <c>train</c> (or <c>finalize</c> for a run that was stopped).</summary>
     public void Start(bool finalize = false)
@@ -368,9 +443,13 @@ internal sealed class TrainJob : IDisposable
             _ctx = finalize ? "final" : string.Empty;
             _st.Phase = finalize ? TrainStatus.PhaseKind.Finishing : TrainStatus.PhaseKind.Starting;
             StartedAt = DateTime.UtcNow;
+            if (!finalize) _trainStartedAt = StartedAt;
         }
-        try { _file = new StreamWriter(Path.Combine(TrainEnv.LogsDir, "train-last.log"), finalize, new UTF8Encoding(false)) { AutoFlush = true }; }
-        catch { _file = null; }
+        lock (_fileLock)
+        {
+            try { _file = new StreamWriter(Path.Combine(TrainEnv.LogsDir, "train-last.log"), finalize, new UTF8Encoding(false)) { AutoFlush = true }; }
+            catch { _file = null; }
+        }
         AddLine("> " + py + " " + string.Join(" ", psi.ArgumentList.Select(a => a.Contains(' ') ? "\"" + a + "\"" : a)));
 
         _job?.Dispose();
@@ -400,8 +479,7 @@ internal sealed class TrainJob : IDisposable
         }
         if (code == 0 && !_cancelled) ReadFinalJson();
         Log.Info($"train: ended, exit {code}{(_cancelled ? " (cancelled)" : string.Empty)}");
-        try { _file?.Dispose(); } catch { /* ignore */ }
-        _file = null;
+        CloseFile();
         Ended?.Invoke(code);
     }
 
@@ -443,8 +521,20 @@ internal sealed class TrainJob : IDisposable
             Parse(line);
             _st.LastLine = line;
         }
-        try { _file?.WriteLine(line); } catch { /* ignore */ }
+        lock (_fileLock)
+        {
+            try { _file?.WriteLine(line); } catch { /* ignore */ }
+        }
         Line?.Invoke(line);
+    }
+
+    private void CloseFile()
+    {
+        lock (_fileLock)
+        {
+            try { _file?.Dispose(); } catch { /* ignore */ }
+            _file = null;
+        }
     }
 
     // ---- parsing (under _lock) ----------------------------------------------------------------------------------------
@@ -510,7 +600,8 @@ internal sealed class TrainJob : IDisposable
         try
         {
             string p = Path.Combine(TrainEnv.RunsDir, Options.Name, "final.json");
-            if (!File.Exists(p)) return;
+            var fi = new FileInfo(p);
+            if (!fi.Exists || !WrittenByThisRun(fi)) return;   // an earlier run's result is not this run's
             using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(p));
             if (!doc.RootElement.TryGetProperty("final", out JsonElement fin)) return;
             TrainScore? Get(string k) =>
@@ -546,6 +637,6 @@ internal sealed class TrainJob : IDisposable
         _disposed = true;
         try { _job?.Kill(); } catch { /* ignore */ }
         try { _job?.Dispose(); } catch { /* ignore */ }
-        try { _file?.Dispose(); } catch { /* ignore */ }
+        CloseFile();
     }
 }

@@ -1091,5 +1091,11 @@ public sealed class VideoEngine : IVideoEngine
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
-    public void Dispose() => Stop(); // Stop retires the session and wakes its worker
+    public void Dispose()
+    {
+        Stop(); // Stop retires the session and wakes its worker
+        // The flush timer is created on first use and lives as long as the engine: release it with the engine.
+        try { _flushTimer?.Dispose(); } catch { /* ignore */ }
+        _flushTimer = null;
+    }
 }

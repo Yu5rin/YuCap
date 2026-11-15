@@ -29,6 +29,24 @@ internal sealed partial class D3DRenderer
     /// <summary>The scaler could not run on this machine (not NVIDIA / no video processor / the blit failed); FSR is used instead.</summary>
     public static volatile bool NvVsrBroken;
     public static string NvBrokenWhy = "";
+    /// <summary>The failure behind <see cref="NvVsrBroken"/> may pass (a failed blit, a video interface that could not be had):
+    /// the next device tries again (<see cref="NvRetryAfterNewDevice"/>). Only "the render GPU is not NVIDIA" is final.</summary>
+    private static volatile bool s_nvBrokenTransient;
+
+    /// <summary>Called for every new device: a scaler failure of an earlier device (a driver reset, an odd output size) does not
+    /// keep RTX scaling off for the rest of the process.</summary>
+    private static void NvRetryAfterNewDevice()
+    {
+        if (!NvVsrBroken || !s_nvBrokenTransient) return;
+        NvVsrBroken = false; NvBrokenWhy = ""; s_nvBrokenTransient = false;
+        Log.Info("D3D: NVIDIA RTX scaler will be tried again on the new device");
+    }
+
+    /// <summary>A blit or view failure while the device is being removed is the device loss, not the scaler: the session restarts on its own.</summary>
+    private bool NvDeviceLost()
+    {
+        try { return Device.DeviceRemovedReason.Failure; } catch { return true; }
+    }
 
     /// <summary>What the HDR display shows now (0 SDR, 1 RTX Video HDR, 2 simple) and why not what was asked; written by the render thread.</summary>
     public static volatile string HdrSwapColorSpace = "G22 / sRGB (SDR)";
@@ -68,7 +86,13 @@ internal sealed partial class D3DRenderer
         {
             _nvSTried = true;
             _nvS = NvVideoProc.TryCreate(Device, Ctx);
-            if (_nvS == null) { NvVsrBroken = true; NvBrokenWhy = NvVideoProc.LastFailure; Log.Info("D3D: NVIDIA RTX scaler unavailable: " + NvBrokenWhy); return false; }
+            if (_nvS == null)
+            {
+                if (NvDeviceLost()) { _nvSTried = false; return false; }
+                NvVsrBroken = true; NvBrokenWhy = NvVideoProc.LastFailure; s_nvBrokenTransient = !NvVideoProc.LastFailureFinal;
+                Log.Info("D3D: NVIDIA RTX scaler unavailable: " + NvBrokenWhy);
+                return false;
+            }
         }
         if (_nvS == null) return false;
         if (_nvOut == null || _nvOutSize != to)
@@ -85,7 +109,8 @@ internal sealed partial class D3DRenderer
         }
         if (!_nvS.Blit(src, new Rectangle(Point.Empty, srcSize), _nvOut, to, vsr: true, hdr: false))
         {
-            NvVsrBroken = true; NvBrokenWhy = NvVideoProc.LastFailure;
+            if (NvDeviceLost()) return false;   // the session ends through Present; the next device starts clean
+            NvVsrBroken = true; NvBrokenWhy = NvVideoProc.LastFailure; s_nvBrokenTransient = true;
             Log.Info("D3D: NVIDIA RTX scaler failed, using FSR: " + NvBrokenWhy);
             return false;
         }
@@ -265,7 +290,12 @@ internal sealed partial class D3DRenderer
     private void HdrUpdate()
     {
         int want = HdrModeRequested;
-        if (want == 0 && _hdrKind == 0) return;
+        if (want == 0 && _hdrKind == 0)
+        {
+            if (_hdrNote.Length != 0 || HdrActiveNote.Length != 0) { _hdrNote = ""; HdrActiveNote = ""; }
+            _hdrSwapFailedKey = null;
+            return;
+        }
         long now = Environment.TickCount64;
         if (_hdrCheckAt == 0)
         {
@@ -283,8 +313,22 @@ internal sealed partial class D3DRenderer
         bool can = want != 0 && _psHdr != null && monHdr && _swap != null;
         int kind = !can ? 0 : (want == 1 && !_hdrRtxBroken ? 1 : 2);
         if (kind == 1 && !RtxHdrReady()) { kind = 2; _hdrRtxWhy = "このドライバー・GPU では RTX Video HDR を使えません"; }
-        if (kind == _hdrKind) return;
-        if (_hdrKind == 0 && kind != 0 && !SetSwapMode(2)) { _hdrNote = "HDR の出力に切り替えられませんでした"; kind = 0; HdrModeRequested = 0; return; }
+        // A swap chain that refused HDR10 is not asked again every frame: only for another request or another monitor.
+        string failKey = want + "|" + (_monHdr?.DeviceName ?? "");
+        if (kind != 0 && _hdrKind == 0 && _hdrSwapFailedKey == failKey) kind = 0;
+        if (kind == _hdrKind)
+        {
+            // Nothing to switch, but an HDR request that is not honoured must still say why (the monitor's HDR is off, ...).
+            if (kind == 0) SetHdrNote(SdrNote(want, monHdr, failKey));
+            return;
+        }
+        if (_hdrKind == 0 && kind != 0 && !SetSwapMode(2))
+        {
+            _hdrSwapFailedKey = failKey;
+            SetHdrNote(SdrNote(want, monHdr, failKey));
+            Log.Info("D3D: HDR requested but the swap chain cannot switch to HDR10 - staying SDR");
+            return;
+        }
         if (kind == 1 && !_hdrRtxChecked)
         {
             // the driver's HDR must really change the picture on the HDR10 back buffer (it does nothing for some setups): measure on versus off once
@@ -294,10 +338,30 @@ internal sealed partial class D3DRenderer
         }
         if (kind == 0 && _hdrKind != 0) SetSwapMode(0);
         if (kind != 0) _hdrNote = kind == 1 ? "" : (want == 1 ? _hdrRtxWhy + "、簡易の HDR にしています" : "");
-        else _hdrNote = want != 0 && !monHdr ? "このモニターの HDR がオフです" : "";
+        else _hdrNote = SdrNote(want, monHdr, failKey);
         _hdrKind = kind;
         HdrActiveKind = kind; HdrActiveNote = _hdrNote;
         Log.Info($"D3D: swap chain {_swapFormatDesc} (HDR display kind {kind}, requested {want}, monitor HDR {monHdr})");
+    }
+
+    /// <summary>Request + monitor for which switching the swap chain to HDR10 failed (null = none).</summary>
+    private string? _hdrSwapFailedKey;
+
+    /// <summary>Why an SDR picture is shown although HDR was requested ("" when it was not requested).</summary>
+    private string SdrNote(int want, bool monHdr, string failKey)
+    {
+        if (want == 0) return "";
+        if (!monHdr) return "このモニターの HDR がオフです";
+        if (_psHdr == null) return "HDR の表示を用意できませんでした";
+        if (_hdrSwapFailedKey == failKey) return "HDR の出力に切り替えられませんでした";
+        return "";
+    }
+
+    private void SetHdrNote(string note)
+    {
+        if (_hdrNote == note && HdrActiveNote == note) return;
+        _hdrNote = note;
+        HdrActiveNote = note;
     }
 
     private bool RtxHdrReady()

@@ -75,6 +75,8 @@ public sealed partial class MainForm
     private string _lastSavedPath = string.Empty;
     private bool _lastSaveCopied;
 
+    private bool _snapshotErrorShowing;
+
     private void SaveSnapshot()
     {
         bool fellBackBefore = _snapshotDirFellBack;
@@ -82,8 +84,15 @@ public sealed partial class MainForm
         if (!SaveSnapshotCore(out string file, out string? error, alsoCopy: wantCopy))
         {
             ShowOsd(L.T("保存に失敗しました"));
-            MessageBox.Show(this, L.F("保存に失敗しました。\n\n{0}", error),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            // The global hotkey still works while this box is open: further presses must not stack more boxes.
+            if (_snapshotErrorShowing) return;
+            _snapshotErrorShowing = true;
+            try
+            {
+                MessageBox.Show(this, L.F("保存に失敗しました。\n\n{0}", error),
+                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally { _snapshotErrorShowing = false; }
             return;
         }
 
@@ -222,32 +231,59 @@ public sealed partial class MainForm
             }
         }
 
+        string? tmp = null;
         try
         {
             bool jpg = _settings.SnapshotFormat.Equals("jpg", StringComparison.OrdinalIgnoreCase);
-            // Milliseconds in the name so rapid consecutive shots never overwrite (and a clash gets a _2 suffix).
-            string path = UniqueSnapshotPath(dir, jpg ? "jpg" : "png", DateTime.Now);
-            fileName = Path.GetFileName(path);
-            _lastSaveDir = dir;   // may be the fallback, not SnapshotDirectory
-            _lastSavedPath = path;
+            string ext = jpg ? "jpg" : "png";
+            // Encode in memory, write a temporary file, then rename it: GDI+ writing straight to the path reports every
+            // file-system failure (no permission, disk full, a path over 260 characters) as the same generic error, and
+            // leaves a 0-byte or truncated picture behind. FileStream gives typed errors (Errors.Describe maps them),
+            // handles long paths, and the picture appears under its real name only when it is complete.
+            using var encoded = new MemoryStream();
             if (jpg)
             {
                 ImageCodecInfo codec = ImageCodecInfo.GetImageEncoders()
                     .First(c => c.FormatID == ImageFormat.Jpeg.Guid);
                 using var ep = new EncoderParameters(1);
                 ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 92L);
-                frame.Save(path, codec, ep);
+                frame.Save(encoded, codec, ep);
             }
             else
             {
-                frame.Save(path, ImageFormat.Png);
+                frame.Save(encoded, ImageFormat.Png);
             }
+
+            // Milliseconds in the name so rapid consecutive shots never overwrite (and a clash gets a _2 suffix).
+            string path = UniqueSnapshotPath(dir, ext, DateTime.Now);
+            tmp = path + ".tmp";   // not .png/.jpg, so the gallery and Explorer previews ignore it
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                encoded.Position = 0;
+                encoded.CopyTo(fs);
+            }
+            try { File.Move(tmp, path); }
+            catch (IOException) when (File.Exists(path))
+            {
+                // Taken in the meantime (another YuCap shot in the same millisecond): pick the next free name.
+                path = UniqueSnapshotPath(dir, ext, DateTime.Now);
+                File.Move(tmp, path);
+            }
+            tmp = null;
+            fileName = Path.GetFileName(path);
+            _lastSaveDir = dir;   // may be the fallback, not SnapshotDirectory
+            _lastSavedPath = path;
         }
         catch (Exception ex)
         {
             Log.Info("snapshot save failed: " + ex);
+            fileName = string.Empty;
             error = Errors.Describe(ex);
             return false;
+        }
+        finally
+        {
+            if (tmp != null) { try { File.Delete(tmp); } catch { /* best effort */ } }
         }
 
         if (alsoCopy) _lastSaveCopied = TryCopyImage(frame);
@@ -450,7 +486,8 @@ public sealed partial class MainForm
         int plus = ver.IndexOf('+'); // strip build metadata if present
         if (plus > 0) ver = ver[..plus];
 
-        using var dlg = Ui.NewDialog(L.T("バージョン情報"), 380, 240);
+        const int dlgW = 400, dlgH = 330;
+        using var dlg = Ui.NewDialog(L.T("バージョン情報"), dlgW, dlgH);
 
         var pic = new PictureBox
         {
@@ -473,24 +510,73 @@ public sealed partial class MainForm
             AutoSize = true,
             Location = new Point(82, 50),
         };
+        // Every third-party component in the exe (the full texts are behind ライセンス...: THIRD-PARTY-NOTICES.txt, embedded).
+        string bullet = L.English ? "  - " : "  ・";
         var libs = new Label
         {
             Text = L.T("使用ライブラリ:") + "\n" +
-                   "  ・Windows Media Foundation (Capture Engine)\n" +
-                   "  ・NAudio — MIT License\n" +
-                   "  ・Vortice.MediaFoundation — MIT License",
+                   bullet + "Windows Media Foundation / Direct3D (Windows)\n" +
+                   bullet + "NAudio — MIT License\n" +
+                   bullet + "Vortice.Windows, Vortice.Mathematics — MIT License\n" +
+                   bullet + "SharpGen.Runtime — MIT License\n" +
+                   bullet + "AMD FidelityFX Super Resolution 1 — MIT License\n" +
+                   bullet + "Anime4K — MIT License\n" +
+                   bullet + "NVIDIA Optical Flow SDK (headers) — MIT License",
             AutoSize = true,
             Location = new Point(20, 96),
         };
-        var ok = Ui.Button("OK", 380 - Ui.Pad - Ui.ButtonWidth, 240 - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
+        var ok = Ui.Button("OK", dlgW - Ui.Pad - Ui.ButtonWidth, dlgH - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
         ok.DialogResult = DialogResult.OK;
+        var licenses = Ui.Button(L.T("ライセンス..."), Ui.Pad, dlgH - Ui.Pad - Ui.ButtonHeight);
+        licenses.Click += (_, _) => ShowThirdPartyNotices(dlg);
 
-        dlg.Controls.AddRange(new Control[] { pic, title, version, libs, ok });
+        dlg.Controls.AddRange(new Control[] { pic, title, version, libs, licenses, ok });
         dlg.AcceptButton = ok;
         dlg.CancelButton = ok;
         dlg.ShowDialog(this);
         pic.Image?.Dispose();
         title.Font.Dispose();
+    }
+
+    /// <summary>The licence texts of the third-party components (THIRD-PARTY-NOTICES.txt, embedded so that the release stays one exe).</summary>
+    private static void ShowThirdPartyNotices(IWin32Window owner)
+    {
+        string text;
+        try
+        {
+            using Stream? s = typeof(MainForm).Assembly.GetManifestResourceStream("ThirdPartyNotices.txt");
+            if (s == null) throw new FileNotFoundException("ThirdPartyNotices.txt");
+            using var r = new StreamReader(s, System.Text.Encoding.UTF8);
+            text = r.ReadToEnd();
+        }
+        catch (Exception ex)
+        {
+            Log.Info("about: third-party notices unavailable - " + ex.Message);
+            text = "https://github.com/Yu5rin/YuCap/blob/main/THIRD-PARTY-NOTICES.txt";
+        }
+
+        const int w = 640, h = 480;
+        using var dlg = Ui.NewDialog(L.T("ライセンス"), w, h);
+        var box = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Text = text,
+            Location = new Point(Ui.Pad, Ui.Pad),
+            Size = new Size(w - 2 * Ui.Pad, h - 3 * Ui.Pad - Ui.ButtonHeight),
+            Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom,
+        };
+        using var mono = new Font("Consolas", 9f);
+        box.Font = mono;
+        var close = Ui.Button(L.T("閉じる"), w - Ui.Pad - Ui.ButtonWidth, h - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
+        close.DialogResult = DialogResult.OK;
+        dlg.Controls.AddRange(new Control[] { box, close });
+        dlg.AcceptButton = close;
+        dlg.CancelButton = close;
+        dlg.Shown += (_, _) => { box.SelectionStart = 0; box.SelectionLength = 0; close.Focus(); };
+        dlg.ShowDialog(owner);
     }
 
 }

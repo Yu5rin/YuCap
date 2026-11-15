@@ -121,7 +121,7 @@ public sealed partial class MainForm
     /// <summary>
     /// Look for a newer release and, with the user's consent, install it.
     /// Communication only ever happens here — from an explicit menu action, or
-    /// from the once-a-day startup check the user can switch off.
+    /// from the check at every start that the user can switch off.
     /// </summary>
     /// <param name="manual">True when the user asked; only then do we report
     /// "no update" or a failed check. The startup check stays silent.</param>
@@ -410,15 +410,20 @@ public sealed partial class MainForm
         Exception? failure = null;
         var progress = new Progress<int>(p => { if (!dlg.IsDisposed) bar.Value = Math.Clamp(p, 0, 100); });
 
+        bool finished = false;
         dlg.Shown += async (_, _) =>
         {
             try { file = await Updater.DownloadAsync(info, progress, cts.Token); }
             catch (OperationCanceledException) { /* user cancelled */ }
             catch (Exception ex) { failure = ex; }
-            finally { if (!dlg.IsDisposed) dlg.Close(); }
+            finally { finished = true; if (!dlg.IsDisposed) dlg.Close(); }
         };
+        // Alt+F4 closes the dialog even without a control box: treat any close before the end as a cancel, so the download
+        // does not carry on (and finish into the staging folder) behind a dialog that is already gone.
+        dlg.FormClosing += (_, _) => { if (!finished) cts.Cancel(); };
         dlg.ShowDialog(this);
-        cts.Dispose();
+        // cts is not disposed here: a cancelled download may still be unwinding and observing its token.
+        if (!finished) file = null;
 
         if (failure != null)
         {
@@ -434,6 +439,10 @@ public sealed partial class MainForm
     /// <summary>Swap in <paramref name="file"/>, relaunch, and close this window.</summary>
     private void ApplyAndClose(string file, string? sha256 = null)
     {
+        // Ask about a running training BEFORE anything is swapped: once the new build has been started, "keep running" can
+        // only leave a half-updated session (the old build running from the renamed .old file, the new one giving up).
+        if (!ConfirmCloseDuringTraining()) return;
+        _trainCloseConfirmed = true;
         try
         {
             // Settings first (the new process reads them), but the video and audio keep running until the swap has
@@ -454,6 +463,13 @@ public sealed partial class MainForm
             }
             _skipSaveOnClose = true;  // settings already written above
             Close();                  // OnFormClosing releases the devices
+            if (!IsDisposed)
+            {
+                // The close was cancelled after all (it cannot be by the training question any more, but a test run or a
+                // future close guard can): this window keeps running, so it must keep saving its settings.
+                Log.Info("update: the close after the swap was cancelled - this window keeps running");
+                _skipSaveOnClose = false;
+            }
         }
         catch (Exception ex)
         {
@@ -462,6 +478,11 @@ public sealed partial class MainForm
             MessageBox.Show(this,
                 L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", Errors.Describe(ex)),
                 "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            // Still open (failed swap, relaunch failure, cancelled close): a later close must ask about training again.
+            if (!IsDisposed) _trainCloseConfirmed = false;
         }
     }
 

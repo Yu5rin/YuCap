@@ -30,6 +30,13 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const int WmEnterSizeMove = 0x0231;
     private const int WmExitSizeMove = 0x0232;
     private const int WmPowerBroadcast = 0x0218;
+    private const int WmEndSession = 0x0016;
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hWnd);
+
+    /// <summary>A modal dialog or message box of ours is up: Windows disables the owner window for as long as it is
+    /// open. Automatic actions (signal fullscreen, profile switch) and hotkeys wait or stand down meanwhile, so they
+    /// do not change what the dialog is showing or editing.</summary>
+    private bool ModalOpen => IsHandleCreated && !IsWindowEnabled(Handle);
     private const int PbtApmSuspend = 0x4, PbtApmResumeSuspend = 0x7, PbtApmResumeAutomatic = 0x12;
 
     // Global hotkeys (RegisterHotKey).
@@ -357,7 +364,21 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         InitAvAuto();
         _uiTimer.Interval = 500;
-        _uiTimer.Tick += (_, _) => { Watchdog.Beat(); CheckEngineHealth(); UpdateStatus(); CheckNativeResChange(); GuardOsdTick(); AutoProfileTick(); DisplayRateTick(); SignalTick(); StreamTick(); if (_info.Showing && _info.Mode == InfoMode.Full) UpdateInfo(); };
+        _uiTimer.Tick += (_, _) =>
+        {
+            Watchdog.Beat();
+            // Each step on its own: one that keeps failing must not stop the others (signal, auto profile ...) and
+            // must not raise an error box twice a second. Its first failure is logged; repeats are counted.
+            UiStep("health", CheckEngineHealth);
+            UiStep("status", UpdateStatus);
+            UiStep("native-res", CheckNativeResChange);
+            UiStep("guard-osd", GuardOsdTick);
+            UiStep("auto-profile", AutoProfileTick);
+            UiStep("display-rate", DisplayRateTick);
+            UiStep("signal", SignalTick);
+            UiStep("stream", StreamTick);
+            if (_info.Showing && _info.Mode == InfoMode.Full) UiStep("info", UpdateInfo);
+        };
         _fpsTimer.Tick += (_, _) => { if (_info.Showing && _info.Mode == InfoMode.Fps) UpdateInfo(); };
 
         // Device arrivals come in bursts; settle before re-enumerating.
@@ -402,6 +423,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         Load += OnLoad;
         FormClosing += OnFormClosing;
+        FormClosed += OnFormClosed;
         Resize += (_, _) => { LayoutCanvas(); MarkSettingsDirty(); };  // debounced: one save per drag
         Shown += (_, _) => LayoutCanvas(); // ensure correct fit once fully laid out
     }
@@ -545,6 +567,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         DwmGetWindowAttribute(hWnd, DwmwaCloaked, out int cloaked, sizeof(int)) == 0 && cloaked != 0;
 
     private bool _dragging;
+    private bool _dragFromMax;   // pressed on the video of a maximised window: a drag hands over to Windows' own move (it restores the window)
+    [DllImport("user32.dll")] private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    private const int WmNcLButtonDown = 0x00A1, HtCaption = 2;
     private bool _snapCollected;
     private Point _dragOrigin;
     private Point _formOrigin;
@@ -583,6 +609,11 @@ public sealed partial class MainForm : Form, IMessageFilter
             // never pay that cost; it is deferred to the first real drag move.
             _snapCollected = false;
         }
+        else if (!_isFullscreen && !_isPip && WindowState == FormWindowState.Maximized)
+        {
+            _dragFromMax = true;
+            _dragOrigin = Cursor.Position;
+        }
     }
 
     private void OnCanvasMouseMove(object? sender, MouseEventArgs e)
@@ -602,6 +633,17 @@ public sealed partial class MainForm : Form, IMessageFilter
             LayoutCanvas();
             return;
         }
+        if (_dragFromMax)
+        {
+            Point at = Cursor.Position;
+            if (Math.Abs(at.X - _dragOrigin.X) < 4 && Math.Abs(at.Y - _dragOrigin.Y) < 4) return;   // a click, not a drag
+            // Maximised: let Windows move it as if the title bar were dragged - it restores the window under the
+            // pointer and offers its own snapping. Our own drag only knows the normal state.
+            _dragFromMax = false;
+            ReleaseCapture();
+            SendMessage(Handle, WmNcLButtonDown, (IntPtr)HtCaption, IntPtr.Zero);
+            return;
+        }
         if (!_dragging) return;
         Point p = Cursor.Position;
         int dx = p.X - _dragOrigin.X, dy = p.Y - _dragOrigin.Y;
@@ -618,6 +660,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void OnCanvasMouseUp(object? sender, MouseEventArgs e)
     {
+        _dragFromMax = false;
         _dragging = false;
         _panning = false;
     }
@@ -1147,8 +1190,68 @@ public sealed partial class MainForm : Form, IMessageFilter
             Bounds = target;
             if (Bounds != target) Bounds = target;
         }
-        TopMost = true;
+        ApplyTopmost();
         LayoutCanvas(ModeChangeSettleMs);
+    }
+
+    // ---- Fullscreen z-order --------------------------------------------
+
+    private delegate void WinEventProc(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(uint evtMin, uint evtMax, IntPtr module, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] private static extern bool UnhookWinEvent(IntPtr hook);
+    [DllImport("user32.dll", EntryPoint = "MonitorFromWindow")] private static extern IntPtr MonitorOfWindow(IntPtr hwnd, uint flags);
+    private const uint EventSystemForeground = 0x0003, WinEventOutOfContext = 0x0000;
+    private const uint MonitorDefaultToNull = 0, MonitorDefaultToNearest = 2;
+    private const int WsExTopmost = 0x0008;
+    private const int WmActivateApp = 0x001C;
+    private WinEventProc? _foregroundProc;   // kept referenced: the hook calls it from native code
+    private IntPtr _foregroundHook;
+
+    /// <summary>Topmost in PiP and when the user asked for it. Fullscreen is topmost too (it must cover the taskbar),
+    /// but not while the user works in another app on the same monitor: Alt+Tab, or Explorer / the browser opened from
+    /// fullscreen, would otherwise open hidden behind the video. An app on another monitor leaves it topmost, so the
+    /// taskbar there does not cut into the picture while the user works elsewhere.</summary>
+    private void ApplyTopmost()
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        bool want = _isPip || _alwaysOnTop || (_isFullscreen && !ForegroundAppOnOurMonitor(out _));
+        if (want) { TopMost = true; return; }
+        if (!TopMost) return;
+        TopMost = false;
+        // Leaving the topmost band puts the window at the top of the normal band - over the app the user just
+        // switched to. Slot it back in behind that app.
+        if (ForegroundAppOnOurMonitor(out IntPtr fg) && (GetWindowLong(fg, GwlExStyle) & WsExTopmost) == 0)
+            SetWindowPos(Handle, fg, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    /// <summary>True when the foreground window belongs to another process and sits on the monitor this window covers.</summary>
+    private bool ForegroundAppOnOurMonitor(out IntPtr fg)
+    {
+        fg = GetForegroundWindow();
+        if (fg == IntPtr.Zero || fg == Handle) return false;     // mid-switch, or us
+        GetWindowThreadProcessId(fg, out uint pid);
+        if (pid == (uint)Environment.ProcessId) return false;    // our own dialogs, menus and owned windows
+        IntPtr mon = MonitorOfWindow(fg, MonitorDefaultToNull);
+        return mon != IntPtr.Zero && mon == MonitorOfWindow(Handle, MonitorDefaultToNearest);
+    }
+
+    /// <summary>Follow foreground changes while fullscreen (WM_ACTIVATEAPP alone does not say where the other app is).</summary>
+    private void HookForeground(bool on)
+    {
+        if (on && _foregroundHook == IntPtr.Zero)
+        {
+            _foregroundProc ??= (_, _, _, _, _, _, _) =>
+            {
+                try { if (_isFullscreen) ApplyTopmost(); }
+                catch (Exception ex) { Log.Info("foreground follow failed: " + ex.Message); }
+            };
+            _foregroundHook = SetWinEventHook(EventSystemForeground, EventSystemForeground, IntPtr.Zero, _foregroundProc, 0, 0, WinEventOutOfContext);
+        }
+        else if (!on && _foregroundHook != IntPtr.Zero)
+        {
+            UnhookWinEvent(_foregroundHook);
+            _foregroundHook = IntPtr.Zero;
+        }
     }
 
     /// <summary>映像 > 描画方式.</summary>
@@ -1390,7 +1493,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Row(gGlobal, L.T("音量を下げる"), FormatHotkey((Keys)_settings.HotkeyVolumeDown));
         Row(gGlobal, L.T("なめらか ⇔ 低遅延"), FormatHotkey((Keys)_settings.HotkeyStyle));
         if (!_settings.GlobalHotkeys)
-            Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です）"));
+            Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です。YuCap の画面では使えます）"));
 
         var close = new Button { Text = L.T("閉じる"), DialogResult = DialogResult.OK };
         Ui.Frame(dlg, lv, true, close);
@@ -1898,7 +2001,12 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
-        if (!_testRunning && e.CloseReason == CloseReason.UserClosing && !ConfirmCloseDuringTraining()) { e.Cancel = true; return; }
+        if (!_testRunning && e.CloseReason == CloseReason.UserClosing && !ConfirmCloseDuringTraining())
+        {
+            e.Cancel = true;
+            _skipSaveOnClose = false;   // a close requested by "update now" was refused: this process lives on and must keep saving
+            return;
+        }
         // An update has already saved settings; re-saving here would capture the
         // torn-down state (no device, window mid-close) over the real settings.
         if (_testRunning)
@@ -1926,6 +2034,37 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             try { SaveSettings(); } catch { /* ignore */ }
         }
+        // Nothing is torn down here: Windows raises this for WM_QUERYENDSESSION too, and a shutdown the user then
+        // cancels (another app blocked it) never closes the form. Tearing down here would leave a live window with
+        // disposed engines. The teardown runs in OnFormClosed, or on WM_ENDSESSION when the session really ends.
+    }
+
+    private void OnFormClosed(object? sender, FormClosedEventArgs e) => TearDown();
+
+    private readonly Dictionary<string, int> _uiStepFailures = new();
+
+    /// <summary>Run one periodic UI step, keeping its exception from reaching the application-wide error box.</summary>
+    private void UiStep(string name, Action step)
+    {
+        try { step(); }
+        catch (Exception ex)
+        {
+            _uiStepFailures.TryGetValue(name, out int n);
+            _uiStepFailures[name] = ++n;
+            if (n == 1) Log.Info($"ui tick '{name}' failed: {ex}");
+            else if (n is 10 or 100 or 1000 || n % 10000 == 0) Log.Info($"ui tick '{name}' failed {n} times: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private bool _tornDown;
+
+    /// <summary>Release everything the window holds. Runs once: from FormClosed, or from WM_ENDSESSION when Windows
+    /// ends the session (the process may be killed before FormClosed is ever raised).</summary>
+    private void TearDown()
+    {
+        if (_tornDown) return;
+        _tornDown = true;
+        HookForeground(false);
         _uiTimer.Stop();
         StopTrainingOnClose();
         StreamOnMainClosing();
@@ -2041,6 +2180,22 @@ public sealed partial class MainForm : Form, IMessageFilter
         PositionOsd();
         PositionInfo();
         PositionTestCaption();
+        // The menu and status bars change height with the scaling, so a locked aspect drifts (a thin letterbox) until
+        // the next manual resize. Put it right once the window has settled on the new monitor (after the drag, if any).
+        if (_lockAspect && IsHandleCreated)
+        {
+            _aspectAfterDpi = true;
+            BeginInvoke(new Action(() => { if (!_inSizeMove) ApplyAspectAfterDpi(); }));
+        }
+    }
+
+    private bool _aspectAfterDpi;
+
+    private void ApplyAspectAfterDpi()
+    {
+        if (!_aspectAfterDpi) return;
+        _aspectAfterDpi = false;
+        if (_lockAspect && !_isPip) ApplyLockedAspect();
     }
 
     private ToolStripMenuItem BuildTextSizeSubmenu()
@@ -2324,7 +2479,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             && _canvas.RectangleToScreen(_canvas.ClientRectangle).Contains(pos);
         bool eligible = overVideo
             && ActiveForm == this          // not another app, not a modal dialog
-            && !_ctx.Visible               // context menu open → keep it usable
+            && !IsMenuDropdownOpen()       // right-click menu or a menu-bar drop-down (it may lie over the video) → keep it usable
             && !_dragging && !_panning;
 
         int hideMs = Math.Clamp(_settings.CursorHideSeconds, 1, 60) * 1000;
@@ -2999,12 +3154,27 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     // ---- Sleep inhibition ------------------------------------------------
 
+    /// <summary>How long the card may show its own No Signal screen before the display is allowed to sleep again
+    /// (a console that is merely restarting comes back well within this).</summary>
+    private const long NoSignalAwakeMs = 60_000;
+    private long _noSignalSince;   // Environment.TickCount64 when No Signal began; 0 = there is a signal (or it is unknown)
+
     /// <summary>Keep the display/system awake while video is playing, like a
-    /// media player. Cleared when the preview stops or the app closes.</summary>
+    /// media player. Cleared when the preview stops or the app closes, while the
+    /// window is minimised, and once the card has shown No Signal for a while (the
+    /// console is off: the card still delivers frames, so "running" alone would keep
+    /// the monitor and the PC awake for good). No Signal is only known on Direct3D.</summary>
     private void UpdatePowerState()
     {
-        bool want = _video.IsRunning;
+        if (_tornDown) return;
+        long now = Environment.TickCount64;
+        if (NoSignalNow) { if (_noSignalSince == 0) _noSignalSince = now; }
+        else _noSignalSince = 0;
+        bool want = _video.IsRunning
+            && WindowState != FormWindowState.Minimized
+            && (_noSignalSince == 0 || now - _noSignalSince < NoSignalAwakeMs);
         if (want == _keepAwake) return;
+        Log.Info(want ? "keeping the display awake" : "letting the display sleep");
         _keepAwake = want;
         SetThreadExecutionState(want
             ? EsContinuous | EsDisplayRequired | EsSystemRequired
@@ -3357,7 +3527,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         };
         var timer = new System.Windows.Forms.Timer { Interval = 250 };
         timer.Tick += (_, _) => UpdateLive();
-        dlg.FormClosed += (_, _) => timer.Dispose();
+        dlg.FormClosed += (_, _) => { timer.Dispose(); value.Font.Dispose(); live.Font.Dispose(); };   // the two bold fonts were leaked per open
         ShowMode();
         UpdateLive();
         timer.Start();
@@ -3631,7 +3801,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             string name = _video.SupportsScalingQuality && _video.PixelPerfect ? L.T("整数倍")
                 : _video.SupportsScalingQuality ? ScalerShortName() : L.T("標準");
-            if (_video.SupportsNativeRes && _video.NativeResState is { Active: > 0 }) name += "・" + L.T("元の細かさ");
+            if (_video.SupportsNativeRes && _video.NativeResState is { Active: > 0 }) name += L.Sep + L.T("元の細かさ");
             return name;
         }
         if (d.Width < res.Width && d.Height < res.Height) return L.T("縮小");
@@ -3750,13 +3920,19 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
+    /// <summary>True for the whole of a renderer / profile / low-latency switch, including the start on the new engine
+    /// (<see cref="_engineSwapping"/> only covers the engine replacement itself). A second switch asked for meanwhile
+    /// would stop the first one's start halfway.</summary>
+    private bool _engineSwitchBusy;
+
     private async void SwitchRenderer(string renderer)
     {
-        if (_engineSwapping) return;
+        if (_engineSwapping || _engineSwitchBusy) { Log.Info("SwitchRenderer: another switch is running"); UpdateChecks(); return; }
+        _engineSwitchBusy = true;
         _devOpBusy++;   // a user operation (it may show a dialog that pumps messages): no automatic recovery meanwhile
         try { await SwitchRendererCoreAsync(renderer); }
         catch (Exception ex) { Log.Info("SwitchRenderer: " + ex); }
-        finally { _devOpBusy--; }
+        finally { _devOpBusy--; _engineSwitchBusy = false; }
     }
 
     private async Task SwitchRendererCoreAsync(string renderer)
@@ -3776,7 +3952,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             UpdateStatus();
             UpdateChecks();
             MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            ShowOsd(L.T("Direct3D 描画を開始できなかったため、標準の描画に戻しました"), OsdLongMilliseconds);
+            if (back == null)
+                ShowOsd(L.F("描画方式「{0}」を開始できなかったため、「{1}」に戻しました", RendererName(renderer), RendererName(previous)), OsdLongMilliseconds);
             return;
         }
 
@@ -3933,6 +4110,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // The second click of the fullscreen double-click also started a drag;
         // cancel it so mouse movement can't drag the fullscreen window around.
         _dragging = false;
+        _dragFromMax = false;
         _isFullscreen = true;
         _savedMenuVisible = _menu.Visible;
         _savedStatusVisible = _status.Visible;
@@ -3949,7 +4127,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         Location = fsBounds.Location;   // onto the chosen monitor first (DPI changes happen here)
         Bounds = fsBounds;
         if (Bounds != fsBounds) Bounds = fsBounds;
-        TopMost = true;
+        HookForeground(true);
+        ApplyTopmost();
         Watchdog.Done();
         Log.Info("EnterFullscreen: bounds set, layouting");
         LayoutCanvas(ModeChangeSettleMs);
@@ -3968,6 +4147,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         Bounds = _restoreBounds;
         if (Bounds != _restoreBounds) Bounds = _restoreBounds;   // may have crossed a DPI boundary
         WindowState = _restoreWindowState;
+        HookForeground(false);
         TopMost = _alwaysOnTop;
         RefreshFrame();
         UpdateChecks();
@@ -3984,6 +4164,9 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleBorderless()
     {
+        // PiP has its own frame and bars, and ExitPip puts back the ones from before PiP: a change made here would be
+        // thrown away without a word. Say so instead.
+        if (_isPip) { ShowOsd(L.T("PiP のあいだは切り替えられません")); return; }
         _borderlessOverridden = false; // the user is now choosing this themselves
         // Capture the video (client) area to preserve BEFORE changing the frame,
         // while ClientSize is still accurate for the current frame style.
@@ -4040,13 +4223,15 @@ public sealed partial class MainForm : Form, IMessageFilter
         // In PiP the window is topmost whatever the setting says; the choice made now belongs to the
         // state PiP will return to (ExitPip restores _prePipTopmost), otherwise it would be lost on exit.
         if (_isPip) _prePipTopmost = _alwaysOnTop;
-        if (!_isFullscreen && !_isPip)
-            TopMost = _alwaysOnTop;
+        if (!_isPip) ApplyTopmost();   // in fullscreen too: "always on top" also keeps it over other apps there
         UpdateChecks();
     }
 
     private void ToggleMenuBar()
     {
+        // PiP has its own frame and bars, and ExitPip puts back the ones from before PiP: a change made here would be
+        // thrown away without a word. Say so instead.
+        if (_isPip) { ShowOsd(L.T("PiP のあいだは切り替えられません")); return; }
         if (_menu.Visible)
         {
             int h = _menu.Height;                 // read while visible
@@ -4064,6 +4249,9 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ToggleStatusBar()
     {
+        // PiP has its own frame and bars, and ExitPip puts back the ones from before PiP: a change made here would be
+        // thrown away without a word. Say so instead.
+        if (_isPip) { ShowOsd(L.T("PiP のあいだは切り替えられません")); return; }
         if (_status.Visible)
         {
             int h = _status.Height;
@@ -4095,7 +4283,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             var info = d;
             var item = new ToolStripMenuItem(info.Name)
             {
-                Checked = string.Equals(info.Name, _video.CurrentDeviceName, StringComparison.Ordinal),
+                // By id: two cards of the same model have the same name, and both were ticked.
+                Checked = _video.CurrentDeviceName != null && _currentVideoInfo != null && info.Id == _currentVideoInfo.Id,
             };
             item.Click += (_, _) => SwitchVideoDevice(info);
             root.DropDownItems.Add(item);
@@ -4116,7 +4305,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             var info = d;
             var item = new ToolStripMenuItem(info.Name)
             {
-                Checked = string.Equals(info.Name, _audio.CurrentDeviceName, StringComparison.Ordinal),
+                // By id: two cards of the same model have the same name, and both were ticked.
+                Checked = _audio.CurrentDeviceName != null && _currentAudioInfo != null && info.Id == _currentAudioInfo.Id,
             };
             item.Click += (_, _) => SwitchAudioDevice(info);
             root.DropDownItems.Add(item);
@@ -4471,6 +4661,21 @@ public sealed partial class MainForm : Form, IMessageFilter
             return;
         }
 
+        // The session really ends (wParam != 0): release the devices first thing (WinForms then closes the form on this
+        // same message, and FormClosed finds everything done). wParam == 0: the shutdown was cancelled after
+        // WM_QUERYENDSESSION - nothing was torn down (see OnFormClosing) and the window keeps running.
+        if (m.Msg == WmEndSession)
+        {
+            Log.Info(m.WParam != IntPtr.Zero ? "session ending" : "session end cancelled");
+            if (m.WParam != IntPtr.Zero) { try { TearDown(); } catch (Exception ex) { Log.Info("teardown at session end failed: " + ex.Message); } }
+        }
+
+        // Our app gained or lost the foreground: fullscreen gives up / takes back the topmost band.
+        if (m.Msg == WmActivateApp && _isFullscreen && !_isPip)
+        {
+            BeginInvoke(() => { try { if (_isFullscreen) ApplyTopmost(); } catch (Exception ex) { Log.Info("activate-app topmost failed: " + ex.Message); } });
+        }
+
         // Monitors added / removed / re-arranged / resolution changed: put fullscreen, PiP and off-screen windows right.
         if (m.Msg == WmDisplayChange)
         {
@@ -4525,6 +4730,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         else if (m.Msg == WmExitSizeMove)
         {
             _inSizeMove = false;
+            ApplyAspectAfterDpi();   // a drag onto a monitor with other scaling: the locked aspect is put right now
             LayoutCanvas();       // final, with border clear
             _canvas.Invalidate();
         }
@@ -4533,7 +4739,16 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (m.Msg == WmHotkey)
         {
             if (_testRunning) return;
-            switch ((int)m.WParam)
+            int id = (int)m.WParam;
+            // A dialog or message box of ours is open: only the sound keys act. A PiP or style switch would change
+            // the window / restart the engine under the dialog, and a snapshot could stack a second box on it.
+            if (ModalOpen && id is not (HkMute or HkVolUp or HkVolDown))
+            {
+                Log.Info($"hotkey {id} ignored: a dialog is open");
+                System.Media.SystemSounds.Beep.Play();
+                return;
+            }
+            switch (id)
             {
                 case HkSnapshot: SaveSnapshot(); break;
                 case HkMute: ToggleMute(); break;
@@ -4833,7 +5048,10 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // Every state toggle funnels through here, so this is the one place
         // that reliably catches "something the user changed" for persistence.
-        MarkSettingsDirty();
+        // Not counted as a user change, though: this also runs whenever a menu
+        // merely opens, and that must not keep pushing back the automatic
+        // profile switch (the setters of profile values note the change themselves).
+        MarkSettingsDirty(userChange: false);
         foreach (var item in _cursorSecItems)
             item.Checked = _settings.CursorAutoHide && (int)item.Tag! == _settings.CursorHideSeconds;
         foreach (var item in _textSizeItems)
@@ -4904,25 +5122,26 @@ public sealed partial class MainForm : Form, IMessageFilter
             return true;
         }
 
+        // Bit 30 of lParam ("previous key state") is set on every WM_KEYDOWN
+        // generated by the key still being held down — i.e. auto-repeat, not a
+        // fresh press. Holding a key must fire ONE action (one snapshot, one
+        // fullscreen toggle), not one per repeat interval. Only the volume keys
+        // repeat on purpose.
+        bool isRepeat = ((long)msg.LParam & 0x40000000) != 0;
+
         // Configured hotkeys also work app-locally: if global registration
         // failed (combo owned by another app) or is disabled, the key still
         // works while YuCap has focus. When globally registered, the key never
         // reaches here, so this cannot double-fire.
         if ((keyData & Keys.KeyCode) != Keys.None)
         {
-            if (keyData == (Keys)_settings.HotkeySnapshot) { SaveSnapshot(); return true; }
-            if (keyData == (Keys)_settings.HotkeyMute) { ToggleMute(); return true; }
-            if (keyData == (Keys)_settings.HotkeyPip) { TogglePip(); return true; }
             if (keyData == (Keys)_settings.HotkeyVolumeUp) { NudgeVolume(+VolumeStep); return true; }
             if (keyData == (Keys)_settings.HotkeyVolumeDown) { NudgeVolume(-VolumeStep); return true; }
-            if (keyData == (Keys)_settings.HotkeyStyle) { ToggleStyle(); return true; }
+            if (keyData == (Keys)_settings.HotkeySnapshot) { if (!isRepeat) SaveSnapshot(); return true; }
+            if (keyData == (Keys)_settings.HotkeyMute) { if (!isRepeat) ToggleMute(); return true; }
+            if (keyData == (Keys)_settings.HotkeyPip) { if (!isRepeat) TogglePip(); return true; }
+            if (keyData == (Keys)_settings.HotkeyStyle) { if (!isRepeat) ToggleStyle(); return true; }
         }
-
-        // Bit 30 of lParam ("previous key state") is set on every WM_KEYDOWN
-        // generated by the key still being held down — i.e. auto-repeat, not a
-        // fresh press. Holding Ctrl+S must fire ONE snapshot, not one per
-        // repeat interval.
-        bool isRepeat = ((long)msg.LParam & 0x40000000) != 0;
 
         // Ctrl+1 .. Ctrl+9: apply the profile in that menu position.
         if (ProfileIndexForKey(keyData) is int profileIndex)
@@ -4934,13 +5153,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         switch (keyData)
         {
             case Keys.F11:
-                ToggleFullscreen();
+                if (!isRepeat) ToggleFullscreen();
                 return true;
             case Keys.F10:
-                ToggleMenuBar();
+                if (!isRepeat) ToggleMenuBar();
                 return true;
             case Keys.F1:
-                ShowShortcuts();
+                if (!isRepeat) ShowShortcuts();
                 return true;
             case Keys.Control | Keys.S:
                 if (!isRepeat) SaveSnapshot();
@@ -4952,15 +5171,16 @@ public sealed partial class MainForm : Form, IMessageFilter
                 if (!isRepeat) ShowSnapshotGallery();
                 return true;
             case Keys.Control | Keys.T:
+                if (isRepeat) return true;
                 ToggleAlwaysOnTop();
                 ShowOsd(_alwaysOnTop ? L.T("常に前面: オン") : L.T("常に前面: オフ"));
                 return true;
             case Keys.Control | Keys.B:
-                ToggleBorderless();
+                if (!isRepeat) ToggleBorderless();
                 return true;
             case Keys.Control | Keys.D0:
             case Keys.Control | Keys.NumPad0:
-                ResetZoom();
+                if (!isRepeat) ResetZoom();
                 return true;
             case Keys.Control | Keys.Shift | Keys.I:
                 if (!isRepeat) CycleInfoMode();
@@ -4969,10 +5189,10 @@ public sealed partial class MainForm : Form, IMessageFilter
                 if (!isRepeat) BeginCompare();
                 return true;
             case Keys.M:
-                ToggleMute();
+                if (!isRepeat) ToggleMute();
                 return true;
             case Keys.Space:
-                ToggleFreeze();
+                if (!isRepeat) ToggleFreeze();
                 return true;
             // Volume from the keyboard, matching the wheel's step. Handy in
             // fullscreen, where the pointer is hidden anyway.
@@ -4983,8 +5203,8 @@ public sealed partial class MainForm : Form, IMessageFilter
                 NudgeVolume(-VolumeStep);
                 return true;
             case Keys.Escape:
-                if (_isFullscreen) { ExitFullscreen(); return true; }
-                if (_isPip) { ExitPip(); return true; }
+                if (_isFullscreen) { if (!isRepeat) ExitFullscreen(); return true; }
+                if (_isPip) { if (!isRepeat) ExitPip(); return true; }
                 break;
         }
         return base.ProcessCmdKey(ref msg, keyData);
@@ -5260,6 +5480,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             _burstTimer.Dispose();
             _pipHoverTimer.Dispose();
             _resumeTimer.Dispose();
+            _displayTimer.Dispose();
             _resizeGuard.Dispose();
             _cursorTimer.Dispose();
             _settingsSaveTimer.Dispose();

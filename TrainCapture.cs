@@ -39,6 +39,7 @@ internal sealed class TrainCapture : IDisposable
     private readonly Thread _thread;
     private volatile bool _stop;
     private long _count, _bytes;
+    private long _otherBytes;   // pictures in the other profile folders under the same data folder (the cap is for all of them)
     private string _curFolder = "";
     private volatile string _state = "";
     private readonly List<float[]> _recent = new();
@@ -48,6 +49,8 @@ internal sealed class TrainCapture : IDisposable
     /// <summary>Pictures in the current folder (saved earlier or now).</summary>
     public long Count => Interlocked.Read(ref _count);
     public long Bytes => Interlocked.Read(ref _bytes);
+    /// <summary>Pictures of every profile folder under the training data folder: what the cap applies to.</summary>
+    public long TotalBytes => Interlocked.Read(ref _bytes) + Interlocked.Read(ref _otherBytes);
     public string Folder => _curFolder;
     /// <summary>What the collector is doing: "" (collecting), or the reason it is waiting (no signal, nothing moving, disk full...).</summary>
     public string State => _state;
@@ -60,6 +63,15 @@ internal sealed class TrainCapture : IDisposable
     }
 
     public void Dispose() { _stop = true; }
+
+    /// <summary>Stop and wait (bounded) until the collector thread is out of its loop: on close, before the video engine it grabs
+    /// from is disposed. A grab is a short GPU copy, so the wait is normally a fraction of a second.</summary>
+    public bool StopAndWait(int ms)
+    {
+        _stop = true;
+        if (Thread.CurrentThread == _thread) return true;
+        try { return _thread.Join(ms); } catch { return true; }
+    }
 
     private void Loop()
     {
@@ -81,14 +93,37 @@ internal sealed class TrainCapture : IDisposable
     private void Rescan(string folder)
     {
         _curFolder = folder;
-        long n = 0, b = 0;
+        long n = 0, b = 0, other = 0;
         try
         {
             if (Directory.Exists(folder))
                 foreach (var fi in new DirectoryInfo(folder).EnumerateFiles("*.png")) { n++; b += fi.Length; }
         }
         catch { }
-        Interlocked.Exchange(ref _count, n); Interlocked.Exchange(ref _bytes, b);
+        foreach (string d in SiblingFolders(folder))
+        {
+            try { foreach (var fi in new DirectoryInfo(d).EnumerateFiles("*.png")) other += fi.Length; }
+            catch { }
+        }
+        Interlocked.Exchange(ref _count, n); Interlocked.Exchange(ref _bytes, b); Interlocked.Exchange(ref _otherBytes, other);
+    }
+
+    /// <summary>The other profile folders that share the cap with <paramref name="folder"/>: only when it is a folder of the training
+    /// data folder (the self-check uses a folder of its own, whose neighbours are not training data).</summary>
+    private static List<string> SiblingFolders(string folder)
+    {
+        var list = new List<string>();
+        try
+        {
+            string full = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
+            string root = Path.GetFullPath(UserModels.DataRoot).TrimEnd(Path.DirectorySeparatorChar);
+            string? parent = Path.GetDirectoryName(full);
+            if (parent == null || !parent.Equals(root, StringComparison.OrdinalIgnoreCase) || !Directory.Exists(root)) return list;
+            foreach (string d in Directory.EnumerateDirectories(root))
+                if (!Path.GetFullPath(d).TrimEnd(Path.DirectorySeparatorChar).Equals(full, StringComparison.OrdinalIgnoreCase)) list.Add(d);
+        }
+        catch { }
+        return list;
     }
 
     private void Step()
@@ -139,31 +174,52 @@ internal sealed class TrainCapture : IDisposable
         Prune(folder, Math.Max(256L << 20, _capBytes()));
     }
 
-    /// <summary>Over <paramref name="cap"/>: delete the oldest pictures until 5% below it, and drop their lines from the index.</summary>
+    /// <summary>Over <paramref name="cap"/> (all profile folders together): delete the oldest pictures, whichever folder they are
+    /// in, until 5% below it, and drop their lines from each folder's index.</summary>
     private void Prune(string folder, long cap)
     {
-        if (Bytes <= cap) return;
+        if (TotalBytes <= cap) return;
         try
         {
-            var files = new DirectoryInfo(folder).EnumerateFiles("*.png").OrderBy(f => f.LastWriteTimeUtc).ToList();
+            var dirs = new List<string> { folder };
+            dirs.AddRange(SiblingFolders(folder));
+            var files = new List<FileInfo>();
+            foreach (string d in dirs)
+            {
+                try { files.AddRange(new DirectoryInfo(d).EnumerateFiles("*.png")); }
+                catch { }
+            }
+            files.Sort((a, b) => a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc));
             long target = (long)(cap * 0.95);
-            var gone = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var gone = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            string curFull = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
             foreach (FileInfo f in files)
             {
-                if (Bytes <= target) break;
+                if (TotalBytes <= target) break;
                 long len = f.Length;
-                try { f.Delete(); gone.Add(f.Name); Interlocked.Decrement(ref _count); Interlocked.Add(ref _bytes, -len); } catch { }
+                string dir = f.DirectoryName ?? folder;
+                bool current = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar).Equals(curFull, StringComparison.OrdinalIgnoreCase);
+                try
+                {
+                    f.Delete();
+                    if (!gone.TryGetValue(dir, out var set)) gone[dir] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    set.Add(f.Name);
+                    if (current) { Interlocked.Decrement(ref _count); Interlocked.Add(ref _bytes, -len); }
+                    else Interlocked.Add(ref _otherBytes, -len);
+                }
+                catch { }
             }
-            string idx = Path.Combine(folder, "index.jsonl");
-            if (gone.Count > 0 && File.Exists(idx))
+            foreach (var (dir, names) in gone)
             {
+                string idx = Path.Combine(dir, "index.jsonl");
+                if (!File.Exists(idx)) continue;
                 var keep = File.ReadAllLines(idx, Encoding.UTF8).Where(l =>
                 {
                     int i = l.IndexOf("\"f\":\"", StringComparison.Ordinal);
                     if (i < 0) return false;
                     int j = l.IndexOf('"', i + 5);
-                    return j > i && !gone.Contains(l.Substring(i + 5, j - i - 5));
-                });
+                    return j > i && !names.Contains(l.Substring(i + 5, j - i - 5));
+                }).ToList();
                 File.WriteAllLines(idx, keep, new UTF8Encoding(false));
             }
         }

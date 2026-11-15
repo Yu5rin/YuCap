@@ -249,7 +249,15 @@ public interface IVideoEngine : IDisposable
     /// <summary>HDR display: "off" | "rtx" | "simple" (the request); <see cref="HdrKind"/> is what is shown now (0 SDR, 1 RTX Video HDR, 2 simple).</summary>
     string HdrMode { get => "off"; set { } }
     int HdrKind => 0;
+    /// <summary>Why the HDR request is not what is shown (the monitor's HDR is off, the output could not switch, RTX Video HDR fell back to the
+    /// simple one); null when there is nothing to say. Japanese text: show it through L.T.</summary>
     string? HdrNote => null;
+    /// <summary>Why the chosen scaling is not what is drawn right now (くっきり could not run and FSR is drawn instead, ぼやけ取り is skipped);
+    /// null when it runs as chosen. The engine tries again by itself; the note clears once it works. Japanese text: show it through L.T.</summary>
+    string? ScalerFallbackNote => null;
+    /// <summary>Why the stream window (配信用ウィンドウ) no longer gets pictures (its swap chain failed again and again after the engine's own
+    /// retries); null while it works. Reopening the stream window starts over. Japanese text: show it through L.T.</summary>
+    string? StreamWindowNote => null;
     /// <summary>Test mode: the live HDR path on grey bars (sRGB codes) -> nits of each bar read back from the HDR10 back buffer; null when the display is not in HDR.</summary>
     float[]? HdrLiveCheck(int[] codes, out int kind, out string why) { kind = 0; why = "Direct3D 描画ではありません"; return null; }
     /// <summary>The swap chain format and colour space in use (Direct3D); empty otherwise.</summary>

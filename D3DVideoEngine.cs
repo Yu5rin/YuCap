@@ -215,6 +215,8 @@ public sealed class D3DVideoEngine : IVideoEngine
         return d;
     }
     public string? HdrNote => string.IsNullOrEmpty(D3DRenderer.HdrActiveNote) ? null : D3DRenderer.HdrActiveNote;
+    public string? ScalerFallbackNote => _s?.Renderer?.ScalerFallbackNote;
+    public string? StreamWindowNote => _s?.Renderer?.StreamNote;
 
     public string RestoreMode
     {
@@ -398,6 +400,8 @@ public sealed class D3DVideoEngine : IVideoEngine
 
     /// <summary>Render thread: device, shaders, swap chain and capture open must all finish within this.</summary>
     internal const int StartBudgetMs = 7000;
+    /// <summary>Longest Start() waits for the device and the shaders before StartBudgetMs begins (the one-time compile).</summary>
+    internal const int ShaderBudgetMs = 20000;
     /// <summary>Longest a Stop() waits: above the render thread's worst teardown (capture join 800 + source shutdown 1000 + join 1200 + disposal).</summary>
     internal const int ShutdownBudgetMs = 6000;
 
@@ -444,17 +448,23 @@ public sealed class D3DVideoEngine : IVideoEngine
 
             var s = new Session(this, _hwnd, info, mode);
             s.Begin();
-            // The render thread's own deadline (device + shaders + capture open) is StartBudgetMs; wait a little longer
-            // than that so its specific error wins over a bare timeout here.
+            // The render thread's own deadline (swap chain + capture open, after the shaders) is StartBudgetMs; wait a little
+            // longer than that so its specific error wins over a bare timeout here.
+            var compile = Stopwatch.StartNew();
+            while (!s.Started.IsSet && !s.ShadersReady.IsSet && compile.ElapsedMilliseconds < ShaderBudgetMs) s.Started.Wait(50);
             if (!s.Started.Wait(StartBudgetMs + 1500))
             {
                 Log.Info("D3D: Start timed out — abandoning the threads");
                 s.RequestStop("start timeout");
+                // Tracked like any other teardown: the next Start waits for it, so the abandoned render thread cannot still
+                // hold the window's DirectComposition target when the retry binds it.
+                TrackShutdown(s);
                 throw new UserFacingException(L.T("映像の開始がタイムアウトしました。"));
             }
             if (s.StartError != null)
             {
                 s.JoinRender(3500);   // let it release the window's composition target before a retry
+                if (s.RenderAlive) TrackShutdown(s);   // a slow teardown: the next Start's StopCore waits for the rest
                 ExceptionDispatchInfo.Capture(s.StartError).Throw();
             }
 
@@ -464,20 +474,26 @@ public sealed class D3DVideoEngine : IVideoEngine
                 {
                     // Stop() was called while we were starting: the caller no longer wants this picture.
                     Log.Info("D3D: Start cancelled by Stop()");
-                    var dead = s;
-                    Task t = Task.Run(() => dead.Shutdown(ShutdownBudgetMs));
-                    lock (_shutdownLock) _shutdownTask = Task.WhenAll(_shutdownTask, t);
+                    TrackShutdown(s);
                     throw new OperationCanceledException();
                 }
+                // Under the same lock as _s: a Stop() right after cannot leave a stopped engine that still reports this device.
+                CurrentDeviceName = info.Name;
+                _resolution = s.Resolution;
+                _mode = s.Mode;
+                NegotiatedFps = s.Fps;
+                _modes = s.Modes;
                 _s = s;
             }
-            CurrentDeviceName = info.Name;
-            _resolution = s.Resolution;
-            _mode = s.Mode;
-            NegotiatedFps = s.Fps;
-            _modes = s.Modes;
             Log.Info($"D3D: running {_resolution.Width}x{_resolution.Height}@{NegotiatedFps} ({s.Mode?.Compression})");
         }
+    }
+
+    /// <summary>Shut <paramref name="dead"/> down in the background and make the next Start (StopCore wait) wait for it.</summary>
+    private void TrackShutdown(Session dead)
+    {
+        Task t = Task.Run(() => dead.Shutdown(ShutdownBudgetMs));
+        lock (_shutdownLock) _shutdownTask = Task.WhenAll(_shutdownTask, t);
     }
 
     /// <summary>Detach the session and shut it down in the background (never blocks the caller for the join).</summary>
@@ -491,6 +507,11 @@ public sealed class D3DVideoEngine : IVideoEngine
             if (external) _stopEpoch++;
             s = _s;
             _s = null;
+            CurrentDeviceName = null;
+            _resolution = Size.Empty;
+            _mode = null;
+            NegotiatedFps = 0;
+            _modes = new();
         }
         if (s != null)
         {
@@ -499,11 +520,6 @@ public sealed class D3DVideoEngine : IVideoEngine
             lock (_shutdownLock) _shutdownTask = Task.WhenAll(_shutdownTask, t);
         }
         if (wait) WaitShutdown(ShutdownBudgetMs + 1000);
-        CurrentDeviceName = null;
-        _resolution = Size.Empty;
-        _mode = null;
-        NegotiatedFps = 0;
-        _modes = new();
     }
 
     public void Dispose() { StopCore(external: true, wait: true); }
@@ -676,6 +692,9 @@ public sealed class D3DVideoEngine : IVideoEngine
 
         // Result of Start
         public readonly ManualResetEventSlim Started = new(false);
+        /// <summary>Set once the device exists and the shaders are compiled: the first compile of a process (seconds on a slow
+        /// machine) has its own allowance (<see cref="ShaderBudgetMs"/>) and does not eat into the capture open's StartBudgetMs.</summary>
+        public readonly ManualResetEventSlim ShadersReady = new(false);
         public Exception? StartError;
         public Size Resolution;                  // the size at Start; see ResolutionNow for the live value
         public int Fps;
@@ -835,14 +854,29 @@ public sealed class D3DVideoEngine : IVideoEngine
             }
         }
 
+        private sealed class ShotBox { public D3DRenderer.AnalysisShot? Shot; public bool Closed; }
+
+        /// <summary>Queue the GPU copy for an analysis shot on the render thread. When the wait times out and the render thread
+        /// gets to the work only afterwards, the closure finds the box closed and disposes the staging texture itself
+        /// (otherwise a full-frame texture would be left behind with nobody holding it).</summary>
+        private D3DRenderer.AnalysisShot? BeginShot()
+        {
+            var box = new ShotBox();
+            Run(rr =>
+            {
+                D3DRenderer.AnalysisShot? sh = rr.AnalysisBegin();
+                lock (box) { if (box.Closed) sh?.Dispose(); else box.Shot = sh; }
+                return null;
+            }, 1500, needFrame: true, out _, allowNull: true);
+            lock (box) { box.Closed = true; return box.Shot; }
+        }
+
         /// <summary>The luma of the current picture for the analysis, or null. The render thread only queues a GPU copy; the
         /// pixels are mapped (without waiting) and converted here, outside FrameLock and off the render thread.</summary>
         private float[]? GrabLuma(D3DRenderer r, out int w, out int h)
         {
             w = h = 0;
-            D3DRenderer.AnalysisShot? shot = null;
-            Run(rr => { shot = rr.AnalysisBegin(); return null; }, 1500, needFrame: true, out _, allowNull: true);
-            D3DRenderer.AnalysisShot? got = shot;
+            D3DRenderer.AnalysisShot? got = BeginShot();
             if (got == null) return null;
             try
             {
@@ -865,9 +899,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         {
             D3DRenderer? r = _r;
             if (r == null || !r.HasFrame || PowerSaving) return null;
-            D3DRenderer.AnalysisShot? shot = null;
-            Run(rr => { shot = rr.AnalysisBegin(); return null; }, 1500, needFrame: true, out _, allowNull: true);
-            D3DRenderer.AnalysisShot? got = shot;
+            D3DRenderer.AnalysisShot? got = BeginShot();
             if (got == null) return null;
             try
             {
@@ -1177,6 +1209,7 @@ public sealed class D3DVideoEngine : IVideoEngine
         }
 
         public void JoinRender(int ms) { _renderThread?.Join(ms); }
+        public bool RenderAlive => _renderThread?.IsAlive == true;
 
         /// <summary>Stop both threads, never blocking the caller longer than <paramref name="budgetMs"/>.</summary>
         public void Shutdown(int budgetMs)
@@ -1253,6 +1286,8 @@ public sealed class D3DVideoEngine : IVideoEngine
                 _r = r;
                 r.CreateDevice();
                 r.CreateShaders();
+                sw.Restart();          // the compile has its own allowance; the budget below is for the swap chain and the capture open
+                ShadersReady.Set();
 
                 // The source reader decodes / converts on our device through this manager.
                 IMFDXGIDeviceManager mgr = MediaFactory.MFCreateDXGIDeviceManager();
@@ -1388,6 +1423,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     try { r.StreamConfigure(sreq.Hwnd, sreq.Size); }
                     catch (Exception ex) { Log.Info("D3D: stream window could not be set up - " + ex.Message.Split('\n')[0]); }
                 }
+                else if (r.StreamRetryDue) r.StreamRetry();   // its swap chain failed: made again a few times (StreamNote says when it gave up)
                 bool savingTick = saving && (loopNow - lastPresentTick) * 2 >= Stopwatch.Frequency;   // time for the 2-a-second refresh
                 bool skipWork = saving && !savingTick;
                 int userDelayMs = _e._videoDelayMs;

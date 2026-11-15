@@ -155,26 +155,31 @@ internal static class D3DShaders
         }
     }
 
-    private static readonly Dictionary<string, byte[][]> A4kCustomCode = new();
+    private static readonly Dictionary<string, (byte[][] Code, char Arch)> A4kCustomCode = new();
 
     /// <summary>Bytecode of the passes of a user-trained network (a model file written by tools/train_upscaler.py: the layout of Anime4K S, M or L as the
     /// first line says, so the passes and entry points are those of <c>A4kModels.Passes*</c>), compiled from the file on disk. Cached per file and modification
     /// time, so a retrained model that replaces the file is picked up without a rebuild. Throws if the file or the compile fails.</summary>
-    public static byte[][] GetA4kCustom(string path)
+    public static byte[][] GetA4kCustom(string path) => GetA4kCustom(path, out _);
+
+    /// <summary>As <see cref="GetA4kCustom(string)"/>, with the layout ('S', 'M' or 'L') the passes were compiled for: the caller must draw
+    /// with that pass table, not with one derived from the file again (the file can be replaced in between).</summary>
+    public static byte[][] GetA4kCustom(string path, out char arch)
     {
         lock (Gate)
         {
             string key = path + "|" + File.GetLastWriteTimeUtc(path).Ticks;
-            if (A4kCustomCode.TryGetValue(key, out byte[][]? have)) return have;
+            if (A4kCustomCode.TryGetValue(key, out (byte[][] Code, char Arch) have)) { arch = have.Arch; return have.Code; }
             var sw = Stopwatch.StartNew();
             string src = File.ReadAllText(path, Encoding.UTF8);
             string label = Path.GetFileName(path);
-            A4kPassInfo[] passes = UserModels.ArchOf(path) switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
+            arch = UserModels.ArchOf(path) is var a && (a == 'S' || a == 'L') ? a : 'M';
+            A4kPassInfo[] passes = arch switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
             var code = new byte[passes.Length][];
             for (int i = 0; i < passes.Length; i++) code[i] = Compile(src, passes[i].Entry, label, "ps_5_0");
             Log.Info($"D3D: Anime4K user model {label} compiled in {sw.ElapsedMilliseconds}ms");
             A4kCustomCode.Clear();
-            A4kCustomCode[key] = code;
+            A4kCustomCode[key] = (code, arch);
             return code;
         }
     }

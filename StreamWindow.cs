@@ -61,6 +61,7 @@ internal sealed class StreamForm : Form
         AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
+        MinimizeBox = false;   // minimised, it has nothing for OBS to capture; it is closed or moved, not minimised
         BackColor = Color.Black;
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.Manual;

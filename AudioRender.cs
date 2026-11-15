@@ -180,16 +180,75 @@ internal sealed class SharedRender : IDisposable
         }
     }
 
+    /// <summary>Sample layout of the device's shared mix format. Almost every endpoint mixes in 32-bit float; some virtual
+    /// cables and Bluetooth / USB drivers report integer PCM, which is converted in <see cref="WriteFrames"/>.</summary>
+    private enum SampleKind { Float32, Pcm8, Pcm16, Pcm24, Pcm32 }
+    private SampleKind _kind = SampleKind.Float32;
+    private int _blockAlign;
+    private byte[] _pcm = Array.Empty<byte>();
+
+    /// <summary>Short description of the mix format for the log ("32-bit float", "16-bit PCM", ...).</summary>
+    public string FormatName { get; private set; } = "32-bit float";
+
     private void ParseFormat(IntPtr fmt)
     {
         ushort tag = (ushort)Marshal.ReadInt16(fmt, 0);
         Channels = (ushort)Marshal.ReadInt16(fmt, 2);
         Rate = Marshal.ReadInt32(fmt, 4);
-        int bits = (ushort)Marshal.ReadInt16(fmt, 14);
-        bool isFloat = tag == 3;
-        if (tag == 0xFFFE) isFloat = Marshal.ReadInt32(fmt, 24) == 3;   // WAVEFORMATEXTENSIBLE SubFormat data1
-        if (!isFloat || bits != 32)
-            throw new NotSupportedException($"output mix format is not 32-bit float (tag {tag}, {bits} bit)");
+        _blockAlign = (ushort)Marshal.ReadInt16(fmt, 12);
+        int bits = (ushort)Marshal.ReadInt16(fmt, 14);   // container size; for EXTENSIBLE the valid bits are left-justified in it
+        int sub = tag;
+        if (tag == 0xFFFE) sub = Marshal.ReadInt32(fmt, 24);   // WAVEFORMATEXTENSIBLE SubFormat data1 (1 = PCM, 3 = float)
+        if (Channels <= 0 || Rate <= 0 || _blockAlign != Channels * bits / 8)
+            throw new NotSupportedException($"output mix format is malformed (tag {tag}, {Channels} ch, {bits} bit, block {_blockAlign})");
+        if (sub == 3 && bits == 32) { _kind = SampleKind.Float32; FormatName = "32-bit float"; return; }
+        if (sub == 1)
+        {
+            switch (bits)
+            {
+                case 8: _kind = SampleKind.Pcm8; break;
+                case 16: _kind = SampleKind.Pcm16; break;
+                case 24: _kind = SampleKind.Pcm24; break;
+                case 32: _kind = SampleKind.Pcm32; break;
+                default: throw new NotSupportedException($"output mix format is {bits}-bit PCM");
+            }
+            FormatName = $"{bits}-bit PCM";
+            return;
+        }
+        throw new NotSupportedException($"output mix format is not supported (tag {tag}, subformat {sub}, {bits} bit)");
+    }
+
+    /// <summary>Float samples (-1..1) to the device's integer PCM layout, clamped. 8-bit PCM is unsigned.</summary>
+    private void ConvertToPcm(float[] data, int samples, byte[] dst)
+    {
+        switch (_kind)
+        {
+            case SampleKind.Pcm8:
+                for (int i = 0; i < samples; i++)
+                    dst[i] = (byte)(Math.Clamp((int)MathF.Round(data[i] * 127f), -128, 127) + 128);
+                break;
+            case SampleKind.Pcm16:
+                for (int i = 0, o = 0; i < samples; i++, o += 2)
+                {
+                    int v = Math.Clamp((int)MathF.Round(data[i] * 32767f), -32768, 32767);
+                    dst[o] = (byte)v; dst[o + 1] = (byte)(v >> 8);
+                }
+                break;
+            case SampleKind.Pcm24:
+                for (int i = 0, o = 0; i < samples; i++, o += 3)
+                {
+                    int v = (int)Math.Clamp(Math.Round(data[i] * 8388607.0), -8388608.0, 8388607.0);
+                    dst[o] = (byte)v; dst[o + 1] = (byte)(v >> 8); dst[o + 2] = (byte)(v >> 16);
+                }
+                break;
+            case SampleKind.Pcm32:
+                for (int i = 0, o = 0; i < samples; i++, o += 4)
+                {
+                    int v = (int)Math.Clamp(Math.Round(data[i] * 2147483647.0), -2147483648.0, 2147483647.0);
+                    dst[o] = (byte)v; dst[o + 1] = (byte)(v >> 8); dst[o + 2] = (byte)(v >> 16); dst[o + 3] = (byte)(v >> 24);
+                }
+                break;
+        }
     }
 
     /// <summary>Initialises the stream with the engine's smallest sensible period (IAudioClient3) or a small v1 buffer.</summary>
@@ -243,7 +302,7 @@ internal sealed class SharedRender : IDisposable
 
         _event = new EventWaitHandle(false, EventResetMode.AutoReset);
         Check(SetEventHandle(_event.SafeWaitHandle.DangerousGetHandle()), "SetEventHandle");
-        Log.Info($"Audio: output buffer {_bufferFrames} frames ({_bufferFrames * 1000.0 / Rate:0} ms), kept at ~{_targetFrames * 1000.0 / Rate:0.0} ms, stream latency {StreamLatencyMs:0.0} ms, {Rate} Hz x {Channels}");
+        Log.Info($"Audio: output buffer {_bufferFrames} frames ({_bufferFrames * 1000.0 / Rate:0} ms), kept at ~{_targetFrames * 1000.0 / Rate:0.0} ms, stream latency {StreamLatencyMs:0.0} ms, {Rate} Hz x {Channels}, {FormatName}");
     }
 
     private IAudioClient Client1 => _client ?? throw new InvalidOperationException();
@@ -287,7 +346,15 @@ internal sealed class SharedRender : IDisposable
             Check(_render.ReleaseBuffer((uint)frames, 2 /* AUDCLNT_BUFFERFLAGS_SILENT */), "ReleaseBuffer");
             return;
         }
-        Marshal.Copy(data, 0, ptr, frames * Channels);
+        if (_kind == SampleKind.Float32)
+            Marshal.Copy(data, 0, ptr, frames * Channels);
+        else
+        {
+            int bytes = frames * _blockAlign;
+            if (_pcm.Length < bytes) _pcm = new byte[bytes];
+            ConvertToPcm(data, frames * Channels, _pcm);
+            Marshal.Copy(_pcm, 0, ptr, bytes);
+        }
         Check(_render.ReleaseBuffer((uint)frames, 0), "ReleaseBuffer");
     }
 

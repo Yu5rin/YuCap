@@ -35,6 +35,14 @@ internal sealed class QualityGuard
 
     public IReadOnlyList<string> Log { get { lock (_gate) return _log.ToArray(); } }
 
+    /// <summary>The decision log keeps only the latest entries: a borderline load can step down and up for hours. Under _gate.</summary>
+    private const int MaxLog = 200;
+    private void AddLog(string line)
+    {
+        if (_log.Count >= MaxLog) _log.RemoveRange(0, _log.Count - MaxLog + 1);
+        _log.Add(line);
+    }
+
     /// <summary>The user's choice changed (quality / Restore): the steps that exist for it are recomputed and the guard starts from the full quality.</summary>
     public void Configure(ScalingQuality quality, char variant, bool restoreOn)
     {
@@ -106,13 +114,13 @@ internal sealed class QualityGuard
                 // coming back too soon after a step down would only make it flap: wait longer when it happened a minute ago already
                 _upBlockUntil = nowMs + (nowMs - _lastDownAt < 60_000 ? 60_000 : 20_000);
                 _lastDownAt = nowMs;
-                _log.Add($"{at}: GPU {avgMs:0.00} ms avg / {maxMs:0.00} ms max of {budgetMs:0.00} ms -> step {_level}/{_steps.Length}: {_steps[_level - 1]}");
+                AddLog($"{at}: GPU {avgMs:0.00} ms avg / {maxMs:0.00} ms max of {budgetMs:0.00} ms -> step {_level}/{_steps.Length}: {_steps[_level - 1]}");
                 return true;
             }
             if (_under >= UnderSeconds && _level > 0 && nowMs >= _upBlockUntil)
             {
                 _level--; _over = _under = 0; _serial++;
-                _log.Add($"{at}: GPU {avgMs:0.00} ms avg / {maxMs:0.00} ms max of {budgetMs:0.00} ms -> back to step {_level}/{_steps.Length}");
+                AddLog($"{at}: GPU {avgMs:0.00} ms avg / {maxMs:0.00} ms max of {budgetMs:0.00} ms -> back to step {_level}/{_steps.Length}");
                 return true;
             }
             return false;

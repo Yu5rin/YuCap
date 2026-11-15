@@ -18,7 +18,9 @@ internal sealed class KmtVBlank : IDisposable
     {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
         public uint hAdapter;
-        public long AdapterLuid;
+        // LUID is two 32-bit fields aligned to 4: a managed long here would align to 8 and move VidPnSourceId from offset 76 to 80.
+        public uint AdapterLuidLow;
+        public int AdapterLuidHigh;
         public uint VidPnSourceId;
     }
 

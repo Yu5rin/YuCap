@@ -29,20 +29,27 @@ internal sealed partial class D3DRenderer
 
     /// <summary>自分専用モデル: a model file of the user's own training (tools/train_upscaler.py; Anime4K M layout) that replaces the built-in
     /// network while no guard override is active. null = the built-in one. Set it with <see cref="SetA4kCustom"/>.</summary>
-    public static string? A4kCustomPath { get; private set; }
-    /// <summary>The layout of the custom model: 'S', 'M' or 'L' (from the first line of the model file; decides the passes and the cost estimate).</summary>
-    public static char A4kCustomArch { get; private set; } = 'M';
+    public static string? A4kCustomPath => s_a4kCustom.Path;
+    /// <summary>The layout of the custom model: 'S', 'M' or 'L' (from the first line of the model file; decides the cost estimate - the passes
+    /// drawn are those the shaders were compiled for, see <see cref="EnsureA4kShaders"/>).</summary>
+    public static char A4kCustomArch => s_a4kCustom.Arch;
     /// <summary>Changes whenever the custom model (file or content) changes: part of the cache key, so a switched or retrained model is never shown from the cache.</summary>
-    public static int A4kCustomEpoch { get; private set; }
+    public static int A4kCustomEpoch => s_a4kCustom.Epoch;
+
+    /// <summary>Path, stamp and layout of the custom model, published together by one reference write: the render thread never sees
+    /// the new path with the old layout (the UI thread sets it while the render thread draws).</summary>
+    private sealed record A4kCustomModel(string? Path, int Epoch, char Arch);
+    private static volatile A4kCustomModel s_a4kCustom = new(null, 0, 'M');
 
     /// <summary>Use the user-trained model at <paramref name="path"/> (null = the built-in network). Safe to call from any thread.</summary>
     public static void SetA4kCustom(string? path)
     {
         int stamp = path == null ? 0 : HashCode.Combine(path, File.GetLastWriteTimeUtc(path).Ticks);
         if (path != null && stamp == _a4kCustomBadStamp) { path = null; stamp = 0; }     // this very file did not compile: stay on the built-in network until it changes
-        if (path == A4kCustomPath && stamp == A4kCustomEpoch) return;
-        A4kCustomPath = path; A4kCustomEpoch = stamp;
-        A4kCustomArch = path == null ? 'M' : (UserModels.ArchOf(path) is var a && a != '\0' ? a : 'M');
+        A4kCustomModel cur = s_a4kCustom;
+        if (path == cur.Path && stamp == cur.Epoch) return;
+        char arch = path == null ? 'M' : (UserModels.ArchOf(path) is var a && a != '\0' ? a : 'M');
+        s_a4kCustom = new A4kCustomModel(path, stamp, arch);
     }
     private static int _a4kCustomBadStamp;
     /// <summary>float16 intermediate textures (false = float32; the equivalence check uses float32 to show the port is exact).</summary>
@@ -82,8 +89,18 @@ internal sealed partial class D3DRenderer
     private ID3D11PixelShader[]? _a4kPs;
     private char _a4kPsLetter;
     private int _a4kPsModel;
+    private A4kPassInfo[] _a4kPsPasses = Array.Empty<A4kPassInfo>();   // the pass table the shaders in _a4kPs were compiled for
+    private int _a4kPsTextures;
     private ID3D11Buffer? _cbA4k;
-    private bool _a4kBroken;
+    private bool _a4kBroken;                 // the shaders do not compile: FSR for the life of this renderer
+    private long _a4kRetryAt;                // a pass failed (typically out of video memory): FSR until this tick, then try again
+    private int _a4kRetryDelayMs = A4kRetryFirstMs;
+    private const int A4kRetryFirstMs = 10_000, A4kRetryMaxMs = 300_000;
+    private volatile string? _scalerNote;
+
+    /// <summary>Why the chosen scaler is not what is drawn right now (Anime4K / Restore could not run, FSR or no pre-pass is used instead);
+    /// null when everything runs as chosen. Any thread.</summary>
+    public string? ScalerFallbackNote => _scalerNote;
 
     /// <summary>True when the CNN shaders compile (first call compiles; ~0.3 s once per process).</summary>
     public bool A4kAvailable
@@ -91,43 +108,56 @@ internal sealed partial class D3DRenderer
         get
         {
             if (_a4kBroken) return false;
+            if (_a4kRetryAt != 0)
+            {
+                if (Environment.TickCount64 < _a4kRetryAt) return false;
+                _a4kRetryAt = 0;   // try again; the note stays until a pass has really run
+            }
             try { return EnsureA4kShaders(); }
             catch (Exception ex)
             {
                 _a4kBroken = true;
+                _scalerNote = "くっきり を使えないため、FSR にしています";
                 Log.Info("D3D: Anime4K unavailable - " + ex.Message.Split('\n')[0]);
                 return false;
             }
         }
     }
 
-    private static A4kPassInfo[] PassesOf(char v) => (v == 'C' ? A4kCustomArch : v) switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
-    private static int TexturesOf(char v) => (v == 'C' ? A4kCustomArch : v) switch { 'S' => A4kModels.TexturesS, 'L' => A4kModels.TexturesL, _ => A4kModels.TexturesM };
+    private static A4kPassInfo[] PassesOfArch(char a) => a switch { 'S' => A4kModels.PassesS, 'L' => A4kModels.PassesL, _ => A4kModels.PassesM };
+    private static int TexturesOfArch(char a) => a switch { 'S' => A4kModels.TexturesS, 'L' => A4kModels.TexturesL, _ => A4kModels.TexturesM };
 
     private bool EnsureA4kShaders()
     {
         char v = A4kVariantNow;
-        int model = v == 'C' ? A4kCustomEpoch : 0;
+        A4kCustomModel custom = s_a4kCustom;   // one snapshot: path, stamp and layout belong together
+        if (v == 'C' && custom.Path == null) v = A4kVariantLetter;   // switched back to the built-in network meanwhile
+        int model = v == 'C' ? custom.Epoch : 0;
         if (_a4kPs != null && _a4kPsLetter == v && _a4kPsModel == model) return true;
         byte[][] code;
+        char arch = v;
         if (v == 'C')
         {
-            string? path = A4kCustomPath;
-            if (path == null) throw new InvalidOperationException("no user model");
-            try { code = D3DShaders.GetA4kCustom(path); }
+            string path = custom.Path!;
+            try { code = D3DShaders.GetA4kCustom(path, out arch); }
             catch (Exception ex)
             {
                 // a broken or half-written model file must never take the built-in network down with it
                 Log.Info("D3D: user model " + Path.GetFileName(path) + " unusable, using the built-in Anime4K network - " + ex.Message.Split('\n')[0]);
-                _a4kCustomBadStamp = A4kCustomEpoch;
+                _a4kCustomBadStamp = custom.Epoch;
                 SetA4kCustom(null);
                 return EnsureA4kShaders();
             }
         }
         else code = D3DShaders.GetA4k(v);
+        A4kPassInfo[] passes = PassesOfArch(arch);
+        if (passes.Length != code.Length) throw new InvalidOperationException($"Anime4K pass table ({passes.Length}) does not match the shaders ({code.Length})");
         if (_a4kPs != null) foreach (var p in _a4kPs) p.Dispose();
-        _a4kPs = new ID3D11PixelShader[code.Length];
-        for (int i = 0; i < code.Length; i++) _a4kPs[i] = Device.CreatePixelShader(code[i]);
+        _a4kPs = null;
+        var ps = new ID3D11PixelShader[code.Length];
+        for (int i = 0; i < code.Length; i++) ps[i] = Device.CreatePixelShader(code[i]);
+        _a4kPs = ps;
+        _a4kPsPasses = passes; _a4kPsTextures = TexturesOfArch(arch);
         _a4kPsLetter = v; _a4kPsModel = model;
         _cbA4k ??= Device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer, ResourceUsage.Default));
         return true;
@@ -169,11 +199,16 @@ internal sealed partial class D3DRenderer
         return n;
     }
 
-    private void A4kFree()
+    private void A4kFreeTextures()
     {
         foreach (var list in _a4kInter) { foreach (var t in list) t?.Dispose(); list.Clear(); }
         for (int i = 0; i < 2; i++) { _a4kOut[i]?.Dispose(); _a4kOut[i] = null; }
         _a4kResult = null; _a4kHaveKey = false;
+    }
+
+    private void A4kFree()
+    {
+        A4kFreeTextures();
         if (_a4kPs != null) { foreach (var p in _a4kPs) p.Dispose(); _a4kPs = null; }
         RestoreFree();
         _cbA4k?.Dispose(); _cbA4k = null;
@@ -196,21 +231,31 @@ internal sealed partial class D3DRenderer
             }
             _a4kResult = outTex;
             _a4kKey = key; _a4kHaveKey = true;
+            if (_a4kRetryDelayMs != A4kRetryFirstMs || _scalerNote != null)
+            {
+                _a4kRetryDelayMs = A4kRetryFirstMs;
+                if (!_restBroken && _restRetryAt == 0) _scalerNote = null;
+            }
             return true;
         }
         catch (Exception ex)
         {
-            Log.Info("D3D: Anime4K pass failed - " + ex.Message.Split('\n')[0]);
-            _a4kBroken = true;
+            // Typically E_OUTOFMEMORY for the float16 textures after a resize to a large window. Not for good: let go of the
+            // textures (the memory is what was missing), draw with FSR and try again later - ever more rarely if it keeps failing.
+            Log.Info($"D3D: Anime4K pass failed - {ex.Message.Split('\n')[0]} - FSR for {_a4kRetryDelayMs / 1000} s");
+            _a4kRetryAt = Environment.TickCount64 + _a4kRetryDelayMs;
+            _a4kRetryDelayMs = Math.Min(A4kRetryMaxMs, _a4kRetryDelayMs * 2);
+            _scalerNote = "くっきり を実行できなかったため、FSR にしています";
             _a4kResult = null; _a4kHaveKey = false;
+            try { A4kFreeTextures(); } catch { }
             return false;
         }
     }
 
     private A4kTex A4kStage(ID3D11ShaderResourceView input, Size src, int stage)
     {
-        A4kPassInfo[] passes = PassesOf(_a4kPsLetter);
-        int nTex = TexturesOf(_a4kPsLetter);
+        A4kPassInfo[] passes = _a4kPsPasses;
+        int nTex = _a4kPsTextures;
         List<A4kTex?> inter = _a4kInter[stage];
         while (inter.Count < nTex) inter.Add(null);
         for (int i = 0; i < nTex; i++) { A4kTex? t = inter[i]; A4kEnsure(ref t, src); inter[i] = t; }

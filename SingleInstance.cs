@@ -120,8 +120,12 @@ internal static class SingleInstance
         {
             var data = Marshal.PtrToStructure<CopyDataStruct>(lParam);
             if (data.dwData.ToInt64() != CopyDataId || data.lpData == IntPtr.Zero) return null;
-            string? s = Marshal.PtrToStringUni(data.lpData);
-            return string.IsNullOrEmpty(s) ? null : s.Split('\n');
+            // Read exactly the copied block (cbData bytes), not up to a terminator the sender may have left out.
+            if (data.cbData < 2 || data.cbData > 64 * 1024) return null;
+            string s = Marshal.PtrToStringUni(data.lpData, data.cbData / 2);
+            int end = s.IndexOf('\0');
+            if (end >= 0) s = s.Substring(0, end);
+            return s.Length == 0 ? null : s.Split('\n');
         }
         catch { return null; }
     }

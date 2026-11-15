@@ -320,6 +320,14 @@ def cmd_train(a):
         torch.cuda.set_per_process_memory_fraction(a.mem_fraction)
     net = T.A4kNet(a.arch).to(DEV)
     orig = T.A4kNet(a.arch).to(DEV).eval()
+    if not a.resume:
+        # A new run under an existing name: the previous run's checkpoints and result must not be taken for this run's
+        # (finalize would export the old best state, and YuCap would offer it as "the best so far").
+        for stale in ("ckpt_best.pt", "ckpt_last.pt", "final.json"):
+            try:
+                os.remove(os.path.join(run_dir(a.name), stale))
+            except FileNotFoundError:
+                pass
     if a.resume and os.path.exists(os.path.join(run_dir(a.name), "ckpt_last.pt")):
         st = torch.load(os.path.join(run_dir(a.name), "ckpt_last.pt"), map_location=DEV)
         if st.get("letter", "M") != a.arch:
@@ -515,7 +523,7 @@ def main():
     t.add_argument("--iters", type=int, default=20000)
     t.add_argument("--batch", type=int, default=32); t.add_argument("--patch", type=int, default=96)
     t.add_argument("--lr", type=float, default=1e-4); t.add_argument("--lr-min", dest="lr_min", type=float, default=1e-5)
-    t.add_argument("--arch", choices=["S", "M", "L"], default="M", help="network size (Anime4K CNN x2 S / M / L): L is more accurate but about 1.5x the GPU cost of M at play time")
+    t.add_argument("--arch", choices=["S", "M", "L"], default="M", help="network size (Anime4K CNN x2 S / M / L): L is more accurate but about 1.7x the GPU cost of M at play time")
     t.add_argument("--loss", choices=["edge", "texture"], default="edge",
                    help="edge: L1 + Sobel edge term (sharper lines, flatter texture).  texture: L1 + SSIM + high-pass texture terms (keeps grain / hatching / cloth)")
     t.add_argument("--edge-w", dest="edge_w", type=float, default=None, help="weight of the Sobel edge term (default 0.15 for --loss edge, 0 for texture)")

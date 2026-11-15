@@ -198,6 +198,7 @@ internal sealed partial class D3DRenderer
         {
             Log.Info("D3D: same-picture detection failed and is switched off: " + ex.Message.Split('\n')[0]);
             _dupDisabled = true;
+            Signal.Disable();   // nothing feeds the signal judgement any more: it must not decay into "no signal" while frames arrive
         }
         return fn;
     }
@@ -263,6 +264,7 @@ internal sealed partial class D3DRenderer
             Signal.Feed(tk.Arrival, f);
             SignalSink?.Invoke(tk.FrameNo, tk.Arrival, sum, c1, c2, dark, lit, nb);
         }
+        else Signal.Arrived(tk.Arrival);   // no verdict for this frame, but it did arrive: not "no frames at all"
         bool same = known && tk.HasPrev && DupMath.Same(sum, max, c1, c2);
         bool unique = !same;
         long now = ClockOverride?.Invoke() ?? Stopwatch.GetTimestamp();

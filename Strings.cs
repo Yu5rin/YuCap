@@ -41,6 +41,7 @@ internal static class L
         // ---- Application ----
         ["YuCap - キャプチャビューア"] = "YuCap - Capture Viewer",
         ["YuCap は既に起動しています。"] = "YuCap is already running.",
+        ["コマンドラインの指定が正しくないため、起動しませんでした。\n\n{0}\n\n使える指定は YuCap.exe --help で確認できます。"] = "YuCap did not start because the command line is not valid.\n\n{0}\n\nRun YuCap.exe --help to see the options.",
         ["エラー"] = "Error",
         ["更新確認"] = "Check for updates",
 
@@ -78,7 +79,19 @@ internal static class L
             "Select a field and press a key combination. Use [Clear] or Backspace to unassign.",
         ["解除"] = "Clear",
         ["閉じる"] = "Close",
-        ["（グローバルホットキーは無効です）"] = "(Global hotkeys are disabled)",
+        ["（グローバルホットキーは無効です。YuCap の画面では使えます）"] = "(Global hotkeys are off; these keys still work in the YuCap window)",
+        ["{0} は使えません。Ctrl か Alt を押しながら、ほかのキーを押してください。"] =
+            "{0} can't be used. Hold Ctrl or Alt and press another key.",
+        ["{0}: YuCap の「{1}」が使えなくなります"] = "{0}: YuCap's \"{1}\" will stop working",
+        ["{0}: ほかのアプリでもよく使うキーです。どこからでも効くようにすると、そのアプリでは使えなくなります"] =
+            "{0}: often used by other apps. As a global hotkey, it stops working in them",
+        ["次のキーは、ほかの操作と重なります。\n\n{0}\n\nこのまま割り当てますか？"] =
+            "These keys overlap other shortcuts:\n\n{0}\n\nAssign them anyway?",
+        ["PiP のあいだは切り替えられません"] = "Not available while in PiP",
+        ["配信用ウィンドウを閉じました。Direct3D 描画に戻すと、また開きます"] =
+            "The stream window was closed. It opens again when you switch back to the Direct3D renderer",
+        ["描画方式「{0}」を開始できなかったため、「{1}」に戻しました"] =
+            "The \"{0}\" renderer could not be started, so YuCap went back to \"{1}\"",
         ["終了"] = "Exit",
         ["デバイス(&D)"] = "&Device",
         ["映像デバイス"] = "Video device",
@@ -167,6 +180,15 @@ internal static class L
         ["負荷が高いため くっきり を FSR に切り替えています"] = "GPU load is high: using FSR instead of Crisp",
         ["負荷が高いため ぼやけ取りを止めています"] = "GPU load is high: blur removal is paused",
         ["負荷が下がったため、元の画質に戻しました"] = "GPU load is lower: quality restored",
+        // engine fallback notes (IVideoEngine.ScalerFallbackNote / StreamWindowNote / HdrNote)
+        ["くっきり を使えないため、FSR にしています"] = "Crisp is not available: using FSR",
+        ["くっきり を実行できなかったため、FSR にしています"] = "Crisp could not run: using FSR for now",
+        ["ぼやけ取りを使えないため、止めています"] = "Blur removal is not available and is off",
+        ["ぼやけ取りを実行できなかったため、止めています"] = "Blur removal could not run and is paused for now",
+        ["配信用ウィンドウに映像を出せなくなりました。開き直してください"] = "The stream window can no longer show the picture. Please reopen it.",
+        ["このモニターの HDR がオフです"] = "HDR is off on this monitor",
+        ["HDR の出力に切り替えられませんでした"] = "Could not switch the output to HDR",
+        ["HDR の表示を用意できませんでした"] = "The HDR display could not be prepared",
         ["ぼやけを取ってから拡大"] = "Remove blur before enlarging",
         ["ぼやけを取ってから拡大: {0}"] = "Remove blur before enlarging: {0}",
         ["拡大の前に、ニューラルネット（Anime4K Restore）でぼやけを取ります。GPU を余分に使い、縁に輪が出やすくなります。元の細かさに合わせて拡大が働いているときは使いません。"] = "Removes blur with a neural network (Anime4K Restore) before enlarging. Uses extra GPU time and can add halos at edges. Not used while Match original detail is shrinking the picture.",
@@ -439,6 +461,8 @@ internal static class L
         ["バージョン情報"] = "About",
         ["バージョン {0}"] = "Version {0}",
         ["使用ライブラリ:"] = "Libraries:",
+        ["ライセンス..."] = "Licenses...",
+        ["ライセンス"] = "Licenses",
         ["ウィンドウの大きさに関係なく、入力された映像の解像度で保存します。"] =
             "Saves at the source video's resolution, regardless of the window size.",
 
@@ -471,8 +495,8 @@ internal static class L
             "The audio device is in use by another application. Close that application and try again.",
         ["音声デバイスが取り外されたか、無効になりました。"] = "The audio device was removed or disabled.",
         ["音声デバイスの形式に対応していません。"] = "The audio device's format is not supported.",
-        ["予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。"] =
-            "An unexpected error occurred.\n\n{0}\n\nDetails were written to error.log.",
+        ["予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。同じエラーがまた起きたときは、表示せずに記録だけします。\n\nYuCap を終了しますか？（［いいえ］で使い続けます）"] =
+            "An unexpected error occurred.\n\n{0}\n\nDetails were written to error.log. If the same error happens again, it is only logged.\n\nQuit YuCap? (No keeps it running)",
         ["Direct3D 11 を初期化できません。"] = "Could not initialize Direct3D 11.",
         ["このウィンドウは別の描画方式で使われています。映像ウィンドウを作り直す必要があります。"] = "This window is in use by the other renderer. The video window has to be recreated.",
         ["映像の開始がタイムアウトしました。"] = "Starting the video timed out.",
@@ -786,7 +810,7 @@ internal static class L
         ["学習用の絵を集めています"] = "Collecting training pictures",
         ["学習用の絵を集めるのをやめました"] = "Stopped collecting training pictures",
         ["学習用の絵: {0} 枚"] = "Training pictures: {0}",
-        ["学習用の絵を集めています。保存先: {0}\n{1:0.0} GB（上限 {2} GB）"] = "Collecting training pictures. Folder: {0}\n{1:0.0} GB (limit {2} GB)",
+        ["学習用の絵を集めています。保存先: {0}\nすべてのプロファイルで {1:0.0} GB（上限 {2} GB）"] = "Collecting training pictures. Folder: {0}\n{1:0.0} GB for all profiles (limit {2} GB)",
         ["今は待っています: {0}"] = "Waiting now: {0}",
         ["信号がありません"] = "no signal",
         ["ゲームの絵ではありません"] = "not a game picture",
@@ -794,6 +818,9 @@ internal static class L
         ["似た絵を保存済み"] = "a similar picture is already saved",
         ["様子を見ています"] = "looking",
         ["ディスクの空きが少ない"] = "the disk is almost full",
+        ["保存先のフォルダーを使えません"] = "the folder cannot be used",
+        ["映像から絵を取り出せません"] = "no picture could be taken from the video",
+        ["エラーが起きました（ログを見てください）"] = "an error occurred (see the log)",
         ["自分専用モデル（{0}）"] = "Your own model ({0})",
         ["自分のゲーム画面で学習させた拡大モデルを使います。くっきりと同じ仕組みで、GPU の使い方も同じです。"] = "Uses an upscaling model trained on your own game pictures. It works like Crisp and uses the GPU the same way.",
         ["自分専用"] = "own model",
@@ -842,6 +869,9 @@ internal static class L
         ["学習が終わりました（{0:0.#} 分）。"] = "Training finished ({0:0.#} min).",
         ["学習が終わりました（{0}）"] = "Training finished ({0})",
         ["学習が途中で止まりました"] = "Training stopped partway",
+        ["前回の学習の準備が最後まで終わっていません（PyTorch などを読み込めません）。準備をやり直します。"] = "The previous training setup did not finish (PyTorch and the other packages cannot be loaded). The setup will be run again.",
+        ["学習の環境を確かめています..."] = "Checking the training environment...",
+        ["学習の準備が最後まで終わっていない可能性があります。押すと確かめて、必要ならやり直します。"] = "The training setup may not have finished. Click to check it and run it again if needed.",
         ["学習が途中で止まりました。"] = "Training stopped partway.",
         ["学習する時間（分）"] = "Training time (minutes)",
         ["学習に使う絵がありません。オプション → 自分専用モデル → 学習用の絵を集める をオンにして遊んでから、もう一度どうぞ。"] = "There are no pictures to train on. Turn on Options > Your own model > Collect training pictures, play for a while, and try again.",

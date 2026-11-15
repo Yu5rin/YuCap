@@ -1,6 +1,6 @@
 ﻿# YuCap 自分専用モデル: 集めた絵で学習して、モデルを作ります（Windows PowerShell 5.1）。
 #   powershell -ExecutionPolicy Bypass -File tools\train_model.ps1 [-Name mine] [-Profile <プロファイル名>] [-Minutes 30] [-Arch M|L|S] [-Loss edge|texture]
-#   -Arch  M（既定）: ふつうの大きさ。L: より大きいネット（精度は上がるが、遊ぶときの GPU の負荷が M の約 1.5 倍）。S: 小さいネット。
+#   -Arch  M（既定）: ふつうの大きさ。L: より大きいネット（精度は上がるが、遊ぶときの GPU の負荷が M の約 1.7 倍）。S: 小さいネット。
 #   -Loss  edge（既定）: 輪郭を強く合わせる。texture: 絵の細かい模様（ざらつき・ハッチング・布目）を保つ損失（SSIM と高周波の項）。
 #   -Profile を省くと、data の下にある絵のフォルダーを全部使います（プロファイルごとのフォルダーと starter）。
 # 先に tools\setup_train_env.ps1 で学習環境を作り、YuCap の オプション → 自分専用モデル → 学習用の絵を集める で絵を集めておきます。

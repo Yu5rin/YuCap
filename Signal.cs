@@ -140,6 +140,26 @@ public sealed class SignalDetector
         }
     }
 
+    /// <summary>A frame arrived whose thumbnail answer was given up (the GPU was far behind): no verdict on the picture, but
+    /// frames are coming, so <see cref="Silent"/> must not take this stretch for "nothing arrives".</summary>
+    internal void Arrived(long tick)
+    {
+        lock (_gate) { if (_lastFeed != 0 && tick > _lastFeed) _lastFeed = tick; }
+    }
+
+    /// <summary>The thumbnails stopped for good (same-picture detection switched itself off): the state goes back to
+    /// <see cref="SignalState.Unknown"/> and stays there - with nothing fed, <see cref="Silent"/> would otherwise report
+    /// "no signal" two seconds later although the picture is live.</summary>
+    internal void Disable()
+    {
+        lock (_gate)
+        {
+            if (_state != SignalState.Unknown) _changes++;
+            _state = SignalState.Unknown;
+            _msgSince = _blackSince = _realSince = _lastHit = _noSignalSince = _lastFeed = 0; _hits = 0; _lastEmpty = false;
+        }
+    }
+
     /// <summary>Test hook: start over.</summary>
     internal void Reset() { lock (_gate) { _state = SignalState.Unknown; _msgSince = _blackSince = _realSince = _lastHit = _noSignalSince = _lastFeed = 0; _hits = 0; _lastEmpty = false; } }
 }

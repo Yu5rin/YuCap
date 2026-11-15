@@ -277,6 +277,8 @@ internal sealed class SnapshotGalleryForm : Form
         base.OnKeyDown(e);
         if (e.KeyCode == Keys.Escape)
         {
+            // An open drop-down (the folder list) closes itself on Esc; the gallery must stay open.
+            if (_folderBox.DroppedDown) return;
             if (_filter.Focused && _filter.TextLength > 0) _filter.Clear();
             else Close();
             e.Handled = true;
@@ -473,7 +475,23 @@ internal sealed class SnapshotGalleryForm : Form
             _fsw.Deleted += OnFsEvent;
             _fsw.Changed += OnFsEvent;
             _fsw.Renamed += (s, e) => OnFsEvent(s, e);
-            _fsw.Error += (_, e) => Log.Info("gallery: watcher error - " + e.GetException().Message);
+            _fsw.Error += (_, e) =>
+            {
+                // Usually a buffer overflow (many files at once): events were lost and the watcher may have stopped.
+                // Start a fresh one and rescan, or the list would stay stale until the gallery is reopened.
+                Log.Info("gallery: watcher error - " + e.GetException().Message + " - restarting it and rescanning");
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        if (IsDisposed) return;
+                        StartWatcher();
+                        _refreshTimer.Stop();
+                        _refreshTimer.Start();
+                    }));
+                }
+                catch (Exception) { /* closing */ }
+            };
             _fsw.EnableRaisingEvents = true;
         }
         catch (Exception ex)

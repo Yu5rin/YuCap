@@ -34,14 +34,65 @@ internal sealed partial class D3DRenderer
     private readonly AutoResetEvent _sGo = new(false);
     private volatile bool _sStop;
     private int _sBusy;                     // 1 from the hand-over until the worker's Present has returned
+    private volatile bool _sFailed;         // the worker's Present failed and the worker has ended: the swap chain is dead
+    private IntPtr _sWantHwnd;              // what the host asked for last (a lost swap chain is made again for it)
+    private Size _sWantSize;
+    private int _sFailures;                 // swap chains lost in a row since the host last configured the window
+    private long _sRetryAt;                 // Environment.TickCount64 at which a lost swap chain is made again (0 = none due)
+    private const int StreamMaxRetries = 3;
+    private volatile string? _sNote;
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
 
     public bool StreamActive => _ssw != null;
     public long StreamPresented => Interlocked.Read(ref _sPresented);
     public long StreamSkipped => Interlocked.Read(ref _sSkipped);
+    /// <summary>Why the stream window no longer gets pictures (its swap chain failed again and again); null while it works. Any thread.</summary>
+    public string? StreamNote => _sNote;
+    /// <summary>A stream swap chain was lost and is due to be made again (<see cref="StreamRetry"/>). Render thread.</summary>
+    public bool StreamRetryDue => _sRetryAt != 0 && Environment.TickCount64 >= _sRetryAt;
 
     /// <summary>Render thread. Open the stream window's swap chain (<paramref name="hwnd"/> 0 = close it). A change of size makes a new one.</summary>
     public void StreamConfigure(IntPtr hwnd, Size size)
+    {
+        _sWantHwnd = hwnd; _sWantSize = size;
+        _sFailures = 0; _sRetryAt = 0; _sNote = null;
+        StreamOpen(hwnd, size);
+    }
+
+    /// <summary>Render thread: make the lost stream swap chain again for the window the host asked for.</summary>
+    public void StreamRetry()
+    {
+        _sRetryAt = 0;
+        try
+        {
+            StreamOpen(_sWantHwnd, _sWantSize);
+            if (_ssw != null) Log.Info("D3D: stream window swap chain made again");
+        }
+        catch (Exception ex) { StreamLost("could not be made again - " + ex.Message.Split('\n')[0]); }
+    }
+
+    /// <summary>The stream swap chain stopped working: free it and try again a little later, a few times. A closed window is not
+    /// retried (the host configures the stream window again when it closes or opens one).</summary>
+    private void StreamLost(string why)
+    {
+        IntPtr hwnd = _sWantHwnd;
+        StreamFree();
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return;
+        _sFailures++;
+        if (_sFailures <= StreamMaxRetries)
+        {
+            _sRetryAt = Environment.TickCount64 + 1000L * _sFailures;
+            Log.Info($"D3D: stream window lost ({why}) - trying again (attempt {_sFailures} of {StreamMaxRetries})");
+        }
+        else
+        {
+            _sRetryAt = 0;
+            _sNote = "配信用ウィンドウに映像を出せなくなりました。開き直してください";
+            Log.Info($"D3D: stream window lost ({why}) - giving up");
+        }
+    }
+
+    private void StreamOpen(IntPtr hwnd, Size size)
     {
         StreamFree();
         if (hwnd == IntPtr.Zero || size.Width < 16 || size.Height < 16) return;
@@ -61,7 +112,7 @@ internal sealed partial class D3DRenderer
         _ssw = factory.CreateSwapChainForHwnd(Device, hwnd, desc);
         factory.MakeWindowAssociation(hwnd, WindowAssociationFlags.IgnoreAll);
         _sHwnd = hwnd; _sSize = size; _sHasLast = false;
-        _sPresented = 0; _sSkipped = 0; _sCpuSum = _sCpuMax = 0; _sCpuN = 0; _sPresentTicks = 0; _sBusy = 0; _sStop = false;
+        _sPresented = 0; _sSkipped = 0; _sCpuSum = _sCpuMax = 0; _sCpuN = 0; _sPresentTicks = 0; _sBusy = 0; _sStop = false; _sFailed = false;
         _sInter = Device.CreateTexture2D(new Texture2DDescription
         {
             Width = (uint)size.Width, Height = (uint)size.Height, MipLevels = 1, ArraySize = 1,
@@ -98,6 +149,7 @@ internal sealed partial class D3DRenderer
                 else if (pr.Code != unchecked((int)0x887A000A))      // DXGI_ERROR_WAS_STILL_DRAWING: skipped, the next one will do
                 {
                     if (IsWindow(hwnd)) Log.Info($"D3D: stream window present failed hr=0x{pr.Code:X8}");
+                    _sFailed = true;     // the render thread frees this swap chain at its next picture (StreamPresent)
                     Volatile.Write(ref _sBusy, 0);
                     return;
                 }
@@ -105,6 +157,7 @@ internal sealed partial class D3DRenderer
             catch (Exception ex)
             {
                 Log.Info("D3D: stream window present failed - " + ex.Message.Split('\n')[0]);
+                _sFailed = true;
                 Volatile.Write(ref _sBusy, 0);
                 return;
             }
@@ -148,6 +201,8 @@ internal sealed partial class D3DRenderer
         IDXGISwapChain1? sw = _ssw;
         Size o = _orientedSize;
         if (sw == null || _orientedSrv == null || _sLast == null || o.Width <= 0 || o.Height <= 0) return;
+        if (_sFailed) { StreamLost("present failed"); return; }
+        if (_sFailures != 0 && Interlocked.Read(ref _sPresented) >= 60) _sFailures = 0;   // it works again: a later loss starts a fresh count
         if (Volatile.Read(ref _sBusy) != 0) { Interlocked.Increment(ref _sSkipped); return; }
         int savedPre = _prescaleActiveH;
         long t0 = Stopwatch.GetTimestamp();
@@ -169,7 +224,7 @@ internal sealed partial class D3DRenderer
         catch (Exception ex)
         {
             Log.Info("D3D: stream window failed - " + ex.Message.Split('\n')[0]);
-            StreamFree();
+            StreamLost(ex.Message.Split('\n')[0]);
         }
         finally
         {

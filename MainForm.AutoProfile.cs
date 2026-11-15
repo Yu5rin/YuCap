@@ -109,6 +109,9 @@ public sealed partial class MainForm
         if (Profiles.Count < 2) { _apDecided = true; return; }
         // The user is busy with the settings: ask again later (this does not use up the one judgement per change).
         if (now - _lastUserChangeTick < AutoProfileQuietMs) return;
+        // A dialog is open (for example 映像の調整, editing the active profile's values): switching now would change
+        // what it edits, and its Cancel would write the old values over the new profile. Judge once it is closed.
+        if (ModalOpen && !_testRunning) return;
 
         _apDecided = true;
         VideoProfile? chosen = ChooseProfileFor(live, out string why);

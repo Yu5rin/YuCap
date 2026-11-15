@@ -137,7 +137,9 @@ public sealed partial class MainForm
         foreach (var i in _trainSetupItems)
         {
             i.Enabled = !ready && !_trainSetupRunning;
-            i.ToolTipText = ready ? L.T("学習の準備はできています。") : L.F("PyTorch などを {0} に入れます。押すと、入れるものを確かめてから始めます。", Path.Combine(UserModels.Root, "venv"));
+            i.ToolTipText = ready ? L.T("学習の準備はできています。")
+                : TrainEnv.Partial ? L.T("学習の準備が最後まで終わっていない可能性があります。押すと確かめて、必要ならやり直します。")
+                : L.F("PyTorch などを {0} に入れます。押すと、入れるものを確かめてから始めます。", Path.Combine(UserModels.Root, "venv"));
         }
     }
 
@@ -205,7 +207,7 @@ public sealed partial class MainForm
         string text = L.F("学習用の絵: {0} 枚", tc!.Count);
         if (_lblTrain.Text != text) _lblTrain.Text = text;
         string state = tc.State;
-        _lblTrain.ToolTipText = L.F("学習用の絵を集めています。保存先: {0}\n{1:0.0} GB（上限 {2} GB）", tc.Folder, tc.Bytes / 1073741824.0, _settings.TrainCapGb)
+        _lblTrain.ToolTipText = L.F("学習用の絵を集めています。保存先: {0}\nすべてのプロファイルで {1:0.0} GB（上限 {2} GB）", tc.Folder, tc.TotalBytes / 1073741824.0, _settings.TrainCapGb)
             + (state.Length > 0 ? "\n" + L.F("今は待っています: {0}", StateText(state)) : string.Empty);
     }
 
@@ -217,6 +219,9 @@ public sealed partial class MainForm
         "same view" => L.T("似た絵を保存済み"),
         "looking" => L.T("様子を見ています"),
         "disk almost full" => L.T("ディスクの空きが少ない"),
+        "folder" => L.T("保存先のフォルダーを使えません"),
+        "no picture" => L.T("映像から絵を取り出せません"),
+        "error" => L.T("エラーが起きました（ログを見てください）"),
         _ => state,
     };
 

@@ -141,7 +141,13 @@ public sealed partial class MainForm
             if (can && _settings.StreamWindowOpen && _video.IsRunning) OpenStreamWindow();
             return;
         }
-        if (!can) { CloseStreamWindow(forget: false); return; }
+        if (!can)
+        {
+            CloseStreamWindow(forget: false);
+            // Otherwise it just vanishes, and an OBS scene capturing it goes blank with no hint why.
+            ShowOsd(L.T("配信用ウィンドウを閉じました。Direct3D 描画に戻すと、また開きます"), OsdLongMilliseconds);
+            return;
+        }
         if (_settings.StreamWindowSize == StreamSizes.Video && _video.IsRunning)
         {
             Size want = StreamWantedSize();
