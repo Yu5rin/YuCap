@@ -6,14 +6,14 @@ using System.Threading.Tasks;
 
 namespace YuCap;
 
-/// <summary>Test mode: the なめらか ⇔ 低遅延 switch, and the profile auto-switch's matcher.</summary>
+/// <summary>Test mode: 映像の出し方 (標準 / なめらか / 低遅延), and the profile auto-switch's matcher.</summary>
 public sealed partial class MainForm
 {
-    /// <summary>Switch to 低遅延 and back to なめらか, as the hotkey does. Each switch must land in the right state, keep
-    /// fullscreen and be showing pictures again within about 2 seconds.</summary>
+    /// <summary>Switch to 低遅延 and back to なめらか, as the hotkey does, then to 標準 and back to なめらか, as the menu does. Each
+    /// switch must land in the right state, keep fullscreen and be showing pictures again within about 2 seconds.</summary>
     private async Task FeatureStyle(TestSection sec, CaptureMode? mode)
     {
-        var item = new TestItem { Name = "なめらか ⇔ 低遅延の切り替え" };
+        var item = new TestItem { Name = "映像の出し方の切り替え（標準・なめらか・低遅延）" };
         EnsureEngine(false, mode);
         if (!CanSwitchStyle)
         {
@@ -29,14 +29,15 @@ public sealed partial class MainForm
 
         bool allOk = true, slow = false;
         var notes = new List<string>();
-        for (int n = 0; n < 2; n++)
+        PlayStyle[] targets = { PlayStyle.LowLatency, PlayStyle.Smooth, PlayStyle.Standard, PlayStyle.Smooth };
+        for (int n = 0; n < targets.Length; n++)
         {
-            bool toLow = n == 0;
-            string label = toLow ? "なめらか → 低遅延" : "低遅延 → なめらか";
+            PlayStyle target = targets[n];
+            string label = $"{StyleName(CurrentStyle)} → {StyleName(target)}";
             long t0 = Stopwatch.GetTimestamp();
             bool done;
             _devOpBusy++;
-            try { done = await SwitchStyleAsync(); }
+            try { done = await SwitchStyleAsync(target); }
             finally { _devOpBusy--; }
             double switchMs = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
 
@@ -51,7 +52,9 @@ public sealed partial class MainForm
             double totalMs = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
 
             PlayStyle now = CurrentStyle;
-            bool stateOk = toLow ? _settings.LowLatency && _video.LowLatency : !_settings.LowLatency && !_video.LowLatency && _settings.Interpolation;
+            bool stateOk = now == target && (target == PlayStyle.LowLatency
+                ? _settings.LowLatency && _video.LowLatency
+                : !_settings.LowLatency && !_video.LowLatency && _settings.Interpolation == (target == PlayStyle.Smooth));
             bool fsOk = _isFullscreen == fsBefore;
             InterpolationStatus? st = _video.InterpolationState;
             string interp = st == null ? "?" : st.Active ? "働いています" : InterpIdleText(st);
@@ -68,7 +71,7 @@ public sealed partial class MainForm
             : slow ? "切り替わりますが、2 秒より時間がかかりました" : "切り替えは速く、切り替え後すぐに映像が出ます";
         item.Explanation = !allOk
             ? "切り替え後の設定（低遅延・補間）、映像が出ているか、全画面のままかのどれかが期待と違いました。"
-            : $"ホットキー（既定 Ctrl+Alt+L）や映像メニューと同じ動きで、低遅延 → なめらかの順に切り替えました（{string.Join("、", notes)}）。時間は、操作してから新しいコマが画面に出始めるまでです。";
+            : $"映像 → 映像の出し方 と同じ動きで、低遅延 → なめらか → 標準 → なめらか の順に切り替えました（{string.Join("、", notes)}）。時間は、操作してから新しいコマが画面に出始めるまでです。";
         sec.Items.Add(item);
     }
 

@@ -59,7 +59,7 @@ internal sealed class SnapshotGalleryForm : Form
     private readonly ComboBox _folderBox = new();
     private readonly Label _count = new() { AutoSize = true };
     private readonly Label _status = new() { AutoSize = true };
-    private readonly Button _bCopy = new(), _bReveal = new(), _bOpen = new(), _bRename = new(), _bDelete = new();
+    private readonly UiButton _bCopy = new(), _bReveal = new(), _bOpen = new(), _bRename = new(), _bDelete = new();
     private readonly System.Windows.Forms.Timer _filterTimer = new() { Interval = 160 };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 450 };
     private readonly System.Windows.Forms.Timer _previewTimer = new() { Interval = 120 };
@@ -102,14 +102,13 @@ internal sealed class SnapshotGalleryForm : Form
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        var lblFilter = Ui.Label(L.T("フィルター:"), 0, 0);
+        var lblFilter = Ui.Caption(L.T("フィルター:"));
         lblFilter.Anchor = AnchorStyles.Left; lblFilter.Margin = new Padding(0, 0, Ui.Gap, 0);
         _filter.Anchor = AnchorStyles.Left | AnchorStyles.Right; _filter.Margin = new Padding(0, 3, Ui.Gap * 2, 3);
-        _filter.BackColor = Ui.Colors.Surface; _filter.ForeColor = Ui.Colors.Text; _filter.BorderStyle = BorderStyle.FixedSingle;
-        var lblFolder = Ui.Label(L.T("フォルダ:"), 0, 0);
+        // colours, borders and the drop-down are themed with the rest of the window (Ui.ApplyTheme in OnLoad)
+        var lblFolder = Ui.Caption(L.T("フォルダー:"));
         lblFolder.Anchor = AnchorStyles.Left; lblFolder.Margin = new Padding(0, 0, Ui.Gap, 0);
-        _folderBox.DropDownStyle = ComboBoxStyle.DropDownList; _folderBox.FlatStyle = FlatStyle.Flat;
-        _folderBox.BackColor = Ui.Colors.Surface; _folderBox.ForeColor = Ui.Colors.Text;
+        _folderBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _folderBox.Width = 200; _folderBox.Anchor = AnchorStyles.Left; _folderBox.Margin = new Padding(0, 3, Ui.Gap * 2, 3);
         _count.Anchor = AnchorStyles.Right; _count.Margin = Padding.Empty; _count.ForeColor = Ui.Colors.SubText;
         top.Controls.Add(lblFilter, 0, 0);
@@ -159,7 +158,7 @@ internal sealed class SnapshotGalleryForm : Form
 
         var root0 = new TableLayoutPanel
         {
-            ColumnCount = 1, RowCount = 3, Dock = DockStyle.Fill, Padding = new Padding(12), Margin = Padding.Empty,
+            ColumnCount = 1, RowCount = 3, Dock = DockStyle.Fill, Padding = new Padding(Ui.Pad), Margin = Padding.Empty,
         };
         root0.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root0.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -181,7 +180,7 @@ internal sealed class SnapshotGalleryForm : Form
         _menu.Items.Add(new ToolStripMenuItem(L.T("削除..."), null, (_, _) => DeleteSelected(true)) { ShortcutKeyDisplayString = "Del" });
 
         // ---- wiring ----
-        _grid.RootTitle = L.T("（保存先フォルダ直下）");
+        _grid.RootTitle = L.T("（保存先フォルダー直下）");
         _grid.EmptyText = L.T("読み込み中...");
         _grid.ThumbLookup = e => _thumbs.TryGetValue(ThumbKey(e), out Bitmap? b) ? b : null;
         _grid.ThumbFailed = e => _failed.ContainsKey(ThumbKey(e));
@@ -217,19 +216,12 @@ internal sealed class SnapshotGalleryForm : Form
         _preview.EmptyText = L.T("画像を選ぶとここに表示されます");
     }
 
-    private void StyleButton(Button b, string text)
+    private static void StyleButton(UiButton b, string text)
     {
+        // A dark Ui button: its disabled caption (nothing selected, the opening state) stays readable.
         b.Text = text;
-        b.FlatStyle = FlatStyle.Flat;
-        b.UseVisualStyleBackColor = false;
-        b.BackColor = Ui.Colors.Surface;
-        b.ForeColor = Ui.Colors.Text;
-        b.FlatAppearance.BorderColor = Ui.Colors.Border;
-        b.FlatAppearance.MouseOverBackColor = Ui.Colors.Hover;
-        b.FlatAppearance.MouseDownBackColor = Ui.Colors.Hover;
         b.AutoSize = true;
         b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        b.MinimumSize = new Size(Ui.ButtonWidth, Ui.ButtonHeight);
         b.Margin = new Padding(0, 0, Ui.Gap, 0);
     }
 
@@ -248,6 +240,7 @@ internal sealed class SnapshotGalleryForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+        Ui.ApplyTheme(this);
         // At a large scaling the requested size can exceed the screen: keep the window on it.
         try
         {
@@ -390,8 +383,8 @@ internal sealed class SnapshotGalleryForm : Form
         try
         {
             _folderBox.Items.Clear();
-            _folderBox.Items.Add(new FolderItem { Folder = null, Text = L.T("すべてのフォルダ") });
-            if (hasRoot && folders.Count > 0) _folderBox.Items.Add(new FolderItem { Folder = string.Empty, Text = L.T("（保存先フォルダ直下）") });
+            _folderBox.Items.Add(new FolderItem { Folder = null, Text = L.T("すべてのフォルダー") });
+            if (hasRoot && folders.Count > 0) _folderBox.Items.Add(new FolderItem { Folder = string.Empty, Text = L.T("（保存先フォルダー直下）") });
             foreach (string f in folders) _folderBox.Items.Add(new FolderItem { Folder = f, Text = f });
             int sel = 0;
             for (int i = 0; i < _folderBox.Items.Count; i++)
@@ -778,7 +771,7 @@ internal sealed class SnapshotGalleryForm : Form
         catch (Exception ex)
         {
             Log.Info("gallery: open failed - " + ex);
-            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, Errors.Describe(ex), MsgKind.Warning);
         }
     }
 
@@ -793,7 +786,7 @@ internal sealed class SnapshotGalleryForm : Form
         catch (Exception ex)
         {
             Log.Info("gallery: reveal failed - " + ex);
-            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, Errors.Describe(ex), MsgKind.Warning);
         }
     }
 
@@ -817,7 +810,7 @@ internal sealed class SnapshotGalleryForm : Form
         {
             string text = sel.Count == 1 ? L.F("「{0}」をごみ箱に移動しますか？", sel[0].Name) : L.F("選んだ {0} 枚をごみ箱に移動しますか？", sel.Count);
             if (sel.Any(e => !RecycleSupported(e.Path))) text += "\n\n" + L.T("ごみ箱が使えない場所にあるファイルは、完全に削除されます。");
-            if (MessageBox.Show(this, text, "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            if (Ui.Message(this, text, MsgKind.Warning, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
                 return 0;
         }
         int first = _grid.FirstSelectedIndex, done = 0;
@@ -839,7 +832,7 @@ internal sealed class SnapshotGalleryForm : Form
         _afterScanSelectIndex = first;
         _ = RescanAsync();
         if (err != null && confirm)
-            MessageBox.Show(this, L.F("削除できませんでした。\n\n{0}", err), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("削除できませんでした。\n\n{0}", err), MsgKind.Warning);
         else if (done > 0)
             SetStatus(L.F("{0} 枚をごみ箱に移動しました", done));
         return done;
@@ -850,18 +843,15 @@ internal sealed class SnapshotGalleryForm : Form
         var sel = _grid.Selected.ToList();
         if (sel.Count != 1) return;
         GalleryEntry en = sel[0];
-        using var dlg = Ui.NewDialog(L.T("名前を変更"), 420, 160);
+        using var dlg = Ui.NewDialog(L.T("名前を変更"), 420);
         var stack = Ui.Stack();
-        var lbl = Ui.Label(L.T("新しい名前（拡張子は変わりません）:"), 0, 0);
-        lbl.Margin = new Padding(0, 0, 0, Ui.Gap / 2);
-        var box = new TextBox { Text = en.Title, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, Ui.Gap) };
-        var err = Ui.FlowHint(string.Empty);
-        err.ForeColor = Color.Firebrick;
-        stack.Controls.Add(lbl);
-        stack.Controls.Add(box);
-        stack.Controls.Add(err);
+        stack.Add(Ui.Caption(L.T("新しい名前（拡張子は変わりません）:")));
+        var box = stack.Add(new TextBox { Text = en.Title }, before: 4);
+        var err = stack.Add(Ui.Hint(string.Empty), before: 4);   // one line kept for the reason a name is refused
+        err.ForeColor = Ui.Colors.Danger;
         Ui.FrameOkCancel(dlg, stack);
-        dlg.Shown += (_, _) => { box.Focus(); box.SelectAll(); };
+        dlg.InitialFocus = box;
+        dlg.Shown += (_, _) => box.SelectAll();
         dlg.FormClosing += (_, e) =>
         {
             if (dlg.DialogResult != DialogResult.OK) return;

@@ -27,6 +27,17 @@ public sealed partial class MainForm
             CollectTexts(_ctx.Items, texts);
             sb.AppendLine("== 項目名の集合 ==");
             foreach (string t in texts) sb.AppendLine(t);
+            UpdateChecks();
+            var mirror = new List<string>();
+            int mm = CountMirrorMismatches(mirror);
+            sb.AppendLine($"== 右クリックとメニューバーの状態の食い違い: {mm} ==");
+            foreach (string m in mirror) sb.AppendLine(m);
+            if (en)
+            {
+                List<string> ja = UntranslatedMenuTexts();
+                sb.AppendLine($"== 英訳のない項目: {ja.Count} ==");
+                foreach (string t in ja) sb.AppendLine(t);
+            }
         }
         L.English = keep;
         return sb.ToString();
@@ -39,7 +50,12 @@ public sealed partial class MainForm
         {
             if (it is ToolStripSeparator) { sb.AppendLine(pad + "---"); continue; }
             string key = it is ToolStripMenuItem { ShortcutKeyDisplayString: { Length: > 0 } k } ? "  [" + k + "]" : string.Empty;
-            sb.AppendLine(pad + it.Text + key);
+            // (●) / ( ) choose-one, [✓] a toggle that is on; {無効} greyed out, {非表示} hidden
+            string mark = it is ToolStripMenuItem mm
+                ? mm.AccessibleRole == AccessibleRole.RadioButton ? (mm.Checked ? "(●) " : "( ) ") : mm.Checked ? "[✓] " : string.Empty
+                : string.Empty;
+            string state = (it.Enabled ? string.Empty : " {無効}") + (it.Available ? string.Empty : " {非表示}");
+            sb.AppendLine(pad + mark + it.Text + key + state);
             if (it is ToolStripMenuItem mi && mi.DropDownItems.Count > 0) DumpItems(sb, mi.DropDownItems, depth + 1);
         }
     }

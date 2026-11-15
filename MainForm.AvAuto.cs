@@ -105,7 +105,7 @@ public sealed partial class MainForm
     private string AvAutoStatusText()
     {
         if (!_video.IsRunning || !_audio.IsRunning) return L.T("映像か音声が動いていないため、待機しています");
-        if (!_video.SupportsVideoDelay) return L.T("標準の描画では映像の遅れを測れないため、自動では合わせられません（映像 → 描画方式で Direct3D にしてください）");
+        if (!_video.SupportsVideoDelay) return L.T("互換（Media Foundation）描画では映像の遅れを測れないため、自動では合わせられません（映像 → 描画方式で Direct3D にしてください）");
         if (_avLimitSide > 0) return L.T("補正できる範囲の端に達しています");
         if (_avCtl.Converged) return L.T("合っています（動かさずに見守っています）");
         if (double.IsNaN(_avCtl.LastMedian)) return L.T("測定中です（数秒かかります）");

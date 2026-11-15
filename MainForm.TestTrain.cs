@@ -60,7 +60,7 @@ public sealed partial class MainForm
             {
                 it.Verdict = problems.Count == 0 ? Verdict.Info : Verdict.Ng;
                 it.Summary = problems.Count == 0 ? "学習の環境（venv）がないため、python を動かす確認はしませんでした" : $"{problems.Count} か所に問題があります";
-                it.Explanation = problems.Count == 0 ? "オプション → 自分専用モデル → 学習の準備をする で環境を作ると、開始と中止まで確認できます。" : string.Join("\n", problems);
+                it.Explanation = problems.Count == 0 ? "映像 → 自分専用モデル → 学習の準備をする で環境を作ると、開始と中止まで確認できます。" : string.Join("\n", problems);
                 sec.Items.Add(it);
                 return;
             }

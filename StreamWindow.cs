@@ -122,6 +122,7 @@ internal sealed class StreamForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        Ui.DarkTitleBar(Handle);   // the same dark title bar as every other YuCap window
         if (ClientSize != _want) ClientSize = _want;
     }
 

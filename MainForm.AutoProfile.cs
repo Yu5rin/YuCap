@@ -185,8 +185,8 @@ public sealed partial class MainForm
         };
         void Add(string key, string label)
         {
-            m.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) => SetAutoProfileMode(key))
-            { Checked = _settings.AutoProfileMode == key });
+            m.DropDownItems.Add(Radio(new ToolStripMenuItem(label, null, (_, _) => SetAutoProfileMode(key))
+            { Tag = key, Checked = _settings.AutoProfileMode == key }));
         }
         Add("off", L.T("オフ"));
         Add("ask", L.T("確認する"));

@@ -449,8 +449,7 @@ internal static partial class Program
             }
             if (!SingleInstance.ActivateExisting(args))
             {
-                MessageBox.Show(L.T("YuCap は既に起動しています。"), "YuCap",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Ui.Message(null, L.T("YuCap は既に起動しています。"), MsgKind.Info, native: true);
             }
             return;
         }
@@ -540,9 +539,8 @@ internal static partial class Program
                 // means nothing to a user. Full detail still goes to error.log below.
                 string text = L.F("予期しないエラーが発生しました。\n\n{0}\n\n詳細は error.log に記録しました。同じエラーがまた起きたときは、表示せずに記録だけします。\n\nYuCap を終了しますか？（［いいえ］で使い続けます）",
                     Errors.Describe(ex));
-                DialogResult answer = owner != null
-                    ? MessageBox.Show(owner, text, "YuCap - " + L.T("エラー"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2)
-                    : MessageBox.Show(text, "YuCap - " + L.T("エラー"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                // The system box (native), not the app's own dark one: the app's drawing may be what just failed.
+                DialogResult answer = Ui.Message(owner, text, MsgKind.Error, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2, native: true);
                 if (answer == DialogResult.Yes)
                 {
                     Log.Info("quitting after an unexpected error (user's choice)");
@@ -682,7 +680,7 @@ internal static partial class Program
         }
         else
         {
-            MessageBox.Show(text, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(null, text, MsgKind.Error, native: true);   // before any window exists
         }
         Environment.ExitCode = 2;
     }

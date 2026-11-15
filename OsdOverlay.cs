@@ -16,9 +16,11 @@ public sealed class OsdOverlay : OverlayControl
     // maxWidth (a small PiP window), where the larger size would force
     // excessive wrapping or simply not fit.
     // Sizes are in pixels (16px = 12pt, 12px = 9pt at 96 DPI) times a scale that follows the
-    // monitor's DPI and the size of the video area (see TextScale).
-    private Font _fontNormal = TextScale.MakeFont("Segoe UI", 16f, 1f, FontStyle.Bold);
-    private Font _fontSmall = TextScale.MakeFont("Segoe UI", 12f, 1f, FontStyle.Bold);
+    // monitor's DPI and the size of the video area (see TextScale). The UI font family (Yu Gothic UI on
+    // Japanese Windows) has a real bold for Japanese too: with Segoe UI the kana fell back to a regular face
+    // next to bold Latin.
+    private Font _fontNormal = TextScale.MakeFont(Ui.FamilyName, 16f, 1f, FontStyle.Bold);
+    private Font _fontSmall = TextScale.MakeFont(Ui.FamilyName, 12f, 1f, FontStyle.Bold);
     private const int SmallMaxWidthThreshold = 360;
 
     private Font _font;
@@ -56,8 +58,8 @@ public sealed class OsdOverlay : OverlayControl
         bool small = ReferenceEquals(_font, _fontSmall);
         _scale = scale;
         Font n = _fontNormal, s = _fontSmall;
-        _fontNormal = TextScale.MakeFont("Segoe UI", 16f, scale, FontStyle.Bold);
-        _fontSmall = TextScale.MakeFont("Segoe UI", 12f, scale, FontStyle.Bold);
+        _fontNormal = TextScale.MakeFont(Ui.FamilyName, 16f, scale, FontStyle.Bold);
+        _fontSmall = TextScale.MakeFont(Ui.FamilyName, 12f, scale, FontStyle.Bold);
         _font = small ? _fontSmall : _fontNormal;
         n.Dispose(); s.Dispose();
         if (Showing && !string.IsNullOrEmpty(Text)) ShowText(Text, _lastMaxWidth, _clickable);
@@ -93,7 +95,9 @@ public sealed class OsdOverlay : OverlayControl
     internal override void PaintOverlay(Graphics g, bool offscreen)
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        using var back = new SolidBrush(TestBack ?? Color.FromArgb(215, 20, 20, 20));
+        // Greyscale antialiasing: ClearType's colour fringes do not survive the blend over the video.
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        using var back = new SolidBrush(TestBack ?? Ui.Colors.OverlayBack);
         if (offscreen)
         {
             using var path = Rounded(new Rectangle(0, 0, Width, Height), TextScale.Px(10, _scale));
@@ -108,13 +112,34 @@ public sealed class OsdOverlay : OverlayControl
 
         if (_clickable)
         {
-            // Thin accent underline under the last line, so a clickable bubble
-            // reads as a link rather than just another status flip.
+            // Thin accent underline under the last line (only as long as that line), so a clickable
+            // bubble reads as a link rather than just another status flip.
             Size textSz = TextRenderer.MeasureText(g, Text, _font, textRect.Size, flags);
             int lineY = padY + textSz.Height;
+            int lastW = Math.Min(LastLineWidth(g, textRect.Width, flags), textRect.Width);
             using var pen = new Pen(Ui.Colors.Accent, 1.5f * _scale);
-            g.DrawLine(pen, padX, lineY, padX + Math.Min(textSz.Width, textRect.Width), lineY);
+            g.DrawLine(pen, padX, lineY, padX + lastW, lineY);
         }
+    }
+
+    /// <summary>Width of the last line of the wrapped text: the longest prefix that still takes one line fewer is found
+    /// by bisection, and what follows it is measured on its own.</summary>
+    private int LastLineWidth(Graphics g, int width, TextFormatFlags flags)
+    {
+        string text = Text;
+        var box = new Size(width, int.MaxValue);
+        int full = TextRenderer.MeasureText(g, text, _font, box, flags).Height;
+        int line = TextRenderer.MeasureText(g, "Ag", _font, box, flags).Height;
+        if (line <= 0 || full <= line + line / 2) return TextRenderer.MeasureText(g, text, _font, box, flags).Width;
+        int lo = 0, hi = text.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            int h = TextRenderer.MeasureText(g, text[..mid], _font, box, flags).Height;
+            if (h < full) lo = mid; else hi = mid - 1;
+        }
+        string last = text[lo..].TrimStart();
+        return TextRenderer.MeasureText(g, last, _font, box, flags | TextFormatFlags.SingleLine).Width;
     }
 
     private static GraphicsPath Rounded(Rectangle r, int radius)

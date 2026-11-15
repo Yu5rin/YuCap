@@ -131,8 +131,8 @@ internal sealed class TestOptions
 /// <summary>The caption bar shown over the video while the test runs (a child control like InfoOverlay).</summary>
 internal sealed class TestCaption : OverlayControl
 {
-    private Font _font = TextScale.MakeFont("Segoe UI", 16f, 1f, FontStyle.Bold);
-    private Font _small = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, 1f, FontStyle.Regular);
+    private Font _font = TextScale.MakeFont(Ui.FamilyName, 16f, 1f, FontStyle.Bold);
+    private Font _small = TextScale.MakeFont(Ui.FamilyName, 10f * 96 / 72, 1f, FontStyle.Regular);
     private string _hint = string.Empty;
     private float _scale = 1f;
 
@@ -152,8 +152,8 @@ internal sealed class TestCaption : OverlayControl
         if (Math.Abs(scale - _scale) < 0.001f) return;
         _scale = scale;
         Font f = _font, s = _small;
-        _font = TextScale.MakeFont("Segoe UI", 16f, scale, FontStyle.Bold);
-        _small = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, scale, FontStyle.Regular);
+        _font = TextScale.MakeFont(Ui.FamilyName, 16f, scale, FontStyle.Bold);
+        _small = TextScale.MakeFont(Ui.FamilyName, 10f * 96 / 72, scale, FontStyle.Regular);
         f.Dispose(); s.Dispose();
         Height = TextScale.Px(40, scale);
         Changed();
@@ -246,32 +246,19 @@ public sealed partial class MainForm
         List<DisplayInfo> all = Displays.List();
         if (all.Count == 0) return;
 
-        using var dlg = Ui.NewDialog(L.T("テストモード（自動試験）"), 480, 300);
+        using var dlg = Ui.NewDialog(L.T("テストモード（自動試験）"), 480);
         var stack = Ui.Stack();
-        var lbl = Ui.Label(L.T("試験するモニター:"), 0, 0);
-        lbl.Margin = new Padding(0, 0, 0, Ui.Gap / 2);
-        var combo = new ComboBox
-        {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Anchor = AnchorStyles.Left | AnchorStyles.Right,
-            Margin = new Padding(0, 0, 0, Ui.Gap * 2),
-        };
+        stack.Add(Ui.Caption(L.T("試験するモニター:")));
+        var combo = stack.Add(Ui.Combo(), before: 4);
         foreach (DisplayInfo d in all) combo.Items.Add(d.MenuLabel());
         combo.SelectedIndex = Math.Max(0, all.IndexOf(DefaultTestDisplay(all)));
 
         int modes = _video.IsRunning ? Math.Max(8, _video.GetModes().Count) : 20;
         int minutes = (int)Math.Ceiling((90 + modes * 8 + 10 * 11 + 70 + 60) / 60.0);
-        var est = Ui.Label(L.F("所要時間の目安: 約 {0} 分", minutes), 0, 0);
-        est.Margin = new Padding(0, 0, 0, Ui.Gap);
-        var note = Ui.FlowHint(L.T("試験中は画面が何度も切り替わります。Esc でいつでも中止できます。終了すると設定は元に戻ります。"));
-        note.Margin = new Padding(0, 0, 0, Ui.Gap);
-        var where = Ui.FlowHint(L.T("レポートは「ピクチャ」フォルダの YuCap\\テストレポート に保存されます。"));
-        stack.Controls.Add(lbl);
-        stack.Controls.Add(combo);
-        stack.Controls.Add(est);
-        stack.Controls.Add(note);
-        stack.Controls.Add(where);
-        Ui.FrameOkCancel(dlg, stack, false, L.T("開始"));
+        stack.Add(Ui.Text(L.F("所要時間の目安: 約 {0} 分", minutes)), before: Ui.Pad);
+        stack.Add(Ui.Hint(L.T("試験中は画面が何度も切り替わります。Esc でいつでも中止できます。終了すると設定は元に戻ります。")), before: Ui.Gap);
+        stack.Add(Ui.Hint(L.T("レポートは「ピクチャ」フォルダの YuCap\\テストレポート に保存されます。")), before: Ui.Gap);
+        Ui.FrameOkCancel(dlg, stack, L.T("開始"));
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         var opt = new TestOptions { Target = all[Math.Clamp(combo.SelectedIndex, 0, all.Count - 1)] };
@@ -414,7 +401,7 @@ public sealed partial class MainForm
         if (!before.Fullscreen && _isFullscreen) ExitFullscreen(userAction: false);
         else if (before.Fullscreen && _isFullscreen) PlaceFullscreen();
         if (before.Pip && !_isPip) EnterPip();
-        TopMost = _isFullscreen || _isPip || _alwaysOnTop;
+        ApplyTopmost();   // the same rule as everywhere else (fullscreen gives way to another app on its monitor)
 
         _testRunning = false;   // from here on settings may be saved again
         ApplyTrainFeatures();   // the user model and the picture collector come back as the user had them
@@ -596,7 +583,7 @@ public sealed partial class MainForm
         {
             Name = "補間した映像の見た目の好み", Verdict = Verdict.Info,
             Summary = "補間の正しさは3の項目で数字にしています。ぬるぬるした動きが好みかどうかは、ご自身で。",
-            Explanation = "【測れない理由】フレーム補間は動きがなめらかになる代わりに、映画のような「コマの間」の感じが薄れ、映像が少し遅れます。この感じ方の良し悪しは人によって違うため、数字では決められません。好みでなければ、メニューの「フレーム補間」をオフにしてください。",
+            Explanation = "【測れない理由】フレーム補間は動きがなめらかになる代わりに、映画のような「コマの間」の感じが薄れ、映像が少し遅れます。この感じ方の良し悪しは人によって違うため、数字では決められません。好みでなければ、映像 → 映像の出し方 を「標準」か「低遅延」にしてください。",
         });
         secManual.Items.Add(new TestItem
         {
@@ -822,7 +809,7 @@ public sealed partial class MainForm
             .Num("Windows", TestProbes.OsDescription())
             .Num(".NET", System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription)
             .Num("言語設定", _testSaved?.Language == "en" ? "English" : "日本語")
-            .Num("元の描画方式", _testSaved?.Renderer == "d3d" ? "Direct3D" : "標準（Media Foundation）"));
+            .Num("元の描画方式", _testSaved?.Renderer == "d3d" ? "Direct3D" : "互換（Media Foundation）"));
 
         GpuInfo gpu = TestProbes.QueryGpu();
         sec.Items.Add(new TestItem { Name = "GPU", Verdict = Verdict.Info }
@@ -1322,10 +1309,10 @@ public sealed partial class MainForm
             "1. テレビ: ゲームモードにして、VRR（機種により「VRR」「可変リフレッシュレート」）をオンにします。Hisense のテレビは、設定のゲームモード／VRR の項目です。\n" +
             "2. GPU のドライバ: NVIDIA は、NVIDIA コントロールパネル → G-SYNC の設定 → 「G-SYNC 互換を有効にする」にチェックを入れ、「ウィンドウモードと全画面モードで有効にする」を選びます。AMD は、Radeon 設定 → ディスプレイ → AMD FreeSync をオンにします。\n" +
             "3. Windows: 設定 → システム → ディスプレイ → グラフィックス → 既定のグラフィックス設定 で、「可変リフレッシュレート」と「ウィンドウ化されたゲームの最適化」をオンにします。\n" +
-            "4. YuCap: VRR を使うのは低遅延モードのときだけです。映像 → 低遅延モードをオンにしてください（オフのときは Windows が画面を合成するため、VRR は効きません）。\n" +
+            "4. YuCap: VRR を使うのは映像の出し方が低遅延のときだけです。映像 → 映像の出し方 → 低遅延 を選んでください（オフのときは Windows が画面を合成するため、VRR は効きません）。\n" +
             "設定を変えたあと、もう一度試験すると、効いているかを確かめられます。";
         it.Explanation = onWorks && !offWorks
-            ? "低遅延モードをオンにしたときだけ VRR が効きました。VRR を使いたいときは、映像 → 低遅延モードをオンにしてください。"
+            ? "低遅延にしたときだけ VRR が効きました。VRR を使いたいときは、映像 → 映像の出し方 → 低遅延 を選んでください。"
             : onWorks
                 ? "VRR が効く設定があります。どの設定かは上の各項目を見てください。"
                 : "VRR が効いている設定は確認できませんでした。120 fps のように、モニターの更新（例: 144 Hz）の整数倍にならない映像は、固定のリフレッシュレートでは 1 コマが 1 回か 2 回の更新で出るため、約 2 割のコマが長く見えます（軽いカクつき）。これは VRR が効いていないときの普通の動きで、故障ではありません。\n" + steps +
@@ -1556,7 +1543,7 @@ public sealed partial class MainForm
             {
                 item.Verdict = Verdict.Warn;
                 item.Summary = "文字の大きさに注意";
-                item.Explanation = string.Join(" ", problems) + "「表示」メニューの「表示の文字の大きさ」で変えられます。";
+                item.Explanation = string.Join(" ", problems) + "「表示」メニューの「情報表示・通知の文字の大きさ」で変えられます。";
             }
         }
         finally
@@ -2047,7 +2034,7 @@ public sealed partial class MainForm
         if (_audio.IsRunning) item.Num("音の途切れ（測定中）", latDrops == 0 ? "なし" : $"{latDrops} 回");
         item.Num("音ズレ補正の設定", _settings.AvOffsetMs == 0 ? "なし" : _settings.AvOffsetMs > 0 ? $"音を {_settings.AvOffsetMs} ms 遅らせる" : $"音を {-_settings.AvOffsetMs} ms 早める（映像を遅らせる）");
         if (videoOk && _testSaved is { Renderer: not "d3d" })
-            item.Num("描画方式", "この項目は Direct3D で測りました（普段の設定は標準（Media Foundation）です。Media Foundation では映像の遅れを測れないため）");
+            item.Num("描画方式", "この項目は Direct3D で測りました（普段の設定は互換（Media Foundation）です。Media Foundation では映像の遅れを測れないため）");
         item.Summary = summary;
         if (latDrops > 0)
         {
@@ -2066,7 +2053,7 @@ public sealed partial class MainForm
     //  9. dialogs
     // =============================================================================================
 
-    private sealed record DialogRow(int Index, string Title, bool English, List<string> Problems, int Dpi, Size Client);
+    private sealed record DialogRow(int Index, string Title, bool English, List<string> Problems, int Dpi, Size Client, string? Image = null);
     private readonly List<DialogRow> _dlgRows = new();
     private int _dlgIndex;
 
@@ -2079,34 +2066,52 @@ public sealed partial class MainForm
         return t.Length > 0 ? $"{n}「{t}」" : n;
     }
 
+    /// <summary>Every visible control, at every depth: inside its parent, not on top of a sibling, and at least as large as
+    /// it says it needs at the width it was given (its own preferred size - the same measurement it paints with, so a
+    /// caption that wraps onto a line its height hides is caught, which a hand-made estimate missed).</summary>
     private static void AuditControls(Control parent, List<string> problems)
     {
-        var kids = parent.Controls.Cast<Control>().Where(c => c.Visible).ToList();
+        var kids = parent.Controls.Cast<Control>().Where(c => c.Visible && Ui.IsShown(c)).ToList();
         Rectangle client = parent.ClientRectangle;
+        bool scrolls = parent is ScrollableControl { AutoScroll: true };
         foreach (Control c in kids)
         {
-            if (c.Left < -1 || c.Top < -1 || c.Right > client.Width + 1 || c.Bottom > client.Height + 1)
+            if (!scrolls && (c.Left < -1 || c.Top < -1 || c.Right > client.Width + 1 || c.Bottom > client.Height + 1))
                 problems.Add($"{Describe(c)} が枠からはみ出しています（{c.Bounds.X},{c.Bounds.Y} {c.Bounds.Width}x{c.Bounds.Height} / 枠 {client.Width}x{client.Height}）");
 
-            // text that does not fit its own control
             try
             {
-                if (c is Button b && b.Text.Length > 0)
+                Size need = Size.Empty;
+                bool checkWidth = false;
+                switch (c)
                 {
-                    int tw = TextRenderer.MeasureText(b.Text, b.Font).Width;
-                    if (tw > b.Width - 8) problems.Add($"{Describe(c)} の文字が切れます（文字 {tw}px / ボタン {b.Width}px）");
+                    case UiButton or UiCheck:
+                        need = c.GetPreferredSize(new Size(c.Width, 0));
+                        checkWidth = true;
+                        break;
+                    case ButtonBase b when b.Text.Length > 0:
+                        need = b.GetPreferredSize(new Size(b.AutoSize ? 0 : b.Width, 0));
+                        checkWidth = b is Button || b.AutoSize;
+                        break;
+                    case Label l when l.Text.Length > 0:
+                        need = l.AutoSize ? l.GetPreferredSize(Size.Empty) : l.GetPreferredSize(new Size(l.Width, 0));
+                        checkWidth = l.AutoSize;
+                        break;
+                    case TextBox { Multiline: false } tb:
+                        need = new Size(0, tb.PreferredHeight);
+                        break;
+                    case UiTable t when !scrolls:
+                        need = t.GetPreferredSize(new Size(t.Width, 0));
+                        break;
                 }
-                else if ((c is CheckBox || c is RadioButton || (c is Label lb && !lb.AutoSize)) && c.Text.Length > 0)
-                {
-                    int avail = c.Width - (c is Label ? 4 : 22);
-                    Size ts = TextRenderer.MeasureText(c.Text, c.Font, new Size(Math.Max(10, avail), int.MaxValue),
-                        TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
-                    if (ts.Height > c.Height + 2) problems.Add($"{Describe(c)} の文字が枠に入りきりません（文字の高さ {ts.Height}px / 枠 {c.Height}px）");
-                }
+                if (need.Height > c.Height + 1)
+                    problems.Add($"{Describe(c)} の文字が枠に入りきりません（必要な高さ {need.Height}px / 枠 {c.Height}px）");
+                if (checkWidth && need.Width > c.Width + 1)
+                    problems.Add($"{Describe(c)} の文字が切れます（必要な幅 {need.Width}px / 枠 {c.Width}px）");
             }
             catch { }
 
-            if (c is Panel or GroupBox or TabControl or TabPage) AuditControls(c, problems);
+            if (c.Controls.Count > 0 && c is not (UpDownBase or ComboBox or TextBoxBase)) AuditControls(c, problems);
         }
         for (int i = 0; i < kids.Count; i++)
             for (int j = i + 1; j < kids.Count; j++)
@@ -2119,13 +2124,43 @@ public sealed partial class MainForm
             }
     }
 
+    [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+
+    /// <summary>A picture of the whole window, title bar included, even while it is fully transparent (PrintWindow asks
+    /// DWM for the window's own content); DrawToBitmap when that comes back empty.</summary>
+    private static Bitmap? PictureOf(Form f)
+    {
+        try
+        {
+            var bmp = new Bitmap(f.Width, f.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                IntPtr dc = g.GetHdc();
+                try { PrintWindow(f.Handle, dc, 2); }   // PW_RENDERFULLCONTENT
+                finally { g.ReleaseHdc(dc); }
+            }
+            Color c0 = bmp.GetPixel(bmp.Width / 2, bmp.Height / 2);
+            bool flat = true;
+            for (int y = 4; y < bmp.Height - 4 && flat; y += 7)
+                for (int x = 4; x < bmp.Width - 4; x += 7)
+                    if (bmp.GetPixel(x, y) != c0) { flat = false; break; }
+            if (!flat) return bmp;
+            bmp.Dispose();
+            var alt = new Bitmap(f.Width, f.Height);
+            f.DrawToBitmap(alt, new Rectangle(0, 0, f.Width, f.Height));
+            return alt;
+        }
+        catch (Exception ex) { Log.Info("test mode: dialog picture failed - " + ex.Message); return null; }
+    }
+
     /// <summary>Called instead of showing a dialog (see <see cref="Ui.DialogAudit"/>). The dialog is put on the
     /// test monitor, shown fully transparent without taking focus - so that its DPI and font scaling really
-    /// apply, which an unshown form does not get - inspected, and hidden again.</summary>
+    /// apply, which an unshown form does not get - inspected, photographed into the report folder, and hidden again.</summary>
     private DialogResult AuditDialog(Form dlg)
     {
         var problems = new List<string>();
         int dpi = 0;
+        string? image = null;
         try
         {
             Rectangle tb = _topt.Target.Bounds;
@@ -2134,12 +2169,24 @@ public sealed partial class MainForm
             dlg.Location = new Point(tb.X + Math.Max(0, (tb.Width - dlg.Width) / 2), tb.Y + Math.Max(0, (tb.Height - dlg.Height) / 2));
             dlg.Show();
             dlg.PerformLayout();
+            if (dlg is UiWindow w) w.Fit();
+            Application.DoEvents();
             dpi = (int)GetDpiForWindow(dlg.Handle);
             AuditControls(dlg, problems);
+            if (_rep != null)
+            {
+                using Bitmap? pic = PictureOf(dlg);
+                if (pic != null)
+                {
+                    image = $"dialog_{_dlgIndex + 1:00}_{(L.English ? "en" : "ja")}.png";
+                    Directory.CreateDirectory(_rep.Folder);
+                    pic.Save(Path.Combine(_rep.Folder, image), System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
             dlg.Hide();
         }
         catch (Exception ex) { problems.Add("検査できませんでした: " + ex.Message); }
-        _dlgRows.Add(new DialogRow(_dlgIndex, dlg.Text, L.English, problems, dpi, dlg.ClientSize));
+        _dlgRows.Add(new DialogRow(_dlgIndex, dlg.Text, L.English, problems, dpi, dlg.ClientSize, image));
         return DialogResult.Cancel;
     }
 
@@ -2184,6 +2231,7 @@ public sealed partial class MainForm
             var problems = list.SelectMany(r => r.Problems.Select(p => (r.English ? "[英語] " : "[日本語] ") + p)).ToList();
             var it = new TestItem { Name = "ダイアログ: " + (list.FirstOrDefault(r => !r.English)?.Title ?? list[0].Title) };
             it.Num("検査した言語", string.Join("・", list.Select(r => r.English ? "英語" : "日本語")));
+            foreach (DialogRow r in list) if (r.Image != null) it.Images.Add(r.Image);
             if (list.Any(r => r.Dpi > 0)) it.Num("表示のスケール", $"{list.First(r => r.Dpi > 0).Dpi} dpi（{Math.Round(list.First(r => r.Dpi > 0).Dpi * 100.0 / 96)}%）");
             if (problems.Count == 0)
             {
@@ -2201,7 +2249,7 @@ public sealed partial class MainForm
         int dpi = _dlgRows.FirstOrDefault(r => r.Dpi > 0)?.Dpi ?? 0;
         int targetScale = TestProbes.ScalePercent(_topt.Target.Bounds);
         var note = new TestItem { Name = "検査の方法とスケール", Verdict = Verdict.Info };
-        note.Num("方法", "ダイアログを試験するモニターの上で、完全に透明・フォーカスなしで表示し、部品の位置と大きさを調べて閉じる")
+        note.Num("方法", "ダイアログを試験するモニターの上で、完全に透明・フォーカスなしで表示し、すべての部品の位置と、文字に必要な大きさ（部品自身の測った大きさ）と実際の大きさを比べ、日本語・英語の画像を保存して閉じる")
             .Num("ダイアログのスケール", dpi > 0 ? $"{dpi} dpi（{Math.Round(dpi * 100.0 / 96)}%）" : "取得できませんでした")
             .Num("試験するモニターのスケール", targetScale > 0 ? $"{targetScale}%" : "不明")
             .Num("検査しなかったもの", "更新のお知らせ・ダウンロード中のダイアログ（更新の有無で内容が決まるため）");

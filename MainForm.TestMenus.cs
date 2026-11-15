@@ -21,13 +21,13 @@ public sealed partial class MainForm
         Point at = new(cr.Left + cr.Width / 3, cr.Top + cr.Height / 4);
         int dpi = DpiAtPoint(at);
         var problems = new List<string>();
-        var it = new TestItem { Name = "メニュー: 項目の高さと文字の大きさ（右クリックのメニュー・メニューバーとその下のメニュー）" };
+        var it = new TestItem { Name = "メニュー: 項目の高さと文字の大きさ、右クリックとメニューバーの状態、英訳（右クリックのメニュー・メニューバーとその下のメニュー）" };
         int checkedItems = 0, menusOpened = 0;
         double worst = 0;
         string rootInfo = "", fontInfo = "";
         int fontChecked = 0;
         double fontWorst = 0;
-        int textsChecked = 0, topCount = 0, mismatches = 0;
+        int textsChecked = 0, topCount = 0, mismatches = 0, untranslated = 0;
 
         // pt per 100% of scaling: the same on every monitor when the font really follows the scaling
         double Norm(Font f, int d) => f.SizeInPoints * 96.0 / Math.Max(96, d);
@@ -73,9 +73,25 @@ public sealed partial class MainForm
                     textsChecked += barTexts.Count;
                     topCount = _ctx.Items.OfType<ToolStripMenuItem>().Count();
                     UpdateChecks();
-                    int mm = CountMirrorMismatches();
+                    var mirror = new List<string>();
+                    int mm = CountMirrorMismatches(mirror);
                     mismatches += mm;
-                    if (mm > 0) problems.Add($"{lang}メニューバーと右クリックのメニューで、チェックや有効・無効が食い違う項目が {mm} 個あります");
+                    if (mm > 0)
+                    {
+                        problems.Add($"{lang}メニューバーと右クリックのメニューで、チェックや有効・無効が食い違う項目が {mm} 個あります");
+                        problems.AddRange(mirror.Take(10).Select(m => lang + m));
+                    }
+                    // every Japanese menu text has its English entry (a changed Japanese string silently loses it)
+                    if (english)
+                    {
+                        List<string> ja = UntranslatedMenuTexts();
+                        untranslated += ja.Count;
+                        if (ja.Count > 0)
+                        {
+                            problems.Add($"{lang}英訳のないメニューの文字が {ja.Count} 個あります（Strings.cs）");
+                            problems.AddRange(ja.Take(10).Select(t => lang + t));
+                        }
+                    }
                 }
 
                 _ctx.Show(at);
@@ -152,16 +168,16 @@ public sealed partial class MainForm
         }
 
         it.Num("メニューバーの項目名が右クリックにもある", $"{textsChecked} 個（日本語・英語の合計）").Num("右クリックの最上位の項目", $"{topCount} 個")
-          .Num("メニューバーと右クリックの状態の食い違い", $"{mismatches} 個");
+          .Num("メニューバーと右クリックの状態の食い違い", $"{mismatches} 個").Num("英訳のないメニューの文字", $"{untranslated} 個");
         it.Num("開いたメニュー", $"{menusOpened} 個").Num("調べた項目", $"{checkedItems} 個")
           .Num("文字の大きさ", fontInfo).Num("文字を調べた項目", $"{fontChecked} 個（最大のずれ {Math.Round(fontWorst * 100)}%、5% まで許容）")
           .Num("親のメニューの項目の高さ", rootInfo).Num("最大のずれ", $"{Math.Round(worst * 100)}%（15% まで許容）");
         if (!barWasVisible) it.Num("メニューバー", "試験中は非表示のため、調べる間だけ表示しました");
-        if (problems.Count == 0) { it.Verdict = Verdict.Ok; it.Summary = "どのメニューも項目の高さと文字の大きさがそろっています"; }
+        if (problems.Count == 0) { it.Verdict = Verdict.Ok; it.Summary = "どのメニューも項目の高さと文字の大きさがそろい、右クリックの状態と英訳も合っています"; }
         else
         {
             it.Verdict = Verdict.Ng;
-            it.Summary = $"{problems.Count} か所で高さまたは文字の大きさがそろっていません";
+            it.Summary = $"{problems.Count} か所で高さ・文字の大きさ・右クリックの状態・英訳のどれかが合っていません";
             it.Explanation = string.Join("\n", problems.Distinct().Take(30));
         }
         sec.Items.Add(it);
@@ -176,28 +192,6 @@ public sealed partial class MainForm
             if (t.Length > 0) set.Add(t);
             if (i is ToolStripMenuItem m) CollectMenuTexts(m.DropDownItems, set);
         }
-    }
-
-    /// <summary>Items of the menu bar whose twin in the right-click menu shows another check mark or enabled state (after <see cref="UpdateChecks"/> there must be none).</summary>
-    private int CountMirrorMismatches()
-    {
-        int[] barIndex = { 0, 1, 2, 3, 4, 6, 7 };
-        int n = 0;
-        int Walk(ToolStripMenuItem a, ToolStripMenuItem b)
-        {
-            int c = 0;
-            for (int i = 0; i < Math.Min(a.DropDownItems.Count, b.DropDownItems.Count); i++)
-            {
-                if (a.DropDownItems[i] is not ToolStripMenuItem x || b.DropDownItems[i] is not ToolStripMenuItem y) continue;
-                if (!((!string.IsNullOrEmpty(x.Name) && x.Name == y.Name) || x.Text == y.Text)) continue;
-                if (x.Checked != y.Checked || x.Enabled != y.Enabled) c++;
-                if (x.HasDropDownItems && y.HasDropDownItems) c += Walk(x, y);
-            }
-            return c;
-        }
-        for (int i = 0; i < _ctxFull.Count && i < barIndex.Length; i++)
-            if (_menu.Items[barIndex[i]] is ToolStripMenuItem bar) n += Walk(bar, _ctxFull[i]);
-        return n;
     }
 
     /// <summary>FPS だけ: the dark box hugs the number with the same margin on every side, in the state with one line and with two.</summary>

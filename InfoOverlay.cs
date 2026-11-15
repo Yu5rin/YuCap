@@ -16,14 +16,17 @@ public enum InfoMode { Off, Fps, Full }
 public sealed class InfoOverlay : OverlayControl
 {
     // Small like the FPS counters of games (Steam, RTSS): 11px = 8pt at 96 DPI, times a scale that follows the monitor DPI only
-    // (not the video size; see TextScale).
+    // (not the video size; see TextScale). The UI font (Yu Gothic UI on Japanese Windows): Consolas has no Japanese, and
+    // GDI fell back to MS Gothic's bitmap glyphs for 信号なし and the labels. Digits are kept tabular by drawing them in
+    // cells of equal width (the bold UI font's own digits are not all the same width).
     private const float BasePx = 11f;
-    private Font _font = TextScale.MakeFont("Consolas", BasePx, 1f, FontStyle.Regular);
-    private Font _bigFont = TextScale.MakeFont("Consolas", BigBasePx, 1f, FontStyle.Bold);
+    private Font _font = TextScale.MakeFont(Ui.FamilyName, BasePx, 1f, FontStyle.Regular);
+    private Font _bigFont = TextScale.MakeFont(Ui.FamilyName, BigBasePx, 1f, FontStyle.Bold);
     private float _scale = 1f;
     private const float BigBasePx = 17f;   // 12.75pt: capitals about 11px
     private string _big = "", _small = "";
-    private static readonly Color Fore = Color.FromArgb(220, 220, 220);
+    private static readonly Color Fore = Ui.Colors.Text;
+    private static readonly Color LabelFore = Ui.Colors.SubText;
 
     /// <summary>Test mode: opaque solid background of this colour (see <see cref="OsdOverlay.TestBack"/>).</summary>
     internal Color? TestBack { get => _testBack; set { _testBack = value; Changed(); } }
@@ -56,10 +59,10 @@ public sealed class InfoOverlay : OverlayControl
         if (Math.Abs(scale - _scale) < 0.001f) return;
         _scale = scale;
         Font old = _font;
-        _font = TextScale.MakeFont("Consolas", BasePx, scale, FontStyle.Regular);
+        _font = TextScale.MakeFont(Ui.FamilyName, BasePx, scale, FontStyle.Regular);
         old.Dispose();
         Font oldBig = _bigFont;
-        _bigFont = TextScale.MakeFont("Consolas", BigBasePx, scale, FontStyle.Bold);
+        _bigFont = TextScale.MakeFont(Ui.FamilyName, BigBasePx, scale, FontStyle.Bold);
         oldBig.Dispose();
         Fit();
     }
@@ -98,18 +101,48 @@ public sealed class InfoOverlay : OverlayControl
     // FPS mode layout (set by Fit): where the two texts are drawn so the dark box hugs the visible glyphs.
     private Rectangle _bigRect, _smallRect;
 
+    /// <summary>Width of one digit cell of <paramref name="f"/>: the widest digit.</summary>
+    private static int DigitCell(Font f)
+    {
+        int w = 0;
+        foreach (char d in "0123456789") w = Math.Max(w, TextRenderer.MeasureText(d.ToString(), f, Huge, TextFormatFlags.NoPadding).Width);
+        return w;
+    }
+
+    /// <summary>Draw <paramref name="text"/> with every character in a cell of the widest digit's width (tabular figures),
+    /// each glyph centred in its cell.</summary>
+    private static void DrawTabular(Graphics g, string text, Font f, Point at, Color color)
+    {
+        int cell = DigitCell(f);
+        for (int i = 0; i < text.Length; i++)
+        {
+            string ch = text[i].ToString();
+            int w = TextRenderer.MeasureText(ch, f, Huge, TextFormatFlags.NoPadding).Width;
+            TextRenderer.DrawText(g, ch, f, new Point(at.X + i * cell + (cell - w) / 2, at.Y), color, TextFormatFlags.NoPadding);
+        }
+    }
+
+    /// <summary>Greyscale antialiasing for everything drawn on the panel: ClearType's colour fringes do not survive being
+    /// blended over the video (and over the black/white pair the engine image is recovered from).</summary>
+    private static void Smooth(Graphics g) => g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
     /// <summary>Bounds of the visible glyphs of <paramref name="text"/> drawn with <paramref name="f"/> at (0,0) with no padding,
     /// and the width GDI advances for it (the rectangle a right-aligned draw of the same text needs).</summary>
-    internal static Rectangle InkBounds(string text, Font f, out int advance)
+    internal static Rectangle InkBounds(string text, Font f, out int advance) => InkBounds(text, f, false, out advance);
+
+    private static Rectangle InkBounds(string text, Font f, bool tabular, out int advance)
     {
         Size adv = TextRenderer.MeasureText(text, f, Huge, TextFormatFlags.NoPadding);
+        if (tabular) adv.Width = DigitCell(f) * text.Length;
         advance = adv.Width;
         int m = 6;
         using var bmp = new Bitmap(adv.Width + m * 2, adv.Height + m * 2);
         using (Graphics g = Graphics.FromImage(bmp))
         {
             g.Clear(Color.Black);
-            TextRenderer.DrawText(g, text, f, new Point(m, m), Color.White, TextFormatFlags.NoPadding);
+            Smooth(g);
+            if (tabular) DrawTabular(g, text, f, new Point(m, m), Color.White);
+            else TextRenderer.DrawText(g, text, f, new Point(m, m), Color.White, TextFormatFlags.NoPadding);
         }
         int l = int.MaxValue, t = int.MaxValue, r = -1, b = -1;
         for (int y = 0; y < bmp.Height; y++)
@@ -149,11 +182,12 @@ public sealed class InfoOverlay : OverlayControl
         if (Mode == InfoMode.Fps)
         {
             // The box is the visible glyphs plus the same padding on all four sides, right edge of the text on the right edge of
-            // the box. Consolas digits are all the same width: the big number is measured as that many zeros, so the box keeps its
-            // size while the digits change and only follows the number of digits (or a different word, like 静止).
+            // the box. Digits are drawn in equal cells and the big number is measured as that many of the widest digit, so the
+            // box keeps its size while the digits change and only follows the number of digits (or a word, like 静止).
             bool digits = _big.Length > 0 && _big.All(char.IsDigit);
-            string refBig = digits ? new string('0', _big.Length) : _big;
-            Rectangle bi = InkBounds(refBig, _bigFont, out int bAdv);
+            _bigTabular = digits;
+            string refBig = digits ? new string(WidestDigit(_bigFont), _big.Length) : _big;
+            Rectangle bi = InkBounds(refBig, _bigFont, digits, out int bAdv);
             Rectangle si = _small.Length == 0 ? Rectangle.Empty : InkBounds(_small, _font, out _);
             int smallAdv = _small.Length == 0 ? 0 : TextRenderer.MeasureText(_small, _font, Huge, TextFormatFlags.NoPadding).Width;
             int pad = FpsPad;
@@ -174,11 +208,48 @@ public sealed class InfoOverlay : OverlayControl
             Changed();
             return;
         }
-        Size sz = TextRenderer.MeasureText(Text, _font, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding);
-        int px = TextScale.Px(7, _scale), py = TextScale.Px(5, _scale);
-        Size = new Size(sz.Width + px * 2, sz.Height + py * 2);
+        // Two columns: the dimmed labels, then the values lined up after the widest label.
+        var lines = Lines();
+        int labelW = 0, valueW = 0, lineH = TextRenderer.MeasureText("Ag", _font, Huge, TextFormatFlags.NoPadding).Height;
+        foreach (var (label, value) in lines)
+        {
+            if (label != null) labelW = Math.Max(labelW, TextRenderer.MeasureText(label, _font, Huge, TextFormatFlags.NoPadding).Width);
+        }
+        _valueX = labelW > 0 ? labelW + TextScale.Px(10, _scale) : 0;
+        foreach (var (label, value) in lines)
+            valueW = Math.Max(valueW, (label != null ? _valueX : 0) + TextRenderer.MeasureText(value, _font, Huge, TextFormatFlags.NoPadding).Width);
+        _lineH = lineH + TextScale.Px(2, _scale);
+        int px = TextScale.Px(10, _scale), py = TextScale.Px(7, _scale);
+        Size = new Size(valueW + px * 2, _lineH * lines.Count - TextScale.Px(2, _scale) + py * 2);
         SetRoundedRegion();
         Changed();
+    }
+
+    private int _valueX, _lineH;
+    private bool _bigTabular;
+
+    private static char WidestDigit(Font f)
+    {
+        char best = '0';
+        int w = -1;
+        foreach (char d in "0123456789")
+        {
+            int dw = TextRenderer.MeasureText(d.ToString(), f, Huge, TextFormatFlags.NoPadding).Width;
+            if (dw > w) { w = dw; best = d; }
+        }
+        return best;
+    }
+
+    /// <summary>The lines of the full panel split into label and value at the first ": " (null label: a line of its own).</summary>
+    private System.Collections.Generic.List<(string? Label, string Value)> Lines()
+    {
+        var res = new System.Collections.Generic.List<(string?, string)>();
+        foreach (string line in Text.Split('\n'))
+        {
+            int i = line.IndexOf(": ", StringComparison.Ordinal);
+            res.Add(i > 0 && i < 40 ? (line[..i], line[(i + 2)..]) : (null, line));
+        }
+        return res;
     }
 
     private int CornerRadius => TextScale.Px(6, _scale);
@@ -204,19 +275,30 @@ public sealed class InfoOverlay : OverlayControl
 
     private void PaintText(Graphics g)
     {
+        Smooth(g);
         if (Mode == InfoMode.Fps)
         {
-            TextRenderer.DrawText(g, _big, _bigFont, _bigRect, Fore, RightFlags);
-            if (_small.Length > 0) TextRenderer.DrawText(g, _small, _font, _smallRect, Fore, RightFlags);
+            if (_bigTabular) DrawTabular(g, _big, _bigFont, _bigRect.Location, Fore);
+            else TextRenderer.DrawText(g, _big, _bigFont, _bigRect, Fore, RightFlags);
+            if (_small.Length > 0) TextRenderer.DrawText(g, _small, _font, _smallRect, LabelFore, RightFlags);
             return;
         }
-        TextRenderer.DrawText(g, Text, _font,
-            new Point(TextScale.Px(7, _scale), TextScale.Px(5, _scale)), Fore, TextFormatFlags.NoPadding);
+        int x = TextScale.Px(10, _scale), y = TextScale.Px(7, _scale);
+        foreach (var (label, value) in Lines())
+        {
+            if (label != null)
+            {
+                TextRenderer.DrawText(g, label, _font, new Point(x, y), LabelFore, TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(g, value, _font, new Point(x + _valueX, y), Fore, TextFormatFlags.NoPadding);
+            }
+            else TextRenderer.DrawText(g, value, _font, new Point(x, y), Fore, TextFormatFlags.NoPadding);
+            y += _lineH;
+        }
     }
 
     internal override void PaintOverlay(Graphics g, bool offscreen)
     {
-        using var back = new SolidBrush(TestBack ?? Color.FromArgb(200, 12, 12, 12));
+        using var back = new SolidBrush(TestBack ?? Ui.Colors.OverlayBack);
         if (offscreen)
         {
             SmoothingMode old = g.SmoothingMode;

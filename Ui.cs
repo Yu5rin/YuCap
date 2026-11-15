@@ -5,44 +5,30 @@ using System.Windows.Forms;
 
 namespace YuCap;
 
-// The video area is always black, and the system-light menu bar and status
-// strip used to frame it in bright white/gray bands — jarring next to a black
-// video canvas and out of place for what is essentially a video viewer. This
-// file gives the MAIN window chrome (menu bar, its dropdowns, the context
-// menu, the status bar) a dark palette that matches, plus a small shared
-// dialog-layout kit so every settings/about dialog is built the same way.
-// Dialogs themselves stay system-light (they're not next to the video canvas
-// and system controls read better with system theming).
-internal static class Ui
+// One dark look for every window: the main window chrome (menu bar, its dropdowns, the context menu, the status bar)
+// drawn by the renderer below, and every dialog and tool window built from the kit in UiControls.cs (themed
+// controls, content-sized layout, the message box). Ui.Colors is the only palette.
+internal static partial class Ui
 {
-    public const int Pad = 16;           // outer margin of every dialog
+    public const int Pad = 16;           // outer margin of every window, space between groups
     public const int Gap = 8;            // space between related controls
-    public const int ButtonWidth = 88;
+    public const int ButtonWidth = 88;   // minimum button size (96-dpi pixels); buttons grow to fit their caption
     public const int ButtonHeight = 28;
 
-    /// <summary>
-    /// A blank dialog shell, sized in client pixels. AutoScaleDimensions is
-    /// pinned to (7,15) — the metric WinForms measures for Segoe UI 9pt, the
-    /// default font — because every dialog below is laid out with pixel
-    /// coordinates drawn AT that metric. Setting it explicitly (rather than
-    /// leaving WinForms to infer it from the design-time font) is what makes
-    /// AutoScaleMode.Font actually rescale those pixel positions correctly
-    /// when the user runs at 125-200% DPI instead of leaving them too small.
-    /// </summary>
-    public static UiDialog NewDialog(string title, int clientWidth, int clientHeight)
+    /// <summary>A blank dialog: dark, sized to its content once laid out with <see cref="Frame"/>.
+    /// <paramref name="width96"/> is the client width to aim for (96-dpi pixels; wider when the content needs it);
+    /// <paramref name="fillHeight96"/> the client height for a dialog whose body fills it (a list).</summary>
+    public static UiDialog NewDialog(string title, int width96 = 400, int fillHeight96 = 0)
     {
         return new UiDialog
         {
             Text = title,
             FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
-            KeyPreview = false,
-            ClientSize = new Size(clientWidth, clientHeight),
-            AutoScaleMode = AutoScaleMode.Font,
-            AutoScaleDimensions = new SizeF(7F, 15F),
+            ContentWidth96 = width96,
+            ContentHeight96 = fillHeight96,
         };
     }
 
@@ -51,200 +37,29 @@ internal static class Ui
     /// inspected without a person having to open it.</summary>
     public static Func<Form, DialogResult>? DialogAudit;
 
-    public static Label Label(string text, int x, int y)
-    {
-        return new Label { Text = text, AutoSize = true, Location = new Point(x, y) };
-    }
-
-    /// <summary>Secondary/explanatory text under a control. Wraps at maxWidth
-    /// instead of running off the dialog, and is dimmed relative to the
-    /// primary text.</summary>
-    public static Label Hint(string text, int x, int y, int maxWidth)
-    {
-        return new Label
-        {
-            Text = text,
-            AutoSize = true,
-            MaximumSize = new Size(maxWidth, 0),
-            Location = new Point(x, y),
-            // SystemColors.GrayText, not Color.Gray: GrayText tracks the
-            // active theme and stays readable, where a fixed gray measures
-            // only ~2.9:1 contrast against the dialog background — below the
-            // usual 4.5:1 legibility floor for body text.
-            ForeColor = SystemColors.GrayText,
-        };
-    }
-
-    /// <summary>Dimmed explanatory text for a <see cref="Frame"/> layout: wraps to the width the dialog really has
-    /// (a table row would otherwise be measured on one line and cut off the wrapped text).</summary>
-    public static Label FlowHint(string text) => new WrapLabel
-    {
-        Text = text,
-        ForeColor = SystemColors.GrayText,
-        Anchor = AnchorStyles.Left | AnchorStyles.Right,
-        Margin = Padding.Empty,
-    };
-
-    /// <summary>Width a button needs to show <paramref name="text"/> without clipping (text + padding),
-    /// never less than <paramref name="minWidth"/>. Keeps English captions from being truncated in
-    /// widths drawn for the Japanese ones.</summary>
-    public static int FitButtonWidth(string text, int minWidth)
-    {
-        int tw = TextRenderer.MeasureText(text, SystemFonts.MessageBoxFont ?? Control.DefaultFont).Width;
-        return Math.Max(minWidth, tw + 28);
-    }
-
-    /// <summary>A button at least <paramref name="width"/> wide, widened to fit its text. With
-    /// <paramref name="keepRight"/> the right edge stays where the requested box put it (for
-    /// right-aligned buttons); otherwise the left edge stays.</summary>
-    public static Button Button(string text, int x, int y, int width = ButtonWidth, bool keepRight = false)
-    {
-        int w = FitButtonWidth(text, width);
-        if (keepRight) x -= w - width;
-        return new Button { Text = text, Location = new Point(x, y), Size = new Size(w, ButtonHeight) };
-    }
-
-    /// <summary>
-    /// Adds OK + キャンセル right-aligned at the bottom of the dialog, using
-    /// its current ClientSize. Wires up AcceptButton/CancelButton and each
-    /// button's DialogResult so Enter/Escape work without extra code, and
-    /// returns the OK button so the caller can attach validation to Click.
-    /// </summary>
-    public static Button AddOkCancel(Form dlg, string? okText = null)
-    {
-        int w = dlg.ClientSize.Width;
-        int h = dlg.ClientSize.Height;
-
-        string cancelText = L.T("キャンセル"), okLabel = okText ?? "OK";
-        int cw = FitButtonWidth(cancelText, ButtonWidth), ow = FitButtonWidth(okLabel, ButtonWidth);
-        var cancel = new Button
-        {
-            Text = cancelText,
-            Location = new Point(w - Pad - cw, h - Pad - ButtonHeight),
-            Size = new Size(cw, ButtonHeight),
-            DialogResult = DialogResult.Cancel,
-        };
-        var ok = new Button
-        {
-            Text = okLabel,
-            Location = new Point(cancel.Location.X - Gap - ow, h - Pad - ButtonHeight),
-            Size = new Size(ow, ButtonHeight),
-            DialogResult = DialogResult.OK,
-        };
-
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
-        dlg.Controls.Add(ok);
-        dlg.Controls.Add(cancel);
-        return ok;
-    }
-
-    /// <summary>
-    /// DPI-proof dialog layout: a root table (docked to fill the dialog) with the body in the top row and a
-    /// right-aligned row of buttons below it, both sized from the controls' real sizes by WinForms layout instead
-    /// of pixel positions drawn at 96 dpi. At 150/200% the controls, fonts and wrapped text then cannot end up on
-    /// top of each other, whatever scaling the dialog really got. The dialog grows beyond the requested
-    /// client size when its content needs more room, and never shrinks below it.
-    ///
-    /// <paramref name="body"/> sits at the top of the free space; with <paramref name="fill"/> it is docked to fill
-    /// it (lists). <paramref name="buttons"/> are given in left-to-right order. The first is the accept button
-    /// and the last one the cancel button unless the caller changes them afterwards.
-    /// </summary>
-    public static void Frame(Form dlg, Control body, bool fill, params Button[] buttons)
-    {
-        var root = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2,
-            Padding = new Padding(Pad),
-            Margin = Padding.Empty,
-        };
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-        if (fill) { body.Dock = DockStyle.Fill; body.Margin = new Padding(0, 0, 0, Gap); }
-        else { body.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; body.Margin = new Padding(0, 0, 0, Gap); }
-        root.Controls.Add(body, 0, 0);
-
-        var row = new FlowLayoutPanel
-        {
-            FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Anchor = AnchorStyles.Right,
-            Margin = Padding.Empty,
-            Padding = Padding.Empty,
-        };
-        for (int i = buttons.Length - 1; i >= 0; i--)
-        {
-            Button b = buttons[i];
-            b.AutoSize = true;
-            b.AutoSizeMode = AutoSizeMode.GrowOnly;
-            b.MinimumSize = new Size(ButtonWidth, ButtonHeight);
-            b.Margin = new Padding(Gap, 0, 0, 0);
-            row.Controls.Add(b);
-        }
-        root.Controls.Add(row, 0, 1);
-
-        dlg.Controls.Add(root);
-
-        // The requested client size is a minimum: if the content needs more at the scaling the dialog really got
-        // (wrapped text, wider captions), the dialog grows. Form.AutoSize does not do this with a docked table.
-        void GrowToFit()
-        {
-            if (!dlg.IsHandleCreated) return;
-            int availW = Math.Max(1, dlg.ClientSize.Width - root.Padding.Horizontal);
-            Size bodyPref = fill ? Size.Empty : body.GetPreferredSize(new Size(availW, 0));
-            Size rowPref = row.GetPreferredSize(new Size(availW, 0));
-            int needH = root.Padding.Vertical + body.Margin.Vertical + bodyPref.Height + row.Margin.Vertical + rowPref.Height;
-            int needW = root.Padding.Horizontal + Math.Max(bodyPref.Width, rowPref.Width);
-            Size cs = dlg.ClientSize;
-            if (needH > cs.Height || needW > cs.Width)
-                dlg.ClientSize = new Size(Math.Max(cs.Width, needW), Math.Max(cs.Height, needH));
-        }
-        dlg.Load += (_, _) => GrowToFit();
-        dlg.Shown += (_, _) => GrowToFit();
-        dlg.DpiChanged += (_, _) => GrowToFit();
-    }
-
-    /// <summary>A single-column table that stacks its controls top to bottom, each row as tall as its control
-    /// (wrapped hints included) and as wide as the dialog. Add the controls, then hand it to <see cref="Frame"/>.</summary>
-    public static TableLayoutPanel Stack()
-    {
-        var t = new TableLayoutPanel
-        {
-            ColumnCount = 1,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Margin = Padding.Empty,
-        };
-        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        return t;
-    }
-
-    /// <summary>OK + キャンセル in a <see cref="Frame"/>; wires AcceptButton/CancelButton/DialogResult and returns OK.</summary>
-    public static Button FrameOkCancel(Form dlg, Control body, bool fill = false, string? okText = null)
-    {
-        var ok = new Button { Text = okText ?? "OK", DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel };
-        Frame(dlg, body, fill, ok, cancel);
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
-        return ok;
-    }
-
     public static class Colors
     {
-        public static readonly Color Back = ColorTranslator.FromHtml("#1E1E1E");     // strip background
-        public static readonly Color Surface = ColorTranslator.FromHtml("#252526");  // dropdown background
-        public static readonly Color Hover = ColorTranslator.FromHtml("#3A3D41");    // hovered/selected item
-        public static readonly Color Border = ColorTranslator.FromHtml("#3F3F46");   // borders, separators
-        public static readonly Color Text = ColorTranslator.FromHtml("#E6E6E6");
-        public static readonly Color SubText = ColorTranslator.FromHtml("#9D9D9D");  // disabled text, shortcut text
-        public static readonly Color Accent = ColorTranslator.FromHtml("#4DA3FF");   // check marks
+        public static readonly Color Back = ColorTranslator.FromHtml("#1E1E1E");        // window / strip background
+        public static readonly Color Surface = ColorTranslator.FromHtml("#252526");     // dropdowns, panels, tool tips
+        public static readonly Color Field = ColorTranslator.FromHtml("#2B2B2B");       // text boxes, lists
+        public static readonly Color FieldAlt = ColorTranslator.FromHtml("#303031");    // every other row of a table
+        public static readonly Color Hover = ColorTranslator.FromHtml("#3A3D41");       // hovered/selected item
+        public static readonly Color Border = ColorTranslator.FromHtml("#3F3F46");      // borders, separators
+        public static readonly Color ButtonFace = ColorTranslator.FromHtml("#2D2D30");  // push buttons
+        public static readonly Color ButtonEdge = ColorTranslator.FromHtml("#54545C");  // push button / field edge
+        public static readonly Color ButtonDown = ColorTranslator.FromHtml("#45494E");
+        public static readonly Color Track = ColorTranslator.FromHtml("#4A4A50");       // slider channel, progress track
+        public static readonly Color Text = ColorTranslator.FromHtml("#E6E6E6");        // ~14:1 on Back
+        public static readonly Color SubText = ColorTranslator.FromHtml("#A6A6A6");     // hints, shortcut text (~7:1)
+        public static readonly Color Disabled = ColorTranslator.FromHtml("#949494");    // disabled captions (~5.5:1, still readable)
+        public static readonly Color KeyText = ColorTranslator.FromHtml("#C8C8C8");     // key names in 操作一覧
+        public static readonly Color Accent = ColorTranslator.FromHtml("#4DA3FF");      // check marks, links, focus
+        public static readonly Color AccentHot = ColorTranslator.FromHtml("#6CB4FF");
+        public static readonly Color AccentFill = ColorTranslator.FromHtml("#0E639C");  // primary button (white text ~6:1)
+        public static readonly Color AccentDown = ColorTranslator.FromHtml("#0B4F7D");
+        public static readonly Color Danger = ColorTranslator.FromHtml("#F1707B");      // validation messages on dark
+        /// <summary>Background of the panels drawn over the video (OSD, info panel): 82% black.</summary>
+        public static readonly Color OverlayBack = Color.FromArgb(209, 16, 16, 16);
     }
 
     private static ToolStripRenderer? _darkRenderer;
@@ -323,6 +138,15 @@ internal static class Ui
             Graphics g = e.Graphics;
             SmoothingMode oldMode = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (e.Item.AccessibleRole == AccessibleRole.RadioButton)
+            {
+                // A choose-one item (MainForm.Radio): a dot, so it reads differently from an on/off tick.
+                float d = Math.Min(r.Width, r.Height) * 0.38f;
+                using var dot = new SolidBrush(Colors.Accent);
+                g.FillEllipse(dot, r.Left + (r.Width - d) / 2f, r.Top + (r.Height - d) / 2f, d, d);
+                g.SmoothingMode = oldMode;
+                return;
+            }
             using var pen = new Pen(Colors.Accent, 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
             float x0 = r.Left + r.Width * 0.20f;
             float y0 = r.Top + r.Height * 0.52f;
@@ -350,6 +174,24 @@ internal static class Ui
             }
         }
 
+        protected override void OnRenderOverflowButtonBackground(ToolStripItemRenderEventArgs e)
+        {
+            // The menu bar's overflow button (a narrow window): a chevron in Text on the dark strip, Hover when pointed at.
+            Rectangle b = new Rectangle(Point.Empty, e.Item.Size);
+            using (var back = new SolidBrush(e.Item.Selected || e.Item.Pressed ? Colors.Hover : Colors.Back))
+                e.Graphics.FillRectangle(back, b);
+            SmoothingMode old = e.Graphics.SmoothingMode;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            float s = Math.Max(3f, b.Height / 7f), cx = b.Width / 2f, cy = b.Height / 2f;
+            using var pen = new Pen(Colors.Text, Math.Max(1.2f, s / 2.5f)) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+            for (int i = 0; i < 2; i++)
+            {
+                float x = cx - s + i * s;
+                e.Graphics.DrawLines(pen, new[] { new PointF(x, cy - s), new PointF(x + s * 0.8f, cy), new PointF(x, cy + s) });
+            }
+            e.Graphics.SmoothingMode = old;
+        }
+
         protected override void OnRenderStatusStripSizingGrip(ToolStripRenderEventArgs e)
         {
             // Three small dots in the bottom-right corner, in Border, instead
@@ -366,63 +208,52 @@ internal static class Ui
                 }
         }
 
-        protected override void OnRenderLabelBackground(ToolStripItemRenderEventArgs e)
+        protected override void OnRenderToolStripStatusLabelBackground(ToolStripItemRenderEventArgs e)
         {
-            base.OnRenderLabelBackground(e);
-            // ProfessionalRenderer draws a ToolStripStatusLabel's BorderSides
-            // via the base label background using the (light-themed) 3D
-            // border colors baked into the base renderer, which stay
-            // invisible-to-wrong on a dark strip. Draw our own 1px Border
-            // line for whichever sides the label actually requested; the
-            // status bar in this app only ever sets Right, so that is the
-            // one guaranteed to render, but the others are handled too in
-            // case a future label sets them.
-            if (e.Item is not ToolStripStatusLabel label || label.BorderSides == ToolStripStatusLabelBorderSides.None)
-                return;
-
-            Rectangle b = new Rectangle(Point.Empty, e.Item.Size);
+            // (The professional renderer drew BorderSides here as light 3D lines.) No 3D label borders on the dark strip (BorderSides stays None): a status label gets one 1 px Border line
+            // at its left edge when a visible label comes before it, so separators sit only BETWEEN segments - never
+            // after the last one.
+            if (e.Item is not ToolStripStatusLabel label || label.Spring || e.ToolStrip == null) return;
+            bool afterAnother = false;
+            foreach (ToolStripItem other in e.ToolStrip.Items)
+            {
+                if (ReferenceEquals(other, label)) break;
+                if (other.Available && other is ToolStripStatusLabel { Spring: false } o && o.Text?.Length > 0) afterAnother = true;
+            }
+            if (!afterAnother) return;
+            int inset = Math.Max(3, e.Item.Height / 5);
             using var pen = new Pen(Colors.Border);
-            if (label.BorderSides.HasFlag(ToolStripStatusLabelBorderSides.Right))
-                e.Graphics.DrawLine(pen, b.Right - 1, 0, b.Right - 1, b.Bottom);
-            if (label.BorderSides.HasFlag(ToolStripStatusLabelBorderSides.Left))
-                e.Graphics.DrawLine(pen, 0, 0, 0, b.Bottom);
-            if (label.BorderSides.HasFlag(ToolStripStatusLabelBorderSides.Top))
-                e.Graphics.DrawLine(pen, 0, 0, b.Right, 0);
-            if (label.BorderSides.HasFlag(ToolStripStatusLabelBorderSides.Bottom))
-                e.Graphics.DrawLine(pen, 0, b.Bottom - 1, b.Right, b.Bottom - 1);
+            e.Graphics.DrawLine(pen, 0, inset, 0, e.Item.Height - inset);
+        }
+
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            // The status bar gets one Border line along its top edge (the light 3D edge of the default renderer is gone);
+            // the other strips keep the professional renderer's own border.
+            if (e.ToolStrip is StatusStrip)
+            {
+                using var pen = new Pen(Colors.Border);
+                e.Graphics.DrawLine(pen, 0, 0, e.ToolStrip.Width, 0);
+                return;
+            }
+            base.OnRenderToolStripBorder(e);
         }
     }
 }
 
-/// <summary>The dialog shell made by <see cref="Ui.NewDialog"/>. Its only addition is the audit hook:
-/// callers hold it as a <c>var</c>, so their <c>dlg.ShowDialog(this)</c> binds to the method below
-/// (<c>Form.ShowDialog</c> itself is not virtual).</summary>
-internal sealed class UiDialog : Form
+/// <summary>The dialog shell made by <see cref="Ui.NewDialog"/>: a <see cref="UiWindow"/> (dark, content-sized,
+/// centred on the window that opened it) plus the audit hook. Callers hold it as a <c>var</c>, so their
+/// <c>dlg.ShowDialog(this)</c> binds to the method below (<c>Form.ShowDialog</c> itself is not virtual).</summary>
+internal sealed class UiDialog : UiWindow
 {
     public new DialogResult ShowDialog(IWin32Window? owner)
     {
         Func<Form, DialogResult>? audit = Ui.DialogAudit;
-        return audit != null ? audit(this) : base.ShowDialog(owner);
+        if (audit != null) return audit(this);
+        PrePlace(owner);
+        return owner != null ? base.ShowDialog(owner) : base.ShowDialog();
     }
 
     // While being audited the dialog is shown invisibly (see MainForm.TestMode.cs); it must not take focus.
     protected override bool ShowWithoutActivation => Ui.DialogAudit != null;
-}
-
-/// <summary>An auto-sized label that reports its height for the width available in its dialog (the dialog's client
-/// width less the padding of its root layout panel) instead of for one unwrapped line.</summary>
-internal sealed class WrapLabel : Label
-{
-    public WrapLabel() { AutoSize = true; }
-
-    public override Size GetPreferredSize(Size proposedSize)
-    {
-        int w = 0;
-        Form? f = FindForm();
-        if (f != null && f.ClientSize.Width > 0)
-            w = f.ClientSize.Width - (f.Controls.Count > 0 ? f.Controls[0].Padding.Horizontal : 0);
-        if (w <= 0) w = proposedSize.Width > 1 && proposedSize.Width < 100000 ? proposedSize.Width : 300;
-        Size s = base.GetPreferredSize(new Size(w, 0));
-        return new Size(Math.Min(s.Width, w), s.Height);
-    }
 }

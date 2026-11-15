@@ -15,30 +15,62 @@ public sealed partial class MainForm
 {
     // ---- choosing the device ------------------------------------------------
 
-    /// <summary>The device to open: the one the user picked last (by id), else the first whose name contains the
-    /// keyword, else null. Never "whatever is there": a microphone or a webcam is not a capture card.</summary>
-    internal static VideoDeviceInfo? ChooseVideoDevice(IReadOnlyList<VideoDeviceInfo> devices, string? savedId, string? keyword)
+    /// <summary>The device to open: the one the user picked last (by id), else the first whose name contains the keyword.
+    /// On a first run - nothing ever picked and the keyword still the default - a card of another make matches nothing, so the
+    /// first video device that is not a camera is taken instead (<paramref name="firstRunFallback"/>; off where only the keyword
+    /// may decide). Never a webcam or a virtual camera: those are not capture cards. Null when there is nothing to open.</summary>
+    internal static VideoDeviceInfo? ChooseVideoDevice(IReadOnlyList<VideoDeviceInfo> devices, string? savedId, string? keyword,
+        bool firstRunFallback = true)
     {
         if (!string.IsNullOrEmpty(savedId))
         {
             var byId = devices.FirstOrDefault(d => d.Id == savedId);
             if (byId != null) return byId;
         }
-        if (!string.IsNullOrWhiteSpace(keyword))
-            return devices.FirstOrDefault(d => d.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(keyword)
+            && devices.FirstOrDefault(d => d.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)) is { } byName)
+            return byName;
+        if (firstRunFallback && string.IsNullOrEmpty(savedId) && IsDefaultKeyword(keyword))
+            return devices.FirstOrDefault(d => !LooksLikeCamera(d.Name));
         return null;
     }
 
-    internal static AudioDeviceInfo? ChooseAudioDevice(IReadOnlyList<AudioDeviceInfo> devices, string? savedId, string? keyword)
+    /// <summary>The audio half: the one picked last, else the keyword, else (first run, as for the video) the audio device whose
+    /// name shares a word with the video device in use - a capture card's audio is named after the card.</summary>
+    internal static AudioDeviceInfo? ChooseAudioDevice(IReadOnlyList<AudioDeviceInfo> devices, string? savedId, string? keyword,
+        string? videoName = null)
     {
         if (!string.IsNullOrEmpty(savedId))
         {
             var byId = devices.FirstOrDefault(d => d.Id == savedId);
             if (byId != null) return byId;
         }
-        if (!string.IsNullOrWhiteSpace(keyword))
-            return devices.FirstOrDefault(d => d.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(keyword)
+            && devices.FirstOrDefault(d => d.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)) is { } byName)
+            return byName;
+        if (string.IsNullOrEmpty(savedId) && IsDefaultKeyword(keyword) && !string.IsNullOrWhiteSpace(videoName))
+        {
+            string[] words = DistinctiveWords(videoName);
+            if (words.Length > 0)
+                return devices.FirstOrDefault(d => words.Any(w => d.Name.Contains(w, StringComparison.OrdinalIgnoreCase)));
+        }
         return null;
+    }
+
+    private static bool IsDefaultKeyword(string? keyword) =>
+        string.IsNullOrWhiteSpace(keyword) || string.Equals(keyword.Trim(), new AppSettings().DeviceKeyword, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Webcams, laptop IR cameras and virtual cameras (OBS and the like). Not "cam" alone: Elgato's Cam Link is a capture card.</summary>
+    private static bool LooksLikeCamera(string name) =>
+        new[] { "camera", "webcam", "カメラ", "virtual", "integrated" }.Any(w => name.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Words of a device name that can tell its audio half apart ("USB", "Video", "Capture" ... name half the devices on a PC).</summary>
+    private static string[] DistinctiveWords(string name)
+    {
+        string[] generic = { "usb", "video", "audio", "capture", "device", "digital", "interface", "hdmi", "input", "with", "the" };
+        return name.Split(new[] { ' ', '(', ')', '-', '_', ',', '/' }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(w => w.Length >= 3 && !generic.Contains(w.ToLowerInvariant()) && !w.All(char.IsDigit))
+            .ToArray();
     }
 
     /// <summary>Canvas text when no capture device can be chosen (nothing plugged in, or nothing matches).</summary>
@@ -233,7 +265,7 @@ public sealed partial class MainForm
             var devices = AudioEngine.EnumerateDevices();
             AudioDeviceInfo? cur = _currentAudioInfo;
             AudioDeviceInfo? pick = (cur != null ? devices.FirstOrDefault(d => d.Id == cur.Id) : null)
-                ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword);
+                ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name);
             if (pick == null) return false;
             try { _audio.Stop(); } catch { /* ignore */ }
             _audio.Start(pick, _settings.AudioOutputDeviceId);

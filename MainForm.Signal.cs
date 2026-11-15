@@ -5,7 +5,7 @@ using System.Windows.Forms;
 namespace YuCap;
 
 /// <summary>
-/// ゲーム機の電源に合わせる. The Direct3D engine tells whether the console is sending a picture (<see cref="IVideoEngine.SignalState"/>:
+/// ゲーム機の電源に連動. The Direct3D engine tells whether the console is sending a picture (<see cref="IVideoEngine.SignalState"/>:
 /// the capture card's own black "No Signal" screen versus a real picture). Two optional actions hang on the changes:
 /// signal back after no signal (the console was switched on) -> fullscreen on the 全画面にするモニター, and signal gone again ->
 /// back to the window. Only changes trigger anything, and only what this code did itself is undone: whatever the user does by hand
@@ -21,25 +21,27 @@ public sealed partial class MainForm
 
     private ToolStripMenuItem BuildSignalSubmenu()
     {
-        var m = new ToolStripMenuItem(L.T("ゲーム機の電源に合わせる"));
+        var m = new ToolStripMenuItem(L.T("ゲーム機の電源に連動"));
         _miSignal = m;
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("信号が来たとき")) { Enabled = false });
-        foreach ((string label, bool on) in new[] { (L.T("何もしない"), false), (L.T("全画面にする（「全画面にするモニター」に）"), true) })
+        var onArrive = new ToolStripMenuItem(L.T("信号が来たら"));
+        foreach ((string label, bool on) in new[] { (L.T("何もしない"), false), (L.T("全画面にする"), true) })
         {
             bool v = on;
-            var it = new ToolStripMenuItem(label, null, (_, _) => { _settings.SignalFullscreen = v; UpdateChecks(); }) { Tag = v };
+            var it = Radio(new ToolStripMenuItem(label, null, (_, _) => { _settings.SignalFullscreen = v; UpdateChecks(); }) { Tag = v });
+            if (v) it.ToolTipText = L.T("「全画面にするモニター」で選んだモニターで全画面にします。");
             _sigOnItems.Add(it);
-            m.DropDownItems.Add(it);
+            onArrive.DropDownItems.Add(it);
         }
-        m.DropDownItems.Add(new ToolStripSeparator());
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("信号がなくなったとき")) { Enabled = false });
+        var onLoss = new ToolStripMenuItem(L.T("信号がなくなったら"));
         foreach ((string label, bool on) in new[] { (L.T("そのまま"), false), (L.T("ウィンドウに戻す（自動で全画面にしたときだけ）"), true) })
         {
             bool v = on;
-            var it = new ToolStripMenuItem(label, null, (_, _) => { _settings.SignalLeaveFullscreen = v; UpdateChecks(); }) { Tag = v };
+            var it = Radio(new ToolStripMenuItem(label, null, (_, _) => { _settings.SignalLeaveFullscreen = v; UpdateChecks(); }) { Tag = v });
             _sigOffItems.Add(it);
-            m.DropDownItems.Add(it);
+            onLoss.DropDownItems.Add(it);
         }
+        m.DropDownItems.Add(onArrive);
+        m.DropDownItems.Add(onLoss);
         return m;
     }
 
@@ -50,7 +52,7 @@ public sealed partial class MainForm
         _miSignal.Enabled = ok;
         _miSignal.ToolTipText = ok
             ? L.T("ゲーム機の電源を入れて映像が来たら全画面にします。映像が来ないあいだ（カードの「No Signal」画面）は、描画をほとんど止めて GPU を休ませます。")
-            : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
+            : L.T(D3dOnlyTip);
         foreach (var it in _sigOnItems) it.Checked = (bool)it.Tag! == _settings.SignalFullscreen;
         foreach (var it in _sigOffItems) it.Checked = (bool)it.Tag! == _settings.SignalLeaveFullscreen;
     }

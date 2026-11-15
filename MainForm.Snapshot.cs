@@ -89,8 +89,8 @@ public sealed partial class MainForm
             _snapshotErrorShowing = true;
             try
             {
-                MessageBox.Show(this, L.F("保存に失敗しました。\n\n{0}", error),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, L.F("保存に失敗しました。\n\n{0}", error),
+                    MsgKind.Error);
             }
             finally { _snapshotErrorShowing = false; }
             return;
@@ -341,113 +341,51 @@ public sealed partial class MainForm
         catch (Exception ex)
         {
             Log.Info("open folder failed: " + ex);
-            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, Errors.Describe(ex), MsgKind.Warning);
         }
     }
 
     private void ShowSnapshotSettings()
     {
-        using var dlg = Ui.NewDialog(L.T("スナップショット設定"), 460, 330);
-        var stack = Ui.Stack();
+        using var dlg = Ui.NewDialog(L.T("スナップショット設定"), 460);
 
-        // 保存先 / 形式: a two-row grid so the labels line up whatever the scaling.
-        var grid = new TableLayoutPanel
-        {
-            ColumnCount = 3, RowCount = 2, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, Ui.Gap),
-        };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        var lblDir = Ui.Label(L.T("保存先:"), 0, 0);
-        lblDir.Anchor = AnchorStyles.Left;
-        lblDir.Margin = new Padding(0, 0, Ui.Gap, 0);
-        var txtDir = new TextBox
-        {
-            Text = SnapshotDirectory,
-            ReadOnly = true,
-            Anchor = AnchorStyles.Left | AnchorStyles.Right,
-            Margin = new Padding(0, 3, Ui.Gap, 3),
-        };
-        var browse = Ui.Button(L.T("参照..."), 0, 0, 88);
-        browse.AutoSize = true;
-        browse.AutoSizeMode = AutoSizeMode.GrowOnly;
-        browse.MinimumSize = new Size(Ui.ButtonWidth, Ui.ButtonHeight);
-        browse.Margin = Padding.Empty;
+        var txtDir = new TextBox { Text = SnapshotDirectory, ReadOnly = true };
+        var browse = Ui.Btn(L.T("参照..."));
         browse.Click += (_, _) =>
         {
             using var fb = new FolderBrowserDialog
             {
-                Description = L.T("スナップショットの保存先フォルダ"),
+                Description = L.T("スナップショットの保存先フォルダー"),
                 SelectedPath = SnapshotDirectory,
                 ShowNewFolderButton = true,
             };
             if (fb.ShowDialog(dlg) == DialogResult.OK) txtDir.Text = fb.SelectedPath;
         };
-
-        var lblFmt = Ui.Label(L.T("形式:"), 0, 0);
-        lblFmt.Anchor = AnchorStyles.Left;
-        lblFmt.Margin = new Padding(0, 0, Ui.Gap, 0);
-        var cmbFmt = new ComboBox
-        {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Anchor = AnchorStyles.Left,
-            Width = 140,
-            Margin = new Padding(0, 3, 0, 3),
-        };
-        cmbFmt.Items.AddRange(new object[] { L.T("PNG (無劣化)"), L.T("JPEG (高画質)") });
+        var cmbFmt = Ui.Combo(160, L.T("PNG (無劣化)"), L.T("JPEG (高画質)"));
         cmbFmt.SelectedIndex =
             _settings.SnapshotFormat.Equals("jpg", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
 
-        grid.Controls.Add(lblDir, 0, 0);
-        grid.Controls.Add(txtDir, 1, 0);
-        grid.Controls.Add(browse, 2, 0);
-        grid.Controls.Add(lblFmt, 0, 1);
-        grid.Controls.Add(cmbFmt, 1, 1);
-        stack.Controls.Add(grid);
-
-        var hint = Ui.FlowHint(L.T("ウィンドウの大きさに関係なく、入力された映像の解像度で保存します。"));
-        hint.Margin = new Padding(0, 0, 0, Ui.Gap * 2);
-        stack.Controls.Add(hint);
+        // 保存先 / 形式 line up in a grid; the check boxes below wrap to the dialog's width.
+        var grid = Ui.Grid()
+            .AddRow(Ui.Caption(L.T("保存先:")), txtDir, browse)
+            .AddRow(Ui.Caption(L.T("形式:")), cmbFmt)
+            .AddSpan(Ui.Hint(L.T("ウィンドウの大きさに関係なく、入力された映像の解像度で保存します。")), before: 4);
+        var stack = Ui.Stack();
+        stack.Add(grid);
 
         // 表示どおりに保存: only the Direct3D renderer has a composed frame to save.
         bool canDisplaySize = _video.SupportsScalingQuality;
-        var chkDisplay = new WrapCheckBox
-        {
-            Text = L.T("表示どおりの大きさで保存する（拡大の画質を反映。Direct3D 描画のとき）"),
-            Checked = _settings.SaveDisplaySize,
-            Enabled = canDisplaySize,
-            Margin = new Padding(0, 0, 0, canDisplaySize ? Ui.Gap : 0),
-        };
-        stack.Controls.Add(chkDisplay);
+        var chkDisplay = Ui.Check(L.T("表示どおりの大きさで保存する（拡大の画質を反映。Direct3D 描画のとき）"), _settings.SaveDisplaySize);
+        chkDisplay.Enabled = canDisplaySize;
+        stack.Add(chkDisplay, before: Ui.Pad + 4);
         if (!canDisplaySize)
-        {
-            var displayHint = Ui.FlowHint(L.T("Direct3D 描画のときに使えます（映像 → 描画方式）"));
-            displayHint.Margin = new Padding(Ui.Gap * 2 + 8, 0, 0, Ui.Gap);
-            stack.Controls.Add(displayHint);
-        }
+            stack.Add(Ui.Hint(L.T("Direct3D 描画のときに使えます（映像 → 描画方式）")), before: 2, indent: 24);
 
-        var chkCopy = new WrapCheckBox
-        {
-            Text = L.T("保存したらクリップボードにもコピーする"),
-            Checked = _settings.SnapshotAlsoCopy,
-            Margin = new Padding(0, 0, 0, Ui.Gap),
-        };
-        stack.Controls.Add(chkCopy);
+        var chkCopy = stack.Add(Ui.Check(L.T("保存したらクリップボードにもコピーする"), _settings.SnapshotAlsoCopy), before: Ui.Gap + 4);
+        var chkProfile = stack.Add(Ui.Check(L.T("プロファイルごとにフォルダを分ける"), _settings.SnapshotByProfile), before: Ui.Gap + 4);
+        stack.Add(Ui.Hint(L.T("使っているプロファイルの名前のフォルダに保存します。プロファイルを使っていないときは保存先にそのまま保存します。")), before: 2, indent: 24);
 
-        var chkProfile = new WrapCheckBox
-        {
-            Text = L.T("プロファイルごとにフォルダを分ける"),
-            Checked = _settings.SnapshotByProfile,
-            Margin = new Padding(0, 0, 0, 2),
-        };
-        stack.Controls.Add(chkProfile);
-        var profileHint = Ui.FlowHint(L.T("使っているプロファイルの名前のフォルダに保存します。プロファイルを使っていないときは保存先にそのまま保存します。"));
-        profileHint.Margin = new Padding(Ui.Gap * 2 + 8, 0, 0, 0);
-        stack.Controls.Add(profileHint);
-
-        var reset = new Button { Text = L.T("既定に戻す") };
+        var reset = Ui.Btn(L.T("既定に戻す"));
         reset.Click += (_, _) =>
         {
             txtDir.Text = Path.Combine(
@@ -457,11 +395,8 @@ public sealed partial class MainForm
             chkCopy.Checked = false;
             chkProfile.Checked = false;
         };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = L.T("キャンセル"), DialogResult = DialogResult.Cancel };
-        Ui.Frame(dlg, stack, false, reset, ok, cancel);
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = cancel;
+        UiButton ok = Ui.FrameOkCancel(dlg, stack, left: new Button[] { reset });
+        dlg.InitialFocus = ok;   // not the read-only path (it would open selected)
 
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
@@ -486,56 +421,44 @@ public sealed partial class MainForm
         int plus = ver.IndexOf('+'); // strip build metadata if present
         if (plus > 0) ver = ver[..plus];
 
-        const int dlgW = 400, dlgH = 330;
-        using var dlg = Ui.NewDialog(L.T("バージョン情報"), dlgW, dlgH);
+        using var dlg = Ui.NewDialog(L.T("バージョン情報"), 420);
 
-        var pic = new PictureBox
+        // The 256 px frame of the exe's icon, drawn at the size the layout gives it (crisp at 200%, unlike the 32 px
+        // frame of Form.Icon stretched).
+        var icon = new UiIcon(Ui.AppIcon, 48);
+        var title = Ui.Styled(L.T("YuCap - キャプチャビューア"), Ui.TitlePt, FontStyle.Bold);
+        var version = Ui.Text(L.F("バージョン {0}", ver) + "\n© 2026 YUGO");
+        var copy = Ui.Link(L.T("バージョンをコピー"), () =>
         {
-            Location = new Point(20, 20),
-            Size = new Size(48, 48),
-            SizeMode = PictureBoxSizeMode.StretchImage,
-        };
-        try { pic.Image = Icon?.ToBitmap(); } catch { /* no icon */ }
+            try { Clipboard.SetText("YuCap " + ver); ShowOsd(L.T("バージョンをコピーしました")); }
+            catch (Exception ex) { Log.Info("about: copy failed - " + ex.Message); }
+        });
+        var site = Ui.Link("github.com/Yu5rin/YuCap", () => OpenUrl("https://github.com/Yu5rin/YuCap"));
+        var head = Ui.Stack();
+        head.Add(title);
+        head.Add(version, before: 4);
+        head.Add(Ui.Row(copy, site), before: 4);
 
-        var title = new Label
-        {
-            Text = L.T("YuCap - キャプチャビューア"),
-            Font = new Font("Segoe UI", 13f, FontStyle.Bold),
-            AutoSize = true,
-            Location = new Point(80, 22),
-        };
-        var version = new Label
-        {
-            Text = L.F("バージョン {0}", ver) + "\n© 2026 YUGO",
-            AutoSize = true,
-            Location = new Point(82, 50),
-        };
         // Every third-party component in the exe (the full texts are behind ライセンス...: THIRD-PARTY-NOTICES.txt, embedded).
-        string bullet = L.English ? "  - " : "  ・";
-        var libs = new Label
-        {
-            Text = L.T("使用ライブラリ:") + "\n" +
-                   bullet + "Windows Media Foundation / Direct3D (Windows)\n" +
-                   bullet + "NAudio — MIT License\n" +
-                   bullet + "Vortice.Windows, Vortice.Mathematics — MIT License\n" +
-                   bullet + "SharpGen.Runtime — MIT License\n" +
-                   bullet + "AMD FidelityFX Super Resolution 1 — MIT License\n" +
-                   bullet + "Anime4K — MIT License\n" +
-                   bullet + "NVIDIA Optical Flow SDK (headers) — MIT License",
-            AutoSize = true,
-            Location = new Point(20, 96),
-        };
-        var ok = Ui.Button("OK", dlgW - Ui.Pad - Ui.ButtonWidth, dlgH - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
-        ok.DialogResult = DialogResult.OK;
-        var licenses = Ui.Button(L.T("ライセンス..."), Ui.Pad, dlgH - Ui.Pad - Ui.ButtonHeight);
-        licenses.Click += (_, _) => ShowThirdPartyNotices(dlg);
+        var libs = Ui.Grid();
+        void Lib(string name, string license) => libs.AddRow(null, Ui.Text("•  " + name), Ui.Caption(license), before: 2);
+        Lib("Windows Media Foundation / Direct3D (Windows)", string.Empty);
+        Lib("NAudio", "MIT License");
+        Lib("Vortice.Windows (Direct3D11, DXGI, D3DCompiler, DirectComposition), Vortice.Mathematics", "MIT License");
+        Lib("SharpGen.Runtime", "MIT License");
+        Lib("AMD FidelityFX Super Resolution 1", "MIT License");
+        Lib("Anime4K", "MIT License");
+        Lib("NVIDIA Optical Flow SDK (headers)", "MIT License");
 
-        dlg.Controls.AddRange(new Control[] { pic, title, version, libs, licenses, ok });
-        dlg.AcceptButton = ok;
-        dlg.CancelButton = ok;
+        var body = Ui.Stack();
+        body.Add(Ui.Row(icon, Ui.Before(Ui.Stretch(head), Ui.Pad)));
+        body.Add(Ui.Caption(L.T("使用ライブラリ:")), before: Ui.Pad + 4);
+        body.Add(libs, before: 4);
+
+        var licenses = Ui.Btn(L.T("ライセンス..."));
+        licenses.Click += (_, _) => ShowThirdPartyNotices(dlg);
+        Ui.FrameClose(dlg, body, "OK", left: new Button[] { licenses });
         dlg.ShowDialog(this);
-        pic.Image?.Dispose();
-        title.Font.Dispose();
     }
 
     /// <summary>The licence texts of the third-party components (THIRD-PARTY-NOTICES.txt, embedded so that the release stays one exe).</summary>
@@ -555,8 +478,7 @@ public sealed partial class MainForm
             text = "https://github.com/Yu5rin/YuCap/blob/main/THIRD-PARTY-NOTICES.txt";
         }
 
-        const int w = 640, h = 480;
-        using var dlg = Ui.NewDialog(L.T("ライセンス"), w, h);
+        using var dlg = Ui.NewDialog(L.T("ライセンス"), 680, 480);
         var box = new TextBox
         {
             Multiline = true,
@@ -564,40 +486,12 @@ public sealed partial class MainForm
             ScrollBars = ScrollBars.Both,
             WordWrap = false,
             Text = text,
-            Location = new Point(Ui.Pad, Ui.Pad),
-            Size = new Size(w - 2 * Ui.Pad, h - 3 * Ui.Pad - Ui.ButtonHeight),
-            Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom,
+            BorderStyle = BorderStyle.None,
         };
-        using var mono = new Font("Consolas", 9f);
-        box.Font = mono;
-        var close = Ui.Button(L.T("閉じる"), w - Ui.Pad - Ui.ButtonWidth, h - Ui.Pad - Ui.ButtonHeight, Ui.ButtonWidth, true);
-        close.DialogResult = DialogResult.OK;
-        dlg.Controls.AddRange(new Control[] { box, close });
-        dlg.AcceptButton = close;
-        dlg.CancelButton = close;
-        dlg.Shown += (_, _) => { box.SelectionStart = 0; box.SelectionLength = 0; close.Focus(); };
+        Ui.Opt(box).FontPt = Ui.BodyPt;   // the UI font (Consolas has no Japanese; a monospace look is not needed)
+        Ui.FrameClose(dlg, box, fill: true);
+        dlg.Shown += (_, _) => { box.SelectionStart = 0; box.SelectionLength = 0; };
         dlg.ShowDialog(owner);
     }
 
-}
-
-/// <summary>A check box whose text wraps to the width its dialog really has (a plain auto-sized check box
-/// measures the text on one line, so a long caption runs off the dialog at larger scalings or in English).</summary>
-internal sealed class WrapCheckBox : CheckBox
-{
-    public WrapCheckBox() { AutoSize = true; }
-
-    public override Size GetPreferredSize(Size proposedSize)
-    {
-        Form? f = FindForm();
-        int w = 0;
-        if (f != null && f.ClientSize.Width > 0)
-            w = f.ClientSize.Width - (f.Controls.Count > 0 ? f.Controls[0].Padding.Horizontal : 0) - Margin.Horizontal;
-        if (w <= 0) w = proposedSize.Width > 1 && proposedSize.Width < 100000 ? proposedSize.Width : 300;
-        int box = (int)Math.Ceiling(22 * DeviceDpi / 96.0);
-        Size ts = TextRenderer.MeasureText(Text, Font, new Size(Math.Max(20, w - box), int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
-        int h = Math.Max(ts.Height + 6, (int)Math.Ceiling(20 * DeviceDpi / 96.0));
-        return new Size(Math.Min(w, ts.Width + box), h);
-    }
 }

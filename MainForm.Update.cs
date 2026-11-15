@@ -167,16 +167,16 @@ public sealed partial class MainForm
                 if (manual && result.NewerVersion != null)
                 {
                     // Not a network failure: a newer release exists but has no file that can be installed from here.
-                    if (MessageBox.Show(this, L.F("{0}\n\nリリースページを開きますか？", result.Error),
-                            "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes
+                    if (Ui.Message(this, L.F("{0}\n\nリリースページを開きますか？", result.Error),
+                            MsgKind.Warning, MessageBoxButtons.YesNo) == DialogResult.Yes
                         && result.PageUrl != null)
                         OpenUrl(result.PageUrl);
                 }
                 else if (manual)
                 {
-                    MessageBox.Show(this,
+                    Ui.Message(this,
                         L.F("更新の確認に失敗しました。\nネットワーク接続を確認してください。\n\n{0}", result.Error),
-                        "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        MsgKind.Warning);
                 }
                 return;
             }
@@ -191,9 +191,9 @@ public sealed partial class MainForm
                     // item goes back to "check for updates".
                     _pendingUpdate = null;
                     UpdateChecks();
-                    MessageBox.Show(this,
+                    Ui.Message(this,
                         L.F("現在のバージョンは {0} です。\n更新はありません。", Updater.CurrentVersion),
-                        "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        MsgKind.Info);
                 }
                 return;
             }
@@ -300,9 +300,9 @@ public sealed partial class MainForm
         // halfway through.
         if (!Updater.CanWriteToInstallDir())
         {
-            if (MessageBox.Show(this,
+            if (Ui.Message(this,
                     L.T("インストール先に書き込めないため、自動更新できません。\nリリースページを開きますか？"),
-                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                    MsgKind.Warning, MessageBoxButtons.YesNo) == DialogResult.Yes)
                 OpenUrl(info.PageUrl);
             return;
         }
@@ -328,10 +328,10 @@ public sealed partial class MainForm
             PromptForUpdate(info);
             return;
         }
-        if (MessageBox.Show(this,
+        if (Ui.Message(this,
                 L.F("今すぐ YuCap を再起動して v{0} に更新しますか？\n\n「いいえ」を選んだ場合は、YuCap を閉じたときに更新されます。",
                     info.Version),
-                "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                MsgKind.Question, MessageBoxButtons.YesNo) != DialogResult.Yes)
             return;
         ApplyAndClose(staged, info.Sha256);
     }
@@ -345,46 +345,29 @@ public sealed partial class MainForm
     /// </summary>
     private UpdatePrompt AskAboutUpdate(UpdateInfo info)
     {
-        using var dlg = Ui.NewDialog(L.T("更新があります"), 420, 200);
+        using var dlg = Ui.NewDialog(L.T("更新があります"), 420);
 
-        // Stacked in a table and framed by Ui.Frame: sizes follow the real controls, not pixel positions.
         var stack = Ui.Stack();
-        var head = Ui.Label(
-            L.F("新しいバージョン {0} があります（現在 {1}）。", info.Version, Updater.CurrentVersion), 0, 0);
-        head.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-        head.Margin = new Padding(0, 0, 0, Ui.Gap);
-        var body = Ui.FlowHint(L.T("更新すると YuCap は自動的に再起動します。"));
-        body.Margin = new Padding(0, 0, 0, Ui.Gap / 2);
-        var size = Ui.FlowHint(
-            L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0")));
-        size.Margin = new Padding(0, 0, 0, Ui.Gap);
-        var notes = new LinkLabel
-        {
-            Text = L.T("リリースノートを見る"),
-            AutoSize = true,
-            Margin = Padding.Empty,
-        };
-        notes.LinkClicked += (_, _) => OpenUrl(info.PageUrl);
-        stack.Controls.Add(head);
-        stack.Controls.Add(body);
-        stack.Controls.Add(size);
-        stack.Controls.Add(notes);
+        stack.Add(Ui.Heading(L.F("新しいバージョン {0} があります（現在 {1}）。", info.Version, Updater.CurrentVersion)));
+        stack.Add(Ui.Text(L.T("更新すると YuCap は自動的に再起動します。")), before: Ui.Gap + 4);
+        stack.Add(Ui.Hint(L.F("ダウンロードサイズ: 約 {0} MB", (info.Size / 1024.0 / 1024.0).ToString("0.0"))), before: 4);
+        stack.Add(Ui.Link(L.T("リリースノートを見る"), () => OpenUrl(info.PageUrl)), before: Ui.Gap + 4);
 
-        // Right-aligned as a group, in reading order 今すぐ更新 / 後で / この版をスキップ.
-        var now = new Button { Text = L.T("今すぐ更新") };
-        var later = new Button { Text = L.T("後で") };
-        var skip = new Button { Text = L.T("この版をスキップ") };
+        // 今すぐ更新 is the primary action, 後で next to it (Esc); この版をスキップ apart at the left.
+        var now = Ui.Btn(L.T("今すぐ更新"));
+        var later = Ui.Btn(L.T("後で"));
+        var skip = Ui.Btn(L.T("この版をスキップ"));
 
         var result = UpdatePrompt.Later;
         now.Click += (_, _) => { result = UpdatePrompt.Now; dlg.Close(); };
         later.Click += (_, _) => { result = UpdatePrompt.Later; dlg.Close(); };
         skip.Click += (_, _) => { result = UpdatePrompt.Skip; dlg.Close(); };
 
-        Ui.Frame(dlg, stack, false, now, later, skip);
+        Ui.Frame(dlg, stack, new Button[] { now, later }, left: new Button[] { skip });
         dlg.AcceptButton = now;
         dlg.CancelButton = later;
+        dlg.InitialFocus = now;
         dlg.ShowDialog(this);
-        head.Font.Dispose();
         return result;
     }
 
@@ -392,19 +375,19 @@ public sealed partial class MainForm
     /// drives the download, so there is nothing here to await.</summary>
     private void DownloadAndApply(UpdateInfo info)
     {
-        using var dlg = Ui.NewDialog(L.T("更新をダウンロード中"), 380, 120);
+        using var dlg = Ui.NewDialog(L.T("更新をダウンロード中"), 400);
         dlg.ControlBox = false;   // only the Cancel button may close this while a download is in flight
 
         var stack = Ui.Stack();
-        var lbl = Ui.Label(L.F("{0} をダウンロードしています...", info.AssetName), 0, 0);
-        lbl.Margin = new Padding(0, 0, 0, Ui.Gap);
-        var bar = new ProgressBar { Maximum = 100, Height = 22, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = Padding.Empty };
-        var cancelBtn = new Button { Text = L.T("キャンセル") };
+        stack.Add(Ui.Text(L.F("{0} をダウンロードしています...", info.AssetName)));
+        var bar = stack.Add(new UiProgress { Maximum = 100 }, before: Ui.Gap + 4);
+        var cancelBtn = Ui.Btn(L.T("キャンセル"));
         var cts = new CancellationTokenSource();
         cancelBtn.Click += (_, _) => { cts.Cancel(); dlg.Close(); };
-        stack.Controls.Add(lbl);
-        stack.Controls.Add(bar);
-        Ui.Frame(dlg, stack, false, cancelBtn);
+        Ui.Frame(dlg, stack, new Button[] { cancelBtn });
+        cancelBtn.Primary = false;
+        dlg.AcceptButton = null;
+        dlg.CancelButton = cancelBtn;
 
         string? file = null;
         Exception? failure = null;
@@ -427,8 +410,8 @@ public sealed partial class MainForm
 
         if (failure != null)
         {
-            MessageBox.Show(this, L.F("更新のダウンロードに失敗しました。\n\n{0}", Errors.Describe(failure)),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("更新のダウンロードに失敗しました。\n\n{0}", Errors.Describe(failure)),
+                MsgKind.Error);
             return;
         }
         if (file == null) return;   // cancelled
@@ -455,10 +438,10 @@ public sealed partial class MainForm
             {
                 // The new build IS installed (it runs at the next launch) but could not be started from here: no rollback
                 // happened, so do not claim one. This window keeps running with its devices.
-                MessageBox.Show(this,
+                Ui.Message(this,
                     L.F("更新ファイルの入れ替えは終わりましたが、新しい版を起動できませんでした。YuCap をいったん閉じて、もう一度起動してください。\n\n{0}",
                         Updater.LastRelaunchError ?? "?"),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MsgKind.Warning);
                 return;
             }
             _skipSaveOnClose = true;  // settings already written above
@@ -475,9 +458,9 @@ public sealed partial class MainForm
         {
             // The swap failed and was rolled back: the running build is untouched and its video and audio were never stopped.
             Log.Info("update apply failed: " + ex.Message);
-            MessageBox.Show(this,
+            Ui.Message(this,
                 L.F("更新の適用に失敗しました。元の状態に戻しました。\n\n{0}", Errors.Describe(ex)),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MsgKind.Error);
         }
         finally
         {

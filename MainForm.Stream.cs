@@ -20,7 +20,7 @@ public sealed partial class MainForm
     private ToolStripMenuItem? _miStream, _miStreamSize;
     private readonly List<ToolStripMenuItem> _streamSizeItems = new();
 
-    private void AddStreamMenu(ToolStripMenuItem view)
+    private void AddStreamMenu(ToolStripMenuItem menu)
     {
         _miStream = new ToolStripMenuItem(L.T("配信用ウィンドウを開く"), null, (_, _) => ToggleStreamWindow()) { Name = "stream" };
         _miStreamSize = new ToolStripMenuItem(L.T("配信用ウィンドウの大きさ"));
@@ -28,12 +28,12 @@ public sealed partial class MainForm
         {
             string k = key;
             string label = k == StreamSizes.Video ? L.T("映像と同じ") : k == "1920x1080" ? k + L.Par(L.T("既定")) : k;
-            var it = new ToolStripMenuItem(label, null, (_, _) => SetStreamSize(k)) { Tag = k };
+            var it = Radio(new ToolStripMenuItem(label, null, (_, _) => SetStreamSize(k)) { Tag = k });
             _streamSizeItems.Add(it);
             _miStreamSize.DropDownItems.Add(it);
         }
-        view.DropDownItems.Add(_miStream);
-        view.DropDownItems.Add(_miStreamSize);
+        menu.DropDownItems.Add(_miStream);
+        menu.DropDownItems.Add(_miStreamSize);
     }
 
     private void UpdateStreamChecks()
@@ -45,7 +45,7 @@ public sealed partial class MainForm
         _miStream.Text = _stream != null ? L.T("配信用ウィンドウを閉じる") : L.T("配信用ウィンドウを開く");
         _miStream.ToolTipText = ok
             ? L.T("OBS などで取り込むための、映像だけのウィンドウを別に開きます（OSD・情報表示・メニューは入りません）。")
-            : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
+            : L.T(D3dOnlyTip);
         _miStreamSize.ToolTipText = ok ? string.Empty : _miStream.ToolTipText;
         string cur = StreamSizes.Normalize(_settings.StreamWindowSize);
         foreach (var it in _streamSizeItems) it.Checked = (string)it.Tag! == cur;

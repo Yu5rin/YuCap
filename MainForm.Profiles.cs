@@ -8,12 +8,11 @@ using System.Windows.Forms;
 
 namespace YuCap;
 
-/// <summary>Per-source profiles (プロファイル), the black-border crop and the low-latency toggle.</summary>
+/// <summary>Per-source profiles (プロファイル) and the black-border crop.</summary>
 public sealed partial class MainForm
 {
     private ToolStripMenuItem _miProfiles = null!;
     private ToolStripMenuItem _miCrop = null!;
-    private ToolStripMenuItem _miLowLatency = null!;
 
     // =====================================================================
     //  プロファイル
@@ -65,7 +64,7 @@ public sealed partial class MainForm
 
     private ToolStripMenuItem BuildProfilesMenu()
     {
-        _miProfiles = new ToolStripMenuItem(L.T("プロファイル(&P)"));
+        _miProfiles = Refilled(TopMenu(IdProfiles, L.T("プロファイル(&P)")));
         // Rebuilt every time it opens (the state it shows - which profile is active, whether it was
         // changed - is worked out then), so nothing else has to keep it up to date.
         _miProfiles.DropDownOpening += (_, _) => UpdateProfileMenu();
@@ -100,11 +99,11 @@ public sealed partial class MainForm
             int index = i;
             // '&' would turn into a menu mnemonic.
             string text = p.Name.Replace("&", "&&") + (isActive && modified ? " *" : string.Empty);
-            items.Add(new ToolStripMenuItem(text, null, (_, _) => ApplyProfileAt(index))
+            items.Add(Radio(new ToolStripMenuItem(text, null, (_, _) => ApplyProfileAt(index))
             {
                 Checked = isActive,
-                ShortcutKeyDisplayString = "Ctrl+" + (i + 1),
-            });
+                ShortcutKeyDisplayString = i < 9 ? "Ctrl+" + (i + 1) : string.Empty,
+            }));
         }
 
         items.Add(new ToolStripSeparator());
@@ -116,11 +115,20 @@ public sealed partial class MainForm
             save.ToolTipText = L.F("プロファイルは最大{0}個までです", AppSettings.MaxProfiles);
         }
         items.Add(save);
+        // The commands below act on the profile in use: they name it, and say why they are grey when there is none.
+        string noneTip = L.T("使用中のプロファイルがないため使えません。上の一覧から選ぶと使えます。");
         if (active != null)
-            items.Add(new ToolStripMenuItem(L.F("「{0}」を現在の設定で上書き", active.Name.Replace("&", "&&")), null,
-                (_, _) => OverwriteActiveProfile()));
-        items.Add(new ToolStripMenuItem(L.T("名前を変更..."), null, (_, _) => RenameActiveProfile()) { Enabled = active != null });
-        items.Add(new ToolStripMenuItem(L.T("削除..."), null, (_, _) => DeleteActiveProfile()) { Enabled = active != null });
+        {
+            string name = active.Name.Replace("&", "&&");
+            items.Add(new ToolStripMenuItem(L.F("「{0}」を現在の設定で上書き...", name), null, (_, _) => OverwriteActiveProfile()));
+            items.Add(new ToolStripMenuItem(L.F("「{0}」の名前を変更...", name), null, (_, _) => RenameActiveProfile()));
+            items.Add(new ToolStripMenuItem(L.F("「{0}」を削除...", name), null, (_, _) => DeleteActiveProfile()));
+        }
+        else
+        {
+            items.Add(new ToolStripMenuItem(L.T("名前を変更..."), null, (_, _) => RenameActiveProfile()) { Enabled = false, ToolTipText = noneTip });
+            items.Add(new ToolStripMenuItem(L.T("削除..."), null, (_, _) => DeleteActiveProfile()) { Enabled = false, ToolTipText = noneTip });
+        }
         items.Add(new ToolStripSeparator());
         items.Add(BuildAutoProfileMenu());
     }
@@ -209,7 +217,7 @@ public sealed partial class MainForm
                 LoadProfileValues(before);
                 Exception? back = await ReplaceEngineAsync(before.Renderer);
                 _videoError = back != null ? Errors.Describe(back) : null;
-                MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, reason, MsgKind.Warning);
             }
         }
         else if (hasDevice && modeDiffers)
@@ -223,8 +231,8 @@ public sealed partial class MainForm
             catch (Exception ex)
             {
                 failed = true;
-                MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
+                    MsgKind.Error);
                 LoadProfileValues(before);
                 await RecoverVideoAsync();
             }
@@ -259,6 +267,10 @@ public sealed partial class MainForm
     {
         VideoProfile? active = FindActiveProfile();
         if (active == null) return;
+        // Nothing to undo with: ask once before the profile's values are replaced.
+        if (Ui.Message(this, L.F("プロファイル「{0}」を現在の設定で上書きしますか？", active.Name), MsgKind.Question,
+                MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
         int i = Profiles.IndexOf(active);
         VideoProfile updated = CaptureProfile(active.Name);
         updated.Signature = SignatureForSave(active.Signature);
@@ -281,8 +293,8 @@ public sealed partial class MainForm
     {
         VideoProfile? active = FindActiveProfile();
         if (active == null) return;
-        if (MessageBox.Show(this, L.F("プロファイル「{0}」を削除しますか？", active.Name), "YuCap",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        if (Ui.Message(this, L.F("プロファイル「{0}」を削除しますか？", active.Name), MsgKind.Question,
+                MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             return;
         Profiles.Remove(active);
         _settings.ActiveProfile = null;
@@ -303,18 +315,15 @@ public sealed partial class MainForm
     /// <paramref name="ownName"/> is the name being renamed, which may of course be kept.</summary>
     private string? AskProfileName(string title, string initial, string? ownName)
     {
-        using var dlg = Ui.NewDialog(title, 380, 150);
-        int inner = dlg.ClientSize.Width - 2 * Ui.Pad;
+        using var dlg = Ui.NewDialog(title, 380);
 
-        var label = Ui.Label(L.T("プロファイル名:"), Ui.Pad, 16);
-        var box = new TextBox
-        {
-            Text = initial, MaxLength = VideoProfile.MaxNameLength,
-            Location = new Point(Ui.Pad, 38), Width = inner,
-        };
-        var reason = Ui.Hint(string.Empty, Ui.Pad, 68, inner);
-        dlg.Controls.AddRange(new Control[] { label, box, reason });
-        Button ok = Ui.AddOkCancel(dlg);
+        var box = new TextBox { Text = initial, MaxLength = VideoProfile.MaxNameLength };
+        var reason = Ui.Hint(string.Empty);   // one line is kept for it, so the dialog does not jump while typing
+        var stack = Ui.Stack();
+        stack.Add(Ui.Caption(L.T("プロファイル名:")));
+        stack.Add(box, before: 4);
+        stack.Add(reason, before: 4);
+        Button ok = Ui.FrameOkCancel(dlg, stack);
 
         string? Problem(string text)
         {
@@ -330,11 +339,12 @@ public sealed partial class MainForm
             string? problem = Problem(box.Text.Trim());
             ok.Enabled = problem == null;
             reason.Text = problem ?? string.Empty;
-            reason.ForeColor = box.Text.Trim().Length == 0 ? SystemColors.GrayText : Color.Firebrick;
+            reason.ForeColor = box.Text.Trim().Length == 0 ? Ui.Colors.SubText : Ui.Colors.Danger;
         }
         box.TextChanged += (_, _) => Check();
         Check();
-        dlg.Shown += (_, _) => { box.Focus(); box.SelectAll(); };
+        dlg.InitialFocus = box;
+        dlg.Shown += (_, _) => box.SelectAll();
 
         return dlg.ShowDialog(this) == DialogResult.OK ? box.Text.Trim() : null;
     }
@@ -352,39 +362,34 @@ public sealed partial class MainForm
         (int l0, int t0, int r0, int b0) = (_settings.CropLeft, _settings.CropTop, _settings.CropRight, _settings.CropBottom);
         Size src = _video.CurrentResolution;   // the device's own size: the crop is in source pixels
 
-        using var dlg = Ui.NewDialog(L.T("黒い縁の切り取り"), 400, 236);
-        int inner = dlg.ClientSize.Width - 2 * Ui.Pad;
+        using var dlg = Ui.NewDialog(L.T("黒い縁の切り取り"), 400);
 
-        // label column wide enough for the longest of the four side names in the current language
-        int lw = 24;
-        foreach (string s in new[] { L.T("左"), L.T("上"), L.T("右"), L.T("下") })
-            lw = Math.Max(lw, TextRenderer.MeasureText(s, dlg.Font).Width + 8);
-
-        NumericUpDown Spin(string name, int x, int y, int value, int sourceLen)
+        UiGrid sides = Ui.Grid(), sides2 = Ui.Grid();
+        NumericUpDown Spin(UiGrid grid, string name, int value, int sourceLen)
         {
             int max = sourceLen > CropMath.MinSide ? Math.Min(AppSettings.MaxCrop, sourceLen - CropMath.MinSide) : AppSettings.MaxCrop;
-            var lbl = Ui.Label(name, x, y + 4);
-            var nud = new NumericUpDown
-            {
-                Minimum = 0, Maximum = max, Value = Math.Clamp(value, 0, max),
-                Location = new Point(x + lw, y), Width = 84,
-            };
-            var px = Ui.Label("px", x + lw + 90, y + 4);
-            dlg.Controls.AddRange(new Control[] { lbl, nud, px });
+            var nud = Ui.Number(0, max, value, 84);
+            grid.AddRow(Ui.Caption(name), nud, Ui.Caption("px"));
             return nud;
         }
 
-        NumericUpDown nl = Spin(L.T("左"), Ui.Pad, 16, l0, src.Width);
-        NumericUpDown nt = Spin(L.T("上"), 200, 16, t0, src.Height);
-        NumericUpDown nr = Spin(L.T("右"), Ui.Pad, 50, r0, src.Width);
-        NumericUpDown nb = Spin(L.T("下"), 200, 50, b0, src.Height);
+        // 上・下 in one column and 左・右 in the next (tab order follows the same reading order).
+        NumericUpDown nt = Spin(sides, L.T("上"), t0, src.Height);
+        NumericUpDown nb = Spin(sides, L.T("下"), b0, src.Height);
+        NumericUpDown nl = Spin(sides2, L.T("左"), l0, src.Width);
+        NumericUpDown nr = Spin(sides2, L.T("右"), r0, src.Width);
 
-        var result = Ui.Hint(string.Empty, Ui.Pad, 86, inner);
-        var detect = Ui.Button(L.T("自動で検出"), Ui.Pad, 112, 110);
-        var reset = Ui.Button(L.T("既定に戻す"), detect.Right + Ui.Gap, 112, 110);
-        var note = Ui.Hint(string.Empty, Ui.Pad, 148, inner);
-        dlg.Controls.AddRange(new Control[] { result, detect, reset, note });
-        Ui.AddOkCancel(dlg);
+        var result = Ui.Text(string.Empty);
+        var detect = Ui.Btn(L.T("自動で検出"));
+        var reset = Ui.Btn(L.T("既定に戻す"));
+        var note = Ui.Hint(string.Empty);
+        var stack = Ui.Stack();
+        stack.Add(Ui.Row(Ui.Stretch(sides, false), Ui.Before(Ui.Stretch(sides2, false), 32)));
+        stack.Add(result, before: Ui.Pad);
+        stack.Add(detect, before: Ui.Gap);
+        stack.Add(note, before: 4);
+        Ui.FrameOkCancel(dlg, stack, left: new Button[] { reset });
+        dlg.InitialFocus = nt;
 
         bool loading = false;
         void Push()
@@ -508,33 +513,5 @@ public sealed partial class MainForm
             };
             return src;
         }
-    }
-
-    // =====================================================================
-    //  低遅延モード（試験版）
-    // =====================================================================
-
-    /// <summary>
-    /// The swap chain kind (DirectComposition vs a window swap chain that can tear) is fixed when
-    /// the engine starts, so the switch is a restart on a fresh window - the same path as changing
-    /// the renderer, including falling back when the new mode cannot start.
-    /// </summary>
-    private async void ToggleLowLatency()
-    {
-        if (_engineSwapping || _engineSwitchBusy) { Log.Info("ToggleLowLatency: another switch is running"); UpdateChecks(); return; }
-        _engineSwitchBusy = true;
-        _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
-        try { await ToggleLowLatencyCoreAsync(); }
-        catch (Exception ex) { Log.Info("ToggleLowLatency: " + ex); }
-        finally { _devOpBusy--; _engineSwitchBusy = false; }
-    }
-
-    private async Task ToggleLowLatencyCoreAsync()
-    {
-        if (!_video.SupportsLowLatency) return;
-        NoteUserChange();
-        bool on = !_settings.LowLatency;
-        if (await SetLowLatencyAsync(on))   // shared with the style switch (MainForm.Style.cs)
-            ShowOsd(on ? L.T("低遅延モード: オン") : L.T("低遅延モード: オフ"));
     }
 }

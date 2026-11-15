@@ -49,8 +49,10 @@ internal static class Errors
     private const int AudclntDeviceInvalidated = unchecked((int)0x88890004);
     private const int AudclntUnsupportedFormat = unchecked((int)0x88890008);
 
-    /// <summary>User-facing description of a failure.</summary>
-    public static string Describe(Exception ex)
+    /// <summary>User-facing description of a failure. <paramref name="accessDenied"/> replaces the default reading of
+    /// an access-denied file-system error ("no permission to write to the save folder"), for callers whose failure is
+    /// about something else (the startup registration in the registry, for one).</summary>
+    public static string Describe(Exception ex, string? accessDenied = null)
     {
         // Thrown by our own code with an already-readable, localized message.
         if (ex is UserFacingException) return ex.Message;
@@ -59,9 +61,9 @@ internal static class Errors
         // otherwise an AggregateException or TargetInvocationException always
         // falls through to the generic "unknown error" branch.
         if (ex is AggregateException { InnerExceptions.Count: 1 } agg)
-            return Describe(agg.InnerException!);
+            return Describe(agg.InnerException!, accessDenied);
         if (ex is TargetInvocationException { InnerException: { } inner })
-            return Describe(inner);
+            return Describe(inner, accessDenied);
 
         // File-system errors first, before any HRESULT mapping below — a
         // snapshot save failing with access denied must not be told "another
@@ -69,8 +71,8 @@ internal static class Errors
         // ERROR_ACCESS_DENIED for a capture device.
         switch (ex)
         {
-            case UnauthorizedAccessException:
-                return L.T("保存先に書き込む権限がありません。別のフォルダを選んでください。");
+            case UnauthorizedAccessException or System.Security.SecurityException:
+                return accessDenied ?? L.T("保存先に書き込む権限がありません。別のフォルダを選んでください。");
             case DirectoryNotFoundException:
                 return L.T("保存先のフォルダが見つかりません。");
             case IOException io when io.HResult == ErrorDiskFull || io.HResult == ErrorHandleDiskFull:

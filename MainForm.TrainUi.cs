@@ -41,57 +41,47 @@ public sealed partial class MainForm
             return;
         }
 
-        using var dlg = Ui.NewDialog(L.T("自分専用モデルの学習"), 520, 470);
+        using var dlg = Ui.NewDialog(L.T("自分専用モデルの学習"), 480);
         var stack = Ui.Stack();
-        static Label Cap(string t) => new() { Text = t, AutoSize = true, Margin = new Padding(0, 0, 0, 2) };
+        // A caption 4 px above its control; 16 px between the groups.
+        T Field<T>(string caption, T control, int width96 = 0) where T : Control
+        {
+            stack.Add(Ui.Caption(caption), before: stack.Controls.Count == 0 ? 0 : Ui.Pad);
+            if (width96 > 0) Ui.Fixed(control, width96);
+            return stack.Add(control, before: 4);
+        }
 
         // 名前
-        stack.Controls.Add(Cap(L.T("モデルの名前（半角の英数字と _ -）")));
-        var name = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, 2), MaxLength = 32 };
-        stack.Controls.Add(name);
-        var nameNote = Ui.FlowHint(string.Empty);
-        nameNote.Margin = new Padding(0, 0, 0, Ui.Gap);
-        stack.Controls.Add(nameNote);
+        var name = Field(L.T("モデルの名前（半角の英数字と _ -）"), new TextBox { MaxLength = 32 });
+        var nameNote = stack.Add(Ui.Hint(string.Empty), before: 4);
 
-        // 形
-        stack.Controls.Add(Cap(L.T("形")));
-        var arch = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, Ui.Gap) };
-        arch.Items.Add(L.T("M（標準）"));
-        arch.Items.Add(L.T("L（高画質・GPU 約 1.7 倍）"));
-        stack.Controls.Add(arch);
+        // 大きさ
+        var arch = Field(L.T("モデルの大きさ"), Ui.Combo(0, L.T("M（標準）"), L.T("L（高画質・GPU 約 1.7 倍）")));
 
         // 採点
-        stack.Controls.Add(Cap(L.T("採点（何を重く見て学習するか）")));
-        var loss = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, Ui.Gap) };
-        loss.Items.Add(L.T("くっきり（edge: 輪郭を強く合わせる）"));
-        loss.Items.Add(L.T("質感重視（texture: ざらつき・模様を保つ）"));
-        stack.Controls.Add(loss);
+        var loss = Field(L.T("採点（何を重く見て学習するか）"), Ui.Combo(0, L.T("くっきり（edge: 輪郭を強く合わせる）"), L.T("質感重視（texture: ざらつき・模様を保つ）")));
 
         // 時間
-        stack.Controls.Add(Cap(L.T("学習する時間（分）")));
-        var minutes = new NumericUpDown { Minimum = 1, Maximum = 600, Value = Math.Clamp(_settings.TrainMinutes, 1, 600), Anchor = AnchorStyles.Left, Width = 90, Margin = new Padding(0, 0, 0, Ui.Gap) };
-        stack.Controls.Add(minutes);
+        var minutes = Field(L.T("学習する時間（分）"), Ui.Number(1, 600, Math.Clamp(_settings.TrainMinutes, 1, 600), 96));
 
-        // 絵のフォルダー
-        stack.Controls.Add(Cap(L.T("学習に使う絵のフォルダー")));
+        // 絵のフォルダー: one check box per folder, in a box that scrolls when there are many
         var folders = TrainEnv.DataFolders();
         var counts = folders.Select(TrainEnv.CountPictures).ToList();
-        var list = new CheckedListBox { CheckOnClick = true, IntegralHeight = false, Anchor = AnchorStyles.Left | AnchorStyles.Right, Height = 84, Margin = new Padding(0, 0, 0, 2) };
+        var folderStack = Ui.Stack();
+        folderStack.DefaultGap = 4;
+        var boxes = new List<UiCheck>();
         for (int i = 0; i < folders.Count; i++)
-            list.Items.Add(L.F("{0}（{1} 枚）", Path.GetFileName(folders[i]), counts[i]), counts[i] > 0);
-        if (folders.Count == 0) list.Items.Add(L.T("（絵のフォルダーがありません）"), false);
-        stack.Controls.Add(list);
-        var total = Ui.FlowHint(string.Empty);
-        total.Margin = new Padding(0, 0, 0, Ui.Gap);
-        stack.Controls.Add(total);
+            boxes.Add(folderStack.Add(Ui.Check(L.F("{0}（{1} 枚）", Path.GetFileName(folders[i]), counts[i]), counts[i] > 0)));
+        if (folders.Count == 0) folderStack.Add(Ui.Hint(L.T("（絵のフォルダーがありません）")));
+        Field(L.T("学習に使う絵のフォルダー"), new UiScroll(folderStack) { Boxed = true, MaxHeight96 = 120 });
+        var total = stack.Add(Ui.Hint(string.Empty), before: 4);
 
         // 重い処理を止める
-        var pause = new CheckBox { Text = L.T("学習中は映像の重い処理を止める"), AutoSize = true, Checked = _settings.TrainPauseHeavy, Margin = new Padding(0, 0, 0, 2) };
-        stack.Controls.Add(pause);
+        var pause = stack.Add(Ui.Check(L.T("学習中は映像の重い処理を止める"), _settings.TrainPauseHeavy), before: Ui.Pad);
         var heavy = HeavyNow();
         string gpu = L.T("学習中は GPU を多く使います（ゲーム中は避けてください）。");
         if (heavy.Length > 0) gpu += " " + L.F("今は {0} が働いているので、GPU を分け合います。上のチェックを入れると、学習のあいだ止めて終わったら元に戻します。", heavy);
-        stack.Controls.Add(Ui.FlowHint(gpu));
+        stack.Add(Ui.Hint(gpu), before: 2, indent: 24);
 
         // 初期値
         char a0 = _settings.TrainArch == "L" ? 'L' : 'M';
@@ -105,42 +95,43 @@ public sealed partial class MainForm
             string n = name.Text.Trim();
             string? prob = TrainEnv.NameProblem(n);
             nameNote.Text = prob ?? (File.Exists(UserModels.PathOf(n)) ? L.T("同じ名前のモデルがあります。学習し直すと置き換わります。") : string.Empty);
-            nameNote.Visible = nameNote.Text.Length > 0;
+            Ui.Show(nameNote, nameNote.Text.Length > 0);
         }
         name.TextChanged += (_, _) => UpdateNote();
         arch.SelectedIndexChanged += (_, _) => { if (!nameEdited) { name.Text = TrainEnv.SuggestName(arch.SelectedIndex == 1 ? 'L' : 'M'); nameEdited = false; } };
         void UpdateTotal()
         {
             int n = 0;
-            for (int i = 0; i < folders.Count; i++) if (list.GetItemChecked(i)) n += counts[i];
+            for (int i = 0; i < folders.Count; i++) if (boxes[i].Checked) n += counts[i];
             total.Text = L.F("使う絵: 合計 {0} 枚", n) + (n > 0 && n < 40 ? "  " + L.T("（少なすぎます。数百枚以上が目安です）") : string.Empty);
         }
-        list.ItemCheck += (_, e) => BeginInvoke(new Action(UpdateTotal));
+        foreach (UiCheck b in boxes) b.CheckedChanged += (_, _) => UpdateTotal();
         UpdateNote(); UpdateTotal();
 
-        var ok = Ui.FrameOkCancel(dlg, stack, false, L.T("学習を始める"));
+        var ok = Ui.FrameOkCancel(dlg, stack, L.T("学習を始める"));
+        dlg.InitialFocus = name;
         ok.Click += (_, _) =>
         {
             string n = name.Text.Trim();
             string? prob = TrainEnv.NameProblem(n);
             var dirs = new List<string>();
-            for (int i = 0; i < folders.Count; i++) if (list.GetItemChecked(i) && counts[i] > 0) dirs.Add(folders[i]);
-            string? err = prob ?? (dirs.Count == 0 ? L.T("学習に使う絵がありません。オプション → 自分専用モデル → 学習用の絵を集める をオンにして遊んでから、もう一度どうぞ。") : null);
+            for (int i = 0; i < folders.Count; i++) if (boxes[i].Checked && counts[i] > 0) dirs.Add(folders[i]);
+            string? err = prob ?? (dirs.Count == 0 ? L.T("学習に使う絵がありません。映像 → 自分専用モデル → 学習用の絵を集める をオンにして遊んでから、もう一度どうぞ。") : null);
             if (err != null)
             {
-                MessageBox.Show(dlg, err, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Ui.Message(dlg, err, MsgKind.Info);
                 dlg.DialogResult = DialogResult.None;
                 return;
             }
             if (File.Exists(UserModels.PathOf(n)) &&
-                MessageBox.Show(dlg, L.F("「{0}」というモデルがあります。学習し直して置き換えますか？", n), "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                Ui.Message(dlg, L.F("「{0}」というモデルがあります。学習し直して置き換えますか？", n), MsgKind.Question, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             {
                 dlg.DialogResult = DialogResult.None;
                 return;
             }
             int pics = dirs.Sum(TrainEnv.CountPictures);
             if (pics < 40 &&
-                MessageBox.Show(dlg, L.F("絵が {0} 枚しかありません。少ないと効果が出ないか、逆に悪くなります。それでも始めますか？", pics), "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                Ui.Message(dlg, L.F("絵が {0} 枚しかありません。少ないと効果が出ないか、逆に悪くなります。それでも始めますか？", pics), MsgKind.Warning, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             {
                 dlg.DialogResult = DialogResult.None;
                 return;
@@ -206,7 +197,7 @@ public sealed partial class MainForm
         catch (Exception ex)
         {
             Log.Info("train: start failed - " + ex);
-            MessageBox.Show(this, L.F("学習を始められませんでした。\n\n{0}", Errors.Describe(ex)), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("学習を始められませんでした。\n\n{0}", Errors.Describe(ex)), MsgKind.Error);
             return;
         }
         ShowTrainWindow();
@@ -263,7 +254,7 @@ public sealed partial class MainForm
         TrainJob? job = _trainJob;
         if (job == null || !job.IsRunning) return;
         string msg = job.Finalizing ? L.T("仕上げを中止しますか？") : L.T("学習を中止しますか？");
-        if (MessageBox.Show(_trainWin ?? (IWin32Window)this, msg, "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+        if (Ui.Message(_trainWin ?? (IWin32Window)this, msg, MsgKind.Question, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
         if (!job.IsRunning) return;
         bool wasTraining = !job.Finalizing;
         job.Cancel();
@@ -277,8 +268,8 @@ public sealed partial class MainForm
                 {
                     if (!ReferenceEquals(job, _trainJob)) return;
                     if (wasTraining && job.HasBestCheckpoint &&
-                        MessageBox.Show(_trainWin ?? (IWin32Window)this, L.T("ここまでで一番よかった状態を、モデルとして残しますか？\n（検証に少し時間がかかります）"), "YuCap",
-                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                        Ui.Message(_trainWin ?? (IWin32Window)this, L.T("ここまでで一番よかった状態を、モデルとして残しますか？\n（検証に少し時間がかかります）"), MsgKind.Question,
+                            MessageBoxButtons.YesNo) == DialogResult.Yes)
                         FinalizeTraining(job.Options);
                     _trainWin?.RefreshNow();
                 }));
@@ -298,7 +289,7 @@ public sealed partial class MainForm
         catch (Exception ex)
         {
             Log.Info("train: finalize failed - " + ex);
-            MessageBox.Show(this, L.F("学習を始められませんでした。\n\n{0}", Errors.Describe(ex)), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("学習を始められませんでした。\n\n{0}", Errors.Describe(ex)), MsgKind.Error);
         }
     }
 
@@ -309,7 +300,7 @@ public sealed partial class MainForm
         string name = job.Options.Name;
         if (UserModels.Resolve(name) == null)
         {
-            MessageBox.Show(this, L.T("モデルのファイルが見つかりません。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.T("モデルのファイルが見つかりません。"), MsgKind.Warning);
             return;
         }
         SetUserModel(name);
@@ -413,14 +404,14 @@ public sealed partial class MainForm
         if (_trainSetupRunning) { ShowOsd(L.T("学習の準備を実行中です（黒い窓を見てください）")); return; }
         if (TrainEnv.Ready)
         {
-            MessageBox.Show(this, L.T("学習の準備はできています。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Ui.Message(this, L.T("学習の準備はできています。"), MsgKind.Info);
             return;
         }
         if (TrainEnv.Partial && !envChecked)
         {
             CheckPartialTrainEnv(ok =>
             {
-                if (ok) MessageBox.Show(this, L.T("学習の準備はできています。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (ok) Ui.Message(this, L.T("学習の準備はできています。"), MsgKind.Info);
                 else OfferTrainSetup(true);
             });
             return;
@@ -435,7 +426,7 @@ public sealed partial class MainForm
             + L.T("・消すとき: そのフォルダーを削除すれば元に戻ります（システムの Python は変えません）") + "\n"
             + L.T("・必要なもの: Python 3.10〜3.12 と NVIDIA の GPU") + "\n\n"
             + L.T("黒い窓で進み具合が表示されます。続けますか？");
-        if (MessageBox.Show(this, text, L.T("学習の準備"), MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+        if (Ui.Message(this, text, MsgKind.Question, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
         try
         {
             _trainSetupRunning = true;
@@ -448,7 +439,7 @@ public sealed partial class MainForm
                         _trainSetupRunning = false;
                         UpdateTrainChecks();
                         if (code == 0 && TrainEnv.Ready) ShowOsd(L.T("学習の準備ができました"), OsdLongMilliseconds);
-                        else MessageBox.Show(this, L.T("学習の準備が終わりませんでした。黒い窓の最後の表示を見てください。"), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        else Ui.Message(this, L.T("学習の準備が終わりませんでした。黒い窓の最後の表示を見てください。"), MsgKind.Error);
                     }));
                 }
                 catch { /* closing */ }
@@ -458,7 +449,7 @@ public sealed partial class MainForm
         {
             _trainSetupRunning = false;
             Log.Info("train: setup start failed - " + ex);
-            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, Errors.Describe(ex), MsgKind.Warning);
         }
     }
 
@@ -498,8 +489,8 @@ public sealed partial class MainForm
     {
         if (_trainCloseConfirmed) return true;    // already asked (before an update swapped the exe)
         if (!TrainRunning || _testRunning) return true;
-        if (MessageBox.Show(this, L.T("学習が動いています。終了すると学習は中止されます。終了しますか？"), "YuCap",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return false;
+        if (Ui.Message(this, L.T("学習が動いています。終了すると学習は中止されます。終了しますか？"), MsgKind.Warning,
+                MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return false;
         return true;
     }
 
@@ -526,24 +517,18 @@ internal sealed class TrainView
     public bool CanUse;
 }
 
-internal static class UiExt
-{
-    public static T WithMargin<T>(this T c, int l, int t, int r, int b) where T : Control { c.Margin = new Padding(l, t, r, b); return c; }
-}
-
 /// <summary>
 /// 学習の経過の窓。操作できるまま最小化でき、メインの窓（最大化・全画面でも）の上に出る。2 回/秒で <see cref="TrainView"/> を取り直して描く。
-/// 画面の部品は表（TableLayoutPanel）で並べ、文字と部品の大きさから高さが決まる（スケール 100–200% で重ならない）。
+/// 部品は Ui の縦の並び（UiStack）で並べ、文字と部品の大きさから高さが決まる（スケール 100–200% で重ならない）。
 /// </summary>
-internal sealed class TrainWindow : Form
+internal sealed class TrainWindow : UiWindow
 {
     private readonly Func<TrainView> _view;
-    private readonly TableLayoutPanel _root = new();
-    private readonly Label _title = new(), _scoreTitle = new();
-    private readonly Label _status, _note;
-    private readonly ProgressBar _bar = new();
+    private readonly Label _title, _status, _note;
+    private readonly UiProgress _bar = new();
     private readonly Label[,] _cells = new Label[4, 3];
-    private readonly Button _logBtn = new(), _cancel = new(), _use = new(), _folder = new(), _close = new();
+    private readonly LinkLabel _logBtn;
+    private readonly UiButton _cancel, _use, _folder, _close;
     private readonly TextBox _log = new();
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 500 };
     private int _logLen;
@@ -552,124 +537,83 @@ internal sealed class TrainWindow : Form
     {
         _view = view;
         Text = L.T("自分専用モデルの学習の経過");
-        FormBorderStyle = FormBorderStyle.FixedSingle;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = true;
         ShowInTaskbar = true;
-        StartPosition = FormStartPosition.CenterParent;
-        AutoScaleMode = AutoScaleMode.Font;
-        AutoScaleDimensions = new SizeF(7F, 15F);
-        ClientSize = new Size(520, 240);
-        // Icon and fonts made here are GDI objects of this window: released when it is disposed (it is created anew each time).
-        var owned = new List<IDisposable>();
-        Disposed += (_, _) => { foreach (IDisposable d in owned) { try { d.Dispose(); } catch { /* ignore */ } } };
-        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); if (Icon != null) owned.Add(Icon); } catch { /* default icon */ }
+        ContentWidth96 = 520;
+        // The icon is a GDI object of this window: released when it is disposed (it is created anew each time).
+        Icon? icon = null;
+        try { icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); Icon = icon; } catch { /* default icon */ }
+        Disposed += (_, _) => icon?.Dispose();
 
-        _root.Dock = DockStyle.Fill;
-        _root.ColumnCount = 1;
-        _root.Padding = new Padding(Ui.Pad);
-        _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        Controls.Add(_root);
-        _status = Ui.FlowHint(string.Empty);
-        _status.ForeColor = SystemColors.ControlText;
-        _note = Ui.FlowHint(string.Empty);
-
-        void Row(Control c, int bottom = Ui.Gap)
-        {
-            c.Margin = new Padding(0, 0, 0, bottom);
-            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            _root.RowCount++;
-            _root.Controls.Add(c, 0, _root.RowCount - 1);
-        }
-        _root.RowCount = 0;
-
-        _title.AutoSize = true;
-        _title.Font = new Font(Font, FontStyle.Bold);
-        owned.Add(_title.Font);
-        Row(_title, 2);
-        Row(_status, 4);
-        _bar.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-        _bar.Height = 22;
-        _bar.MinimumSize = new Size(10, 22);
-        Row(_bar, Ui.Gap + 4);
+        var stack = Ui.Stack();
+        _title = stack.Add(Ui.Heading(string.Empty));
+        _status = stack.Add(Ui.Text(string.Empty), before: 2);
+        stack.Add(_bar, before: Ui.Gap + 2);
 
         // 小さな表: 方法 / PSNR / SSIM
-        var grid = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Anchor = AnchorStyles.Left | AnchorStyles.Right };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        var grid = Ui.Grid();
+        grid.RowGap = 4;
         string[] heads = { L.T("検証用の絵での点数"), "PSNR", "SSIM" };
         string[] rows = { L.T("ふつうの拡大（bicubic）"), L.T("元の Anime4K"), L.T("あなたのモデル（今の最良）") };
         for (int r = 0; r < 4; r++)
         {
-            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             for (int c = 0; c < 3; c++)
             {
-                var l = new Label { AutoSize = true, Margin = new Padding(0, 1, c == 0 ? 8 : 16, 1), Anchor = c == 0 ? AnchorStyles.Left : AnchorStyles.Right };
-                l.Text = r == 0 ? heads[c] : c == 0 ? rows[r - 1] : "-";
-                if (r == 0) l.ForeColor = SystemColors.GrayText;
-                if (r == 3) { l.Font = new Font(Font, FontStyle.Bold); owned.Add(l.Font); }
+                Label l = c == 0 ? Ui.Caption(r == 0 ? heads[0] : rows[r - 1]) : Ui.Fixed(Ui.Text(r == 0 ? heads[c] : "-"), 72);
+                if (c > 0) l.TextAlign = ContentAlignment.MiddleRight;
+                if (r == 0) l.ForeColor = Ui.Colors.SubText;
+                if (r == 3) { Ui.Opt(l).FontPt = Ui.BodyPt; Ui.Opt(l).FontStyle = FontStyle.Bold; l.Font = Ui.FontAt(0, Ui.BodyPt, FontStyle.Bold); }
                 _cells[r, c] = l;
-                grid.Controls.Add(l, c, r);
             }
+            grid.AddRow(_cells[r, 0], _cells[r, 1], _cells[r, 2]);
         }
-        Row(grid, Ui.Gap);
-        Row(_note, Ui.Gap);
+        stack.Add(grid, before: Ui.Pad);
+        _note = stack.Add(Ui.Hint(string.Empty), before: Ui.Gap + 4);
 
-        _logBtn.Text = L.T("詳しい経過 ▼");
-        _logBtn.AutoSize = true;
-        _logBtn.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        _logBtn.Anchor = AnchorStyles.Left;
-        _logBtn.Click += (_, _) => ToggleLog();
-        Row(_logBtn, 4);
+        _logBtn = stack.Add(Ui.Link(L.T("詳しい経過 ▼"), ToggleLog), before: Ui.Pad);
         _log.Multiline = true;
         _log.ReadOnly = true;
         _log.ScrollBars = ScrollBars.Vertical;
         _log.WordWrap = true;
-        _log.Font = new Font("Consolas", 8.5f);
-        owned.Add(_log.Font);
-        _log.Height = 170;
-        _log.MinimumSize = new Size(10, 170);
-        _log.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-        _log.Visible = false;
-        Row(_log, Ui.Gap);
+        Ui.Fixed(_log, 0, 170);
+        Ui.Opt(_log).FontPt = 8.5f;   // the UI font: Consolas has no Japanese (it fell back to bitmap MS Gothic)
+        stack.Add(_log, before: 4);
+        Ui.Show(_log, false);
 
-        var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Anchor = AnchorStyles.Right, Margin = Padding.Empty };
-        _close.Text = L.T("閉じる");
-        _cancel.Text = L.T("中止");
-        _use.Text = L.T("このモデルを使う");
-        _folder.Text = L.T("モデルのフォルダーを開く");
-        foreach (Button b in new[] { _close, _use, _folder, _cancel })
-        {
-            b.AutoSize = true;
-            b.AutoSizeMode = AutoSizeMode.GrowOnly;
-            b.MinimumSize = new Size(Ui.ButtonWidth, Ui.ButtonHeight);
-            b.Margin = new Padding(Ui.Gap, 0, 0, 0);
-            buttons.Controls.Add(b);
-        }
+        _cancel = Ui.Btn(L.T("中止"));
+        _folder = Ui.Btn(L.T("モデルのフォルダーを開く"));
+        _use = Ui.Btn(L.T("このモデルを使う"));
+        _close = Ui.Btn(L.T("閉じる"));
         _close.Click += (_, _) => Close();
         _cancel.Click += (_, _) => onCancel();
         _use.Click += (_, _) => onUse();
         _folder.Click += (_, _) => onOpenModels();
-        Row(buttons, 0);
+        Ui.Frame(this, stack, new Button[] { _cancel, _folder, _use, _close });
+        AcceptButton = null;
+        _cancel.Primary = false;
+        _use.Primary = true;      // the action the finished run is waiting for
+        CancelButton = _close;    // Esc closes the window (the training goes on)
+        InitialFocus = _close;
 
         _timer.Tick += (_, _) => RefreshNow();
         Shown += (_, _) => { RefreshNow(); _timer.Start(); };
         FormClosed += (_, _) => { _timer.Stop(); _timer.Dispose(); };
-        DpiChanged += (_, _) => FitHeight();
     }
 
     public void SetLogVisible(bool visible)
     {
-        if (_log.Visible != visible) ToggleLog();
+        if (Ui.IsShown(_log) != visible) ToggleLog();
     }
 
     private void ToggleLog()
     {
-        _log.Visible = !_log.Visible;
-        _logBtn.Text = _log.Visible ? L.T("詳しい経過 ▲") : L.T("詳しい経過 ▼");
-        if (_log.Visible) { _logLen = -1; RefreshNow(); }
-        FitHeight(true);
+        bool show = !Ui.IsShown(_log);
+        Ui.Show(_log, show);
+        _logBtn.Text = show ? L.T("詳しい経過 ▲") : L.T("詳しい経過 ▼");
+        if (show) { _logLen = -1; RefreshNow(); }
+        Fit();
     }
 
     private static string Fmt(double v, string f) => double.IsNaN(v) ? "-" : v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
@@ -689,41 +633,28 @@ internal sealed class TrainWindow : Form
     /// <summary>Show <paramref name="v"/> (also used by the layout test with made-up values).</summary>
     public void Render(TrainView v)
     {
-        SuspendLayout();
         _title.Text = v.Title.Length > 0 ? v.Title : L.T("自分専用モデルの学習");
         _status.Text = v.Status;
         _note.Text = v.Note;
-        _note.Visible = v.Note.Length > 0;
-        if (v.Percent < 0)
-        {
-            if (_bar.Style != ProgressBarStyle.Marquee) _bar.Style = ProgressBarStyle.Marquee;
-        }
+        Ui.Show(_note, v.Note.Length > 0);
+        if (v.Percent < 0) _bar.Style = ProgressBarStyle.Marquee;
         else
         {
-            if (_bar.Style != ProgressBarStyle.Continuous) _bar.Style = ProgressBarStyle.Continuous;
+            _bar.Style = ProgressBarStyle.Continuous;
             _bar.Value = Math.Clamp(v.Percent, 0, 100);
         }
         SetRow(1, v.Bicubic); SetRow(2, v.Original); SetRow(3, v.Yours);
         bool running = v.Mode == TrainView.ModeKind.Running;
-        _cancel.Visible = running;
-        _use.Visible = v.Mode == TrainView.ModeKind.Done && v.CanUse;
-        _folder.Visible = v.Mode == TrainView.ModeKind.Done;
-        if (_log.Visible && v.Log.Length != _logLen)
+        Ui.Show(_cancel, running);
+        Ui.Show(_use, v.Mode == TrainView.ModeKind.Done && v.CanUse);
+        Ui.Show(_folder, v.Mode == TrainView.ModeKind.Done);
+        if (Ui.IsShown(_log) && v.Log.Length != _logLen)
         {
             _log.Text = v.Log;
             _log.SelectionStart = _log.TextLength;
             _log.ScrollToCaret();
             _logLen = v.Log.Length;
         }
-        ResumeLayout(true);
-        FitHeight();
-    }
-
-    /// <summary>Make the window as tall as its content needs (it never relies on a fixed height drawn at 96 dpi).</summary>
-    private void FitHeight(bool force = false)  // force: always re-measure
-    {
-        int w = Math.Max(1, ClientSize.Width);
-        int need = _root.GetPreferredSize(new Size(w, 0)).Height;
-        if (need > 0 && Math.Abs(need - ClientSize.Height) > 1) ClientSize = new Size(w, need);
+        if (IsHandleCreated) Fit();
     }
 }

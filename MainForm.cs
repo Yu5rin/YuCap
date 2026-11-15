@@ -106,7 +106,6 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly List<ToolStripMenuItem> _qualityItems = new();
     private readonly List<ToolStripMenuItem> _hdrRoots = new();
     private readonly List<ToolStripMenuItem> _hdrItems = new();
-    private readonly List<ToolStripMenuItem> _interpItems = new();
     private readonly List<ToolStripMenuItem> _sharpnessItems = new();
     private readonly List<ToolStripMenuItem> _nativeResItems = new();
     private readonly List<ToolStripMenuItem> _chromaItems = new();
@@ -122,13 +121,9 @@ public sealed partial class MainForm : Form, IMessageFilter
     private ToolStripMenuItem _miStatusBar = null!;
     private ToolStripMenuItem _miMenuBar = null!;
     private ToolStripMenuItem _miMute = null!;
-    private ToolStripMenuItem _cmiMute = null!;
-    private ToolStripMenuItem _cmiLowLatency = null!;
     private ToolStripMenuItem _miMirror = null!;
     private ToolStripMenuItem _miFreeze = null!;
-    private ToolStripMenuItem _cmiFreeze = null!;
     private ToolStripMenuItem _miPip = null!;
-    private ToolStripMenuItem _cmiPip = null!;
     private ToolStripMenuItem _cmiProfiles = null!;
     private ToolStripMenuItem _miClickThrough = null!;
     private ToolStripMenuItem _miHotkeys = null!;
@@ -150,18 +145,11 @@ public sealed partial class MainForm : Form, IMessageFilter
     private readonly List<ToolStripMenuItem> _pipHoverItems = new();
     private readonly List<ToolStripMenuItem> _pipSizeItems = new();
     private readonly List<ToolStripMenuItem> _pipPosItems = new();
-    private ToolStripMenuItem _cmiBorderless = null!;
-    private ToolStripMenuItem _cmiTopmost = null!;
-    private ToolStripMenuItem _cmiStatusBar = null!;
-    private ToolStripMenuItem _cmiMenuBar = null!;
-    private ToolStripMenuItem _cmiMenuBarTop = null!;
-    private readonly List<ToolStripMenuItem> _ctxFull = new();   // the right-click menu's copies of ファイル .. ヘルプ (オプション included), in menu-bar order
 
     private ToolStripMenuItem _videoDevicesRoot = null!;
     private ToolStripMenuItem _audioDevicesRoot = null!;
     private ToolStripMenuItem _audioOutputRoot = null!;
     private ToolStripMenuItem _videoModeRoot = null!;
-    private ToolStripMenuItem _cmiVideoModeRoot = null!;
 
     // ---- State -----------------------------------------------------------
     private VideoDisplayMode _displayMode = VideoDisplayMode.AspectFit;
@@ -215,6 +203,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     // Burst snapshots.
     private readonly System.Windows.Forms.Timer _burstTimer = new();
     private int _burstTotal, _burstDone;
+    private int _burstSkips;   // ticks skipped in a row because the video was restarting
 
     // Command-line video mode (session-only; never persisted).
     private CaptureMode? _cliMode;
@@ -283,7 +272,8 @@ public sealed partial class MainForm : Form, IMessageFilter
     // below this while entering PiP (small preset sizes would otherwise be
     // clamped up to a 4:3 window with black bars) and restores it via this
     // field on exit.
-    private static readonly Size NormalMinimumSize = new(320, 240);
+    // In pixels of the monitor the window is on (320 x 240 at 100%): re-applied when the window changes monitor.
+    private Size NormalMinimumSize => new(Dpi(320), Dpi(240));
 
     // Text shown in place of the video while a device is (re)starting — see
     // RunDeviceStart. Distinct from _startingUp, which covers only the very
@@ -331,6 +321,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         ToolStripManager.Renderer = Ui.DarkRenderer;
         _menu.BackColor = _status.BackColor = Ui.Colors.Back;
         _menu.ForeColor = _status.ForeColor = Ui.Colors.Text;
+        Ui.DarkStripToolTips(_status);
+        // A window narrower than the menu bar (a small window, or one moved to a 200% monitor) keeps every menu
+        // reachable through the overflow button at the right end instead of silently dropping the last ones.
+        _menu.CanOverflow = true;
+        _menu.LayoutStyle = ToolStripLayoutStyle.HorizontalStackWithOverflow;
+        foreach (ToolStripItem top in _menu.Items) top.Overflow = ToolStripItemOverflow.AsNeeded;   // a menu item's default is Never
+        _menu.ItemAdded += (_, e) => e.Item!.Overflow = ToolStripItemOverflow.AsNeeded;            // the bar is rebuilt on language/DPI changes
 
         // Freeze-frame overlay: shows the captured still exactly over the canvas,
         // clipped to its own bounds so a zoomed-in still can't overflow onto the
@@ -466,7 +463,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         string main = _busyText ?? (_startingUp ? L.T("接続しています...") : (_recoveryMain ?? L.T("映像が入力されていません")));
         // RGB(200,200,200) on black is ~10.6:1 — the old Brushes.Gray (128,128,128)
         // was only ~4.5:1, borderline for a large-ish message like this.
-        using var font = TextScale.MakeFont("Segoe UI", 14f * 96 / 72, _msgScale, FontStyle.Regular);
+        using var font = TextScale.MakeFont(Ui.FamilyName, 14f * 96 / 72, _msgScale, FontStyle.Regular);
         using var mainBrush = new SolidBrush(Color.FromArgb(255, 200, 200, 200));
         var bounds = new Rectangle(0, 0, _canvas.ClientSize.Width, _canvas.ClientSize.Height);
         int wrapWidth = Math.Max(1, (int)(bounds.Width * 0.9));
@@ -478,9 +475,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         // is self-explanatory and _videoError would otherwise talk about a
         // PREVIOUS failure while a new connection attempt is in flight.
         string? second = _busyText == null
-            ? (_videoError ?? (_startingUp ? null : L.T("キャプチャデバイスを接続すると自動的に表示されます")))
+            ? (_videoError ?? (_startingUp ? null : L.T("キャプチャーボードを接続すると自動的に表示されます")))
             : null;
-        using var secondFont = TextScale.MakeFont("Segoe UI", 10f * 96 / 72, _msgScale, FontStyle.Regular);
+        using var secondFont = TextScale.MakeFont(Ui.FamilyName, 10f * 96 / 72, _msgScale, FontStyle.Regular);
         // RGB(150,150,150) on black is ~7.7:1 (≥7:1 target); the old (96,96,96) was ~3.3:1.
         using var secondBrush = new SolidBrush(Color.FromArgb(255, 150, 150, 150));
         Size secondSz = second != null
@@ -488,7 +485,12 @@ public sealed partial class MainForm : Form, IMessageFilter
             : Size.Empty;
 
         int totalH = mainSz.Height + (second != null ? TextScale.Px(4, _msgScale) + secondSz.Height : 0);
-        int top = (bounds.Height - totalH) / 2;
+        // The app mark, dimmed, above the message (when the window is tall enough for it to be more than clutter).
+        int mark = TextScale.Px(56, _msgScale), markGap = TextScale.Px(20, _msgScale);
+        bool withMark = bounds.Height >= totalH + 2 * (mark + markGap);
+        int top = (bounds.Height - totalH + (withMark ? mark + markGap : 0)) / 2;
+        if (withMark && CanvasMark(mark) is { } markBmp)
+            g.DrawImageUnscaled(markBmp, (bounds.Width - mark) / 2, top - markGap - mark);
         TextRenderer.DrawText(g, main, font, new Rectangle(wrapRect.X, top, wrapWidth, mainSz.Height),
             mainBrush.Color, mainFlags);
         if (second != null)
@@ -497,6 +499,28 @@ public sealed partial class MainForm : Form, IMessageFilter
             TextRenderer.DrawText(g, second, secondFont, new Rectangle(wrapRect.X, secondTop, wrapWidth, secondSz.Height),
                 secondBrush.Color, mainFlags);
         }
+    }
+
+    private Bitmap? _canvasMark;
+
+    /// <summary>The app icon at <paramref name="size"/> pixels at 35% opacity, for the empty canvas (made once per size).</summary>
+    private Bitmap? CanvasMark(int size)
+    {
+        if (_canvasMark != null && _canvasMark.Width == size) return _canvasMark;
+        _canvasMark?.Dispose();
+        _canvasMark = null;
+        using Icon? icon = Ui.AppIcon(size);
+        if (icon == null) return null;
+        using Bitmap full = icon.ToBitmap();
+        var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(bmp))
+        using (var attrs = new System.Drawing.Imaging.ImageAttributes())
+        {
+            attrs.SetColorMatrix(new System.Drawing.Imaging.ColorMatrix { Matrix33 = 0.35f });
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.DrawImage(full, new Rectangle(0, 0, size, size), 0, 0, full.Width, full.Height, GraphicsUnit.Pixel, attrs);
+        }
+        return _canvasMark = bmp;
     }
 
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
@@ -715,449 +739,6 @@ public sealed partial class MainForm : Form, IMessageFilter
         return new Point(x, y);
     }
 
-    /// <summary>
-    /// The menu bar. Each menu is made by its own builder that returns a brand-new item tree, so the right-click menu
-    /// (<see cref="BuildContextMenu"/>) can carry the same menus as submenus. The check/enable state of both copies follows
-    /// from <see cref="UpdateChecks"/> (the fields below point at the bar's copy; <see cref="MirrorMenuState"/> copies it to the other).
-    /// The right-click menu is built first, so these fields end up pointing at the menu bar's items.
-    /// </summary>
-    private void BuildMenu()
-    {
-        _menu.Items.AddRange(new ToolStripItem[]
-        {
-            BuildFileMenu(), BuildDeviceMenu(), BuildVideoMenu(), BuildAudioMenu(), BuildViewMenu(), BuildProfilesMenu(), BuildOptionsMenu(), BuildHelpMenu(),
-        });
-    }
-
-    private ToolStripMenuItem BuildFileMenu()
-    {
-        // ---- ファイル: スナップショット操作と終了 ----
-        var file = new ToolStripMenuItem(L.T("ファイル(&F)"));
-        var snap = new ToolStripMenuItem(L.T("スナップショットを保存"), null, (_, _) => SaveSnapshot())
-        {
-            ShortcutKeyDisplayString = "Ctrl+S",
-        };
-        var copy = new ToolStripMenuItem(L.T("スナップショットをコピー"), null, (_, _) => CopySnapshotToClipboard())
-        {
-            ShortcutKeyDisplayString = "Ctrl+C",
-        };
-        _miBurst = new ToolStripMenuItem(L.T("連写スナップショット..."), null, (_, _) => ShowBurstDialog()) { Name = "burst" };
-        var gallery = new ToolStripMenuItem(L.T("スナップショット一覧..."), null, (_, _) => ShowSnapshotGallery())
-        {
-            ShortcutKeyDisplayString = "Ctrl+G",
-        };
-        var openDir = new ToolStripMenuItem(L.T("保存先フォルダを開く"), null, (_, _) => OpenSnapshotFolder());
-        var exit = new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close());
-        file.DropDownOpening += (_, _) => UpdateChecks();
-        file.DropDownItems.Add(snap);
-        file.DropDownItems.Add(copy);
-        file.DropDownItems.Add(_miBurst);
-        file.DropDownItems.Add(new ToolStripSeparator());
-        file.DropDownItems.Add(gallery);
-        file.DropDownItems.Add(openDir);
-        file.DropDownItems.Add(new ToolStripSeparator());
-        file.DropDownItems.Add(exit);
-        return file;
-    }
-
-    private ToolStripMenuItem BuildDeviceMenu()
-    {
-        // ---- デバイス: 何を取り込むか（映像・音声の機器とモード） ----
-        var device = new ToolStripMenuItem(L.T("デバイス(&D)"));
-        _videoDevicesRoot = new ToolStripMenuItem(L.T("映像デバイス"));
-        _audioDevicesRoot = new ToolStripMenuItem(L.T("音声デバイス"));
-        var videoDevices = _videoDevicesRoot;
-        var audioDevices = _audioDevicesRoot;
-        videoDevices.DropDownOpening += (_, _) => RebuildVideoDeviceList(videoDevices);
-        audioDevices.DropDownOpening += (_, _) => RebuildAudioDeviceList(audioDevices);
-        _videoDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
-        _audioDevicesRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
-        _audioOutputRoot = new ToolStripMenuItem(L.T("音声の出力先"));
-        var audioOutput = _audioOutputRoot;
-        audioOutput.DropDownOpening += (_, _) => RebuildAudioOutputList(audioOutput);
-        _audioOutputRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
-        _videoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
-        var videoMode = _videoModeRoot;
-        videoMode.DropDownOpening += (_, _) => RebuildVideoModeList(videoMode);
-        _videoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
-
-        device.DropDownItems.Add(_videoDevicesRoot);
-        device.DropDownItems.Add(_videoModeRoot);
-        device.DropDownItems.Add(new ToolStripSeparator());
-        device.DropDownItems.Add(_audioDevicesRoot);
-        device.DropDownItems.Add(_audioOutputRoot);
-        device.DropDownItems.Add(new ToolStripSeparator());
-        device.DropDownItems.Add(new ToolStripMenuItem(L.T("優先デバイス設定..."), null,
-            (_, _) => ShowDeviceKeywordSettings()));
-        return device;
-    }
-
-    private ToolStripMenuItem BuildVideoMenu()
-    {
-        // ---- 映像: 絵の見え方（再生・拡大・補間・調整・描画方式） ----
-        var video = new ToolStripMenuItem(L.T("映像(&V)"));
-        video.DropDownOpening += (_, _) => UpdateChecks();
-        _miFreeze = new ToolStripMenuItem(L.T("一時停止 / 再開"), null, (_, _) => ToggleFreeze())
-        {
-            ShortcutKeyDisplayString = "Space",
-        };
-        _miLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
-        _miAdjust = new ToolStripMenuItem(L.T("映像の調整..."), null, (_, _) => ShowAdjustmentsDialog());
-        _miCrop = new ToolStripMenuItem(L.T("黒い縁の切り取り..."), null, (_, _) => ShowCropDialog());
-        video.DropDownItems.Add(_miFreeze);
-        video.DropDownItems.Add(new ToolStripSeparator());
-        video.DropDownItems.Add(BuildQualitySubmenu());
-        video.DropDownItems.Add(BuildHdrSubmenu());
-        video.DropDownItems.Add(BuildInterpolationItem());
-        video.DropDownItems.Add(_miLowLatency);
-        _miStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle()) { Name = "style" };
-        video.DropDownItems.Add(_miStyle);
-        video.DropDownItems.Add(new ToolStripSeparator());
-        video.DropDownItems.Add(_miAdjust);
-        video.DropDownItems.Add(BuildShadowSubmenu());
-        video.DropDownItems.Add(_miCrop);
-        video.DropDownItems.Add(BuildRotationSubmenu());
-        video.DropDownItems.Add(new ToolStripSeparator());
-        video.DropDownItems.Add(BuildRendererSubmenu());
-        return video;
-    }
-
-    private ToolStripMenuItem BuildAudioMenu()
-    {
-        // ---- 音声 ----
-        var audio = new ToolStripMenuItem(L.T("音声(&A)"));
-        audio.DropDownOpening += (_, _) => UpdateChecks();
-        _miMute = new ToolStripMenuItem(L.T("ミュート"), null, (_, _) => ToggleMute())
-        {
-            ShortcutKeyDisplayString = "M",
-        };
-        _miRestoreLevel = new ToolStripMenuItem(L.T("入力レベルを元に戻す"), null, (_, _) => RestoreCaptureLevel());
-        audio.DropDownItems.Add(_miMute);
-        audio.DropDownItems.Add(new ToolStripMenuItem(L.T("音ズレ補正..."), null, (_, _) => ShowAvSyncDialog()));
-        audio.DropDownItems.Add(new ToolStripSeparator());
-        audio.DropDownItems.Add(new ToolStripMenuItem(L.T("入力レベルを最大にする"), null,
-            (_, _) => MaximizeCaptureLevel()));
-        audio.DropDownItems.Add(_miRestoreLevel);
-        audio.DropDownItems.Add(new ToolStripSeparator());
-        audio.DropDownItems.Add(new ToolStripMenuItem(L.T("音声バッファ設定..."), null, (_, _) => ShowAudioBufferSettings()));
-        return audio;
-    }
-
-    private ToolStripMenuItem BuildViewMenu()
-    {
-        // ---- 表示: ウィンドウと画面の使い方 ----
-        var view = new ToolStripMenuItem(L.T("表示(&W)"));
-        view.DropDownOpening += (_, _) => UpdateChecks();
-
-        _miLockAspect = new ToolStripMenuItem(L.T("ウィンドウ比率を映像に固定"), null, (_, _) => ToggleLockAspect());
-        _miBorderless = new ToolStripMenuItem(L.T("ウィンドウ枠を非表示"), null, (_, _) => ToggleBorderless())
-        {
-            ShortcutKeyDisplayString = "Ctrl+B",
-        };
-        _miTopmost = new ToolStripMenuItem(L.T("常に前面に表示"), null, (_, _) => ToggleAlwaysOnTop())
-        {
-            ShortcutKeyDisplayString = "Ctrl+T",
-        };
-        _miMenuBar = new ToolStripMenuItem(L.T("メニューバーを表示"), null, (_, _) => ToggleMenuBar())
-        {
-            ShortcutKeyDisplayString = "F10",
-        };
-        _miStatusBar = new ToolStripMenuItem(L.T("ステータスバーを表示"), null, (_, _) => ToggleStatusBar())
-        {
-            Checked = true,
-        };
-        var fullscreen = new ToolStripMenuItem(L.T("全画面表示"), null, (_, _) => ToggleFullscreen())
-        {
-            ShortcutKeyDisplayString = "F11",
-        };
-        var zoomReset = new ToolStripMenuItem(L.T("ズームをリセット"), null, (_, _) => ResetZoom())
-        {
-            ShortcutKeyDisplayString = "Ctrl+0",
-        };
-        // ShortcutKeyDisplayString is set from the real setting in UpdateChecks
-        // (FormatHotkey((Keys)_settings.HotkeyPip)) rather than hard-coded here,
-        // since the user can rebind it in ホットキー設定.
-        _miPip = new ToolStripMenuItem(L.T("ピクチャインピクチャ"), null, (_, _) => TogglePip());
-
-        view.DropDownItems.Add(fullscreen);
-        view.DropDownItems.Add(BuildFullscreenDisplaySubmenu());
-        view.DropDownItems.Add(BuildSignalSubmenu());
-        view.DropDownItems.Add(_miPip);
-        view.DropDownItems.Add(BuildPipSettingsSubmenu());
-        view.DropDownItems.Add(new ToolStripSeparator());
-        view.DropDownItems.Add(BuildAspectSubmenu());
-        view.DropDownItems.Add(BuildSizeSubmenu());
-        view.DropDownItems.Add(_miLockAspect);
-        view.DropDownItems.Add(zoomReset);
-        view.DropDownItems.Add(new ToolStripSeparator());
-        view.DropDownItems.Add(BuildInfoModeSubmenu());
-        view.DropDownItems.Add(BuildTextSizeSubmenu());
-        view.DropDownItems.Add(new ToolStripSeparator());
-        AddStreamMenu(view);
-        view.DropDownItems.Add(new ToolStripSeparator());
-        view.DropDownItems.Add(_miMenuBar);
-        view.DropDownItems.Add(_miStatusBar);
-        view.DropDownItems.Add(_miBorderless);
-        view.DropDownItems.Add(_miTopmost);
-        return view;
-    }
-
-    private ToolStripMenuItem BuildOptionsMenu()
-    {
-        // ---- オプション: アプリ全体の動作設定 ----
-        var options = new ToolStripMenuItem(L.T("オプション(&O)"));
-        var snapCfg = new ToolStripMenuItem(L.T("スナップショット設定..."), null, (_, _) => ShowSnapshotSettings());
-        var hotkeyCfg = new ToolStripMenuItem(L.T("ホットキー設定..."), null, (_, _) => ShowHotkeySettings());
-        _miHotkeys = new ToolStripMenuItem(L.T("グローバルホットキーを有効化"), null, (_, _) => ToggleGlobalHotkeys());
-        _miStartup = new ToolStripMenuItem(L.T("Windows起動時に自動実行"), null, (_, _) => ToggleStartup());
-        _miUpdateCheck = new ToolStripMenuItem(L.T("自動で更新する"), null, (_, _) => ToggleUpdateCheck());
-        var lang = new ToolStripMenuItem(L.T("言語 / Language"));
-        var langJa = new ToolStripMenuItem("日本語", null, (_, _) => SetLanguage("ja")) { Checked = !L.English };
-        var langEn = new ToolStripMenuItem("English", null, (_, _) => SetLanguage("en")) { Checked = L.English };
-        lang.DropDownItems.Add(langJa);
-        lang.DropDownItems.Add(langEn);
-        _miCursorHide = new ToolStripMenuItem(L.T("カーソルを自動的に隠す"), null,
-            (_, _) => ToggleCursorAutoHide());
-        var cursorSecs = new ToolStripMenuItem(L.T("隠すまでの時間"));
-        foreach (int sec in new[] { 1, 2, 3, 5, 10 })
-        {
-            int s = sec;
-            var item = new ToolStripMenuItem(L.F("{0}秒", s), null,
-                (_, _) => SetCursorHideSeconds(s)) { Tag = s };
-            _cursorSecItems.Add(item);
-            cursorSecs.DropDownItems.Add(item);
-        }
-
-        options.DropDownOpening += (_, _) => { _miStartup.Checked = IsStartupRegistered(); UpdateChecks(); };
-        options.DropDownItems.Add(snapCfg);
-        options.DropDownItems.Add(hotkeyCfg);
-        options.DropDownItems.Add(_miHotkeys);
-        options.DropDownItems.Add(new ToolStripSeparator());
-        options.DropDownItems.Add(_miCursorHide);
-        options.DropDownItems.Add(cursorSecs);
-        options.DropDownItems.Add(new ToolStripSeparator());
-        options.DropDownItems.Add(_miStartup);
-        options.DropDownItems.Add(_miUpdateCheck);
-        options.DropDownItems.Add(new ToolStripSeparator());
-        options.DropDownItems.Add(BuildTrainSubmenu());
-        options.DropDownItems.Add(new ToolStripSeparator());
-        options.DropDownItems.Add(lang);
-        return options;
-    }
-
-    private ToolStripMenuItem BuildHelpMenu()
-    {
-        // ---- ヘルプ ----
-        var help = new ToolStripMenuItem(L.T("ヘルプ(&H)"));
-        var shortcuts = new ToolStripMenuItem(L.T("操作一覧..."), null, (_, _) => ShowShortcuts())
-        {
-            ShortcutKeyDisplayString = "F1",
-        };
-        _miCheckUpdate = new ToolStripMenuItem(L.T("更新を確認..."), null,
-            async (_, _) => await CheckForUpdatesAsync(manual: true)) { Name = "checkupdate" };
-        help.DropDownItems.Add(shortcuts);
-        help.DropDownItems.Add(new ToolStripMenuItem(L.T("テストモード（自動試験）..."), null, (_, _) => ShowTestModeDialog()));
-        help.DropDownItems.Add(new ToolStripSeparator());
-        help.DropDownItems.Add(_miCheckUpdate);
-        help.DropDownItems.Add(new ToolStripMenuItem(L.T("バージョン情報..."), null, (_, _) => ShowAbout()));
-        return help;
-    }
-
-    /// <summary>情報表示 > オフ / FPS だけ / 詳しく (Ctrl+Shift+I cycles through them).</summary>
-    private ToolStripMenuItem BuildInfoModeSubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("情報表示")) { ShortcutKeyDisplayString = "Ctrl+Shift+I" };
-        foreach ((string label, InfoMode mode) in new[]
-                 { (L.T("オフ"), InfoMode.Off), (L.T("FPS だけ"), InfoMode.Fps), (L.T("詳しく"), InfoMode.Full) })
-        {
-            InfoMode md = mode;
-            var item = new ToolStripMenuItem(label, null, (_, _) => ChooseInfoMode(md)) { Tag = md };
-            _infoModeItems.Add(item);
-            m.DropDownItems.Add(item);
-        }
-        return m;
-    }
-
-    private ToolStripMenuItem BuildRotationSubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("回転 / 反転"));
-        foreach (int deg in new[] { 0, 90, 180, 270 })
-        {
-            int d = deg;
-            var item = new ToolStripMenuItem(d == 0 ? L.T("回転なし") : L.F("{0}° 回転", d), null,
-                (_, _) => SetRotationDeg(d)) { Tag = d };
-            _rotationItems.Add(item);
-            m.DropDownItems.Add(item);
-        }
-        m.DropDownItems.Add(new ToolStripSeparator());
-        _miMirror = new ToolStripMenuItem(L.T("左右反転"), null, (_, _) => ToggleMirror());
-        m.DropDownItems.Add(_miMirror);
-        return m;
-    }
-
-    private ToolStripMenuItem BuildPipSettingsSubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("PiP設定"));
-
-        // Position & size first: with click-through on, the window can't be
-        // dragged or resized, so these presets are the only way to control them.
-        var pos = new ToolStripMenuItem(L.T("表示位置"));
-        foreach ((string label, int corner) in new[]
-                 { ("右下", 0), ("左下", 1), ("右上", 2), ("左上", 3) })
-        {
-            int c = corner;
-            var item = new ToolStripMenuItem(L.T(label), null, (_, _) => SetPipCorner(c)) { Tag = c };
-            _pipPosItems.Add(item);
-            pos.DropDownItems.Add(item);
-        }
-        m.DropDownItems.Add(pos);
-
-        var size = new ToolStripMenuItem(L.T("サイズ（映像原寸比）"));
-        foreach (int pct in new[] { 10, 15, 20, 25, 30, 40, 50 })
-        {
-            int p = pct;
-            var item = new ToolStripMenuItem($"{p}%", null, (_, _) => SetPipSize(p)) { Tag = p };
-            _pipSizeItems.Add(item);
-            size.DropDownItems.Add(item);
-        }
-        m.DropDownItems.Add(size);
-
-        var idle = new ToolStripMenuItem(L.T("不透明度（通常時）"));
-        var hover = new ToolStripMenuItem(L.T("不透明度（マウスオーバー時）"));
-        foreach (int pct in new[] { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 })
-        {
-            int p = pct;
-            var i1 = new ToolStripMenuItem($"{p}%", null, (_, _) => SetPipOpacity(p, hover: false)) { Tag = p };
-            _pipIdleItems.Add(i1);
-            idle.DropDownItems.Add(i1);
-        }
-        // No 0% here (unlike the idle submenu above): a PiP window that is
-        // invisible both at rest AND under the pointer can never be found
-        // again to bring it back — hovering must remain the guaranteed way to
-        // locate it. SetPipOpacity enforces the same floor.
-        foreach (int pct in new[] { 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 })
-        {
-            int p = pct;
-            var i2 = new ToolStripMenuItem($"{p}%", null, (_, _) => SetPipOpacity(p, hover: true)) { Tag = p };
-            _pipHoverItems.Add(i2);
-            hover.DropDownItems.Add(i2);
-        }
-        m.DropDownItems.Add(idle);
-        m.DropDownItems.Add(hover);
-        m.DropDownItems.Add(new ToolStripSeparator());
-        _miClickThrough = new ToolStripMenuItem(L.T("クリックスルー"), null, (_, _) => TogglePipClickThrough());
-        m.DropDownItems.Add(_miClickThrough);
-        return m;
-    }
-
-    private ToolStripMenuItem BuildAspectSubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("アスペクト比 / 表示モード"));
-        m.DropDownItems.Add(MakeAspectItem(L.T("アスペクト比を保持"), VideoDisplayMode.AspectFit));
-        m.DropDownItems.Add(MakeAspectItem(L.T("ウィンドウに引き伸ばし"), VideoDisplayMode.Stretch));
-        m.DropDownItems.Add(MakeAspectItem(L.T("原寸表示"), VideoDisplayMode.OneToOne));
-        m.DropDownItems.Add(MakeAspectItem(L.T("整数倍表示 (くっきり)"), VideoDisplayMode.IntegerScale));
-        return m;
-    }
-
-    /// <summary>フレーム補間 (check item). Greyed out unless the engine can interpolate (Direct3D only).</summary>
-    private ToolStripMenuItem BuildInterpolationItem()
-    {
-        var item = new ToolStripMenuItem(L.T("フレーム補間"), null, (_, _) => ToggleInterpolation());
-        _interpItems.Add(item);
-        return item;
-    }
-
-    /// <summary>拡大の画質 > 標準 / 高画質（FSR）, シャープさ. Greyed out unless the active
-    /// engine can do it (Direct3D only) and the display mode actually scales smoothly.</summary>
-    private ToolStripMenuItem BuildQualitySubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("拡大の画質"));
-        var std = new ToolStripMenuItem(L.T("標準"), null, (_, _) => SetScalingQuality("standard")) { Tag = "standard" };
-        var fsr = new ToolStripMenuItem(L.T("高画質（FSR）"), null, (_, _) => SetScalingQuality("fsr")) { Tag = "fsr" };
-        var a4k = new ToolStripMenuItem(L.T("くっきり（アニメ・イラスト向け）"), null, (_, _) => { _settings.A4kModel = ""; SetScalingQuality("anime4k"); })
-        {
-            Tag = "anime4k",
-            ToolTipText = L.T("ニューラルネット（Anime4K）で線や文字を細くくっきり描き直します。ゲーム機の絵やイラスト向けで、GPU を多く使います。"),
-        };
-        _qualityItems.Add(std);
-        _qualityItems.Add(fsr);
-        var nv = new ToolStripMenuItem(L.T("AI 拡大（NVIDIA RTX）"), null, (_, _) => SetScalingQuality("nvrtx"))
-        {
-            Tag = "nvrtx",
-            ToolTipText = L.T("NVIDIA の RTX ビデオ超解像（VSR）で拡大します。NVIDIA コントロールパネルの「RTX ビデオ強調」をオンにしてください。"),
-        };
-        _qualityItems.Add(a4k);
-        _qualityItems.Add(nv);
-        m.DropDownItems.Add(std);
-        m.DropDownItems.Add(fsr);
-        m.DropDownItems.Add(a4k);
-        m.DropDownItems.Add(nv);
-        AttachUserModelItems(m, a4k);
-        m.DropDownItems.Add(new ToolStripSeparator());
-        var sharp = new ToolStripMenuItem(L.T("シャープさ"));
-        foreach (int pct in new[] { 0, 25, 50, 75, 100 })
-        {
-            int p = pct;
-            var item = new ToolStripMenuItem($"{p}%", null, (_, _) => SetSharpness(p)) { Tag = p };
-            _sharpnessItems.Add(item);
-            sharp.DropDownItems.Add(item);
-        }
-        m.DropDownItems.Add(sharp);
-        m.DropDownItems.Add(new ToolStripSeparator());
-        var native = new ToolStripMenuItem(L.T("元の細かさに合わせて拡大"));
-        foreach (string key in AppSettings.NativeResValues)
-        {
-            string k = key;
-            string label = k == "off" ? L.T("オフ") : k == "auto" ? L.T("自動") : k + "p";
-            var item = new ToolStripMenuItem(label, null, (_, _) => SetNativeRes(k)) { Tag = k };
-            _nativeResItems.Add(item);
-            native.DropDownItems.Add(item);
-        }
-        m.DropDownItems.Add(native);
-        m.DropDownItems.Add(new ToolStripSeparator());
-        var chroma = new ToolStripMenuItem(L.T("色のにじみを抑える"), null, (_, _) => ToggleChromaGuided())
-        {
-            CheckOnClick = false,
-            ToolTipText = L.T("色の境目（赤い文字など）のにじみを、映像の明るさの情報を使って抑えます。Direct3D 描画のとき働きます。"),
-        };
-        _chromaItems.Add(chroma);
-        m.DropDownItems.Add(chroma);
-        var restore = new ToolStripMenuItem(L.T("ぼやけを取ってから拡大"), null, (_, _) => ToggleRestore())
-        {
-            ToolTipText = L.T("拡大の前に、ニューラルネット（Anime4K Restore）でぼやけを取ります。GPU を余分に使い、縁に輪が出やすくなります。元の細かさに合わせて拡大が働いているときは使いません。"),
-        };
-        _restoreItems.Add(restore);
-        m.DropDownItems.Add(restore);
-        _qualityRoots.Add(m);
-        return m;
-    }
-
-    /// <summary>表示 > 全画面にするモニター. The items are rebuilt every time the submenu opens, so
-    /// a monitor plugged in (or removed) since the last time shows up without a restart.</summary>
-    private ToolStripMenuItem BuildFullscreenDisplaySubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("全画面にするモニター"));
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
-        m.DropDownOpening += (_, _) =>
-        {
-            m.DropDownItems.Clear();
-            var own = new ToolStripMenuItem(L.T("ウィンドウがあるモニター"), null,
-                (_, _) => SetFullscreenDisplay("")) { Checked = _settings.FullscreenDisplay.Length == 0 };
-            m.DropDownItems.Add(own);
-            string? chosen = Displays.Find(_settings.FullscreenDisplay)?.DeviceName;
-            foreach (DisplayInfo d in Displays.List())
-            {
-                string key = d.Key;
-                m.DropDownItems.Add(new ToolStripMenuItem(d.MenuLabel(), null, (_, _) => SetFullscreenDisplay(key))
-                {
-                    Checked = chosen != null && chosen == d.DeviceName,
-                });
-            }
-        };
-        return m;
-    }
-
     private void SetFullscreenDisplay(string key)
     {
         _settings.FullscreenDisplay = key;
@@ -1254,59 +835,30 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
-    /// <summary>映像 > 描画方式.</summary>
-    private ToolStripMenuItem BuildRendererSubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("描画方式"));
-        var mf = new ToolStripMenuItem(L.T("標準（Media Foundation）"), null, (_, _) => SwitchRenderer("mf")) { Tag = "mf" };
-        var d3d = new ToolStripMenuItem(L.T("Direct3D（高画質拡大・試験版）"), null, (_, _) => SwitchRenderer("d3d")) { Tag = "d3d" };
-        _rendererItems.Add(mf);
-        _rendererItems.Add(d3d);
-        m.DropDownItems.Add(mf);
-        m.DropDownItems.Add(d3d);
-        return m;
-    }
-
-    private ToolStripMenuItem MakeAspectItem(string text, VideoDisplayMode mode)
-    {
-        var item = new ToolStripMenuItem(text, null, (_, _) => SetDisplayMode(mode)) { Tag = mode };
-        _aspectItems.Add(item);
-        return item;
-    }
-
-    private ToolStripMenuItem BuildSizeSubmenu()
-    {
-        var m = new ToolStripMenuItem(L.T("ウィンドウサイズ"));
-        foreach (int pct in new[] { 50, 75, 100, 125, 150, 200 })
-        {
-            int p = pct;
-            m.DropDownItems.Add(new ToolStripMenuItem($"{p}%", null, (_, _) => ApplySizePreset(p)));
-        }
-        return m;
-    }
-
     private void BuildStatusBar()
     {
         // RenderMode/BackColor are left at their defaults here: the dark
         // chrome (Renderer + BackColor/ForeColor) is applied once, uniformly,
         // in the constructor via Ui.DarkRenderer — setting System/Control here
-        // would just be overwritten.
-        _lblVideo.BorderSides = ToolStripStatusLabelBorderSides.Right;
-        _lblAudio.BorderSides = ToolStripStatusLabelBorderSides.Right;
-        _lblVolume.BorderSides = ToolStripStatusLabelBorderSides.Right;
+        // would just be overwritten. No label draws a 3D border: the renderer puts
+        // one thin separator between visible segments (none after the last one).
+        _lblVideo.BorderSides = ToolStripStatusLabelBorderSides.None;
+        _lblAudio.BorderSides = ToolStripStatusLabelBorderSides.None;
+        _lblVolume.BorderSides = ToolStripStatusLabelBorderSides.None;
         _lblVolume.ToolTipText = L.T("クリックでミュート切替 ／ 映像の上でホイールまたは ↑↓ で音量");
         _lblVolume.Click += (_, _) => ToggleMute();
-        _lblState.BorderSides = ToolStripStatusLabelBorderSides.Right;
+        _lblState.BorderSides = ToolStripStatusLabelBorderSides.None;
         _lblState.ForeColor = Ui.Colors.Accent;
         _lblTrain.Click += (_, _) => { if (TrainRunning) ShowTrainWindow(); };
         var filler = new ToolStripStatusLabel { Spring = true, Text = string.Empty };
         foreach (var l in new[] { _lblInterp, _lblScale, _lblCrisp, _lblTrain })
         {
-            l.BorderSides = ToolStripStatusLabelBorderSides.Right;
+            l.BorderSides = ToolStripStatusLabelBorderSides.None;
             l.Visible = false;
         }
         _status.Items.AddRange(new ToolStripItem[] { _lblVideo, _lblAudio, _lblVolume, _lblInterp, _lblScale, _lblCrisp, _lblTrain, _lblState, filler });
         _status.SizingGrip = true;
+        foreach (ToolStripItem item in _status.Items) item.Padding = new Padding(6, 0, 6, 0);   // room on both sides of the separators
     }
 
     /// <summary>Scaling (dpi) of the monitor under a screen point; the form's own scaling when it cannot be asked.</summary>
@@ -1355,150 +907,57 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateChecks();
     }
 
-    private void BuildContextMenu(int dpi = 0)
-    {
-        ContextMenuStrip old = _ctx;
-        _ctx = new ContextMenuStrip { Renderer = Ui.DarkRenderer };
-        _ctxDpi = dpi > 0 ? dpi : DeviceDpi;
-        _ctx.Opening += OnCtxOpening;
-        if (IsHandleCreated) BeginInvoke(new Action(old.Dispose));   // not while one of its own handlers may still be running
-        else old.Dispose();
-
-        // 右クリック: 上によく使うもの（全画面 → 再生 → 撮影 → 映像 → 表示・プロファイル → ウィンドウ）、
-        // 区切りの下にメニューバーの中身をそのまま（ファイル〜ヘルプ）、最後に自分専用モデル・メニューバーの表示・終了。
-        // 最大化やメニューバーを隠したままでも、設定や学習まで右クリックから届く。
-        _ctx.Items.Add(new ToolStripMenuItem(L.T("全画面表示"), null, (_, _) => ToggleFullscreen())
-        {
-            ShortcutKeyDisplayString = "F11",
-        });
-        _cmiFreeze = new ToolStripMenuItem(L.T("一時停止 / 再開"), null, (_, _) => ToggleFreeze());
-        _ctx.Items.Add(_cmiFreeze);
-        _cmiMute = new ToolStripMenuItem(L.T("ミュート"), null, (_, _) => ToggleMute());
-        _ctx.Items.Add(_cmiMute);
-        _ctx.Items.Add(new ToolStripSeparator());
-
-        _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットを保存"), null, (_, _) => SaveSnapshot()));
-        _ctx.Items.Add(new ToolStripMenuItem(L.T("スナップショットをコピー"), null, (_, _) => CopySnapshotToClipboard()));
-        _ctx.Items.Add(new ToolStripSeparator());
-
-        _cmiVideoModeRoot = new ToolStripMenuItem(L.T("映像モード (解像度/FPS)"));
-        _cmiVideoModeRoot.DropDownOpening += (_, _) => RebuildVideoModeList(_cmiVideoModeRoot);
-        _cmiVideoModeRoot.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
-        _ctx.Items.Add(_cmiVideoModeRoot);
-        _ctx.Items.Add(BuildQualitySubmenu());
-        _ctx.Items.Add(BuildInterpolationItem());
-        _cmiLowLatency = new ToolStripMenuItem(L.T("低遅延モード（試験版）"), null, (_, _) => ToggleLowLatency());
-        _ctx.Items.Add(_cmiLowLatency);
-        _cmiStyle = new ToolStripMenuItem(L.T("なめらか ⇔ 低遅延"), null, (_, _) => ToggleStyle());
-        _ctx.Items.Add(_cmiStyle);
-        _ctx.Items.Add(new ToolStripSeparator());
-
-        _ctx.Items.Add(BuildInfoModeSubmenu());
-        _cmiProfiles = new ToolStripMenuItem(L.T("プロファイル"));
-        _cmiProfiles.DropDownOpening += (_, _) => UpdateProfileMenu();
-        UpdateProfileMenu();
-        _ctx.Items.Add(_cmiProfiles);
-        _cmiPip = new ToolStripMenuItem(L.T("ピクチャインピクチャ"), null, (_, _) => TogglePip());
-        _ctx.Items.Add(_cmiPip);
-
-        _cmiBorderless = new ToolStripMenuItem(L.T("ウィンドウ枠を非表示"), null, (_, _) => ToggleBorderless());
-        _cmiTopmost = new ToolStripMenuItem(L.T("常に前面に表示"), null, (_, _) => ToggleAlwaysOnTop());
-        _cmiMenuBar = new ToolStripMenuItem(L.T("メニューバーを表示"), null, (_, _) => ToggleMenuBar());
-        _cmiStatusBar = new ToolStripMenuItem(L.T("ステータスバーを表示"), null, (_, _) => ToggleStatusBar());
-        var window = new ToolStripMenuItem(L.T("ウィンドウ"));
-        window.DropDownItems.Add(BuildAspectSubmenu());
-        window.DropDownItems.Add(BuildSizeSubmenu());
-        window.DropDownItems.Add(new ToolStripSeparator());
-        window.DropDownItems.Add(_cmiBorderless);
-        window.DropDownItems.Add(_cmiTopmost);
-        window.DropDownItems.Add(_cmiMenuBar);
-        window.DropDownItems.Add(_cmiStatusBar);
-        _ctx.Items.Add(window);
-        _ctx.Items.Add(new ToolStripSeparator());
-
-        // メニューバーの中身（それぞれ新しく作った別の項目。状態は UpdateChecks -> MirrorMenuState でそろう）
-        foreach (ToolStripMenuItem sub in new[] { BuildFileMenu(), BuildDeviceMenu(), BuildVideoMenu(), BuildAudioMenu(), BuildViewMenu(), BuildOptionsMenu(), BuildHelpMenu() })
-        {
-            sub.Text = StripMnemonic(sub.Text ?? string.Empty);
-            _ctxFull.Add(sub);
-            _ctx.Items.Add(sub);
-        }
-        _ctx.Items.Add(BuildTrainSubmenu());
-        _ctx.Items.Add(new ToolStripSeparator());
-        _cmiMenuBarTop = new ToolStripMenuItem(L.T("メニューバーを表示"), null, (_, _) => ToggleMenuBar()) { ShortcutKeyDisplayString = "F10" };
-        _ctx.Items.Add(_cmiMenuBarTop);
-        _ctx.Items.Add(new ToolStripMenuItem(L.T("終了"), null, (_, _) => Close()));
-        _canvas.ContextMenuStrip = _ctx;
-        _freezeView.ContextMenuStrip = _ctx;
-    }
-
     // ---- Shortcuts help (F1) ----------------------------------------------
 
     private void ShowShortcuts()
     {
-        using var dlg = Ui.NewDialog(L.T("操作一覧"), 520, 470);
+        using var dlg = Ui.NewDialog(L.T("操作一覧"), 560);
 
-        var lv = new ListView
+        // One read-only table: the action and its keys in two columns that wrap (nothing is cut off in either
+        // language), under a heading per group. As tall as its rows; it scrolls only on a screen too short for it.
+        var table = new UiTable();
+        string? lastGroup = null;
+
+        string gHere = L.T("YuCap の画面で");
+        string gGlobal = L.T("割り当てを変えられるキー（どこからでも）");
+
+        void Row(string g, string action, string keys)
         {
-            View = View.Details,
-            FullRowSelect = true,
-            HeaderStyle = ColumnHeaderStyle.Nonclickable,
-            GridLines = false,
-        };
-        lv.Columns.Add(L.T("操作"), 300);
-        lv.Columns.Add(L.T("キー・マウス"), 180);
-        // Column widths follow the list's real width (about 62 / 38 %), so they hold at any display scaling.
-        void FitColumns()
-        {
-            int w = lv.ClientSize.Width;
-            if (w <= 0) return;
-            lv.Columns[0].Width = (int)(w * 0.62);
-            lv.Columns[1].Width = w - lv.Columns[0].Width;
+            if (g != lastGroup) { table.AddGroup(g); lastGroup = g; }
+            table.AddRow(action, keys);
         }
-        lv.ClientSizeChanged += (_, _) => FitColumns();
 
-        var gHere = new ListViewGroup(L.T("YuCap の画面で"));
-        var gGlobal = new ListViewGroup(L.T("どこからでも（グローバルホットキー）"));
-        lv.Groups.Add(gHere);
-        lv.Groups.Add(gGlobal);
-
-        void Row(ListViewGroup g, string action, string keys) =>
-            lv.Items.Add(new ListViewItem(new[] { action, keys }) { Group = g });
-
-        Row(gHere, L.T("全画面表示の切替"), $"F11{L.Or}{L.T("ダブルクリック")}");
+        Row(gHere, L.T("全画面表示の切り替え"), $"F11{L.Or}Alt+Enter{L.Or}{L.T("ダブルクリック")}");
         Row(gHere, L.T("全画面・PiP を終了"), "Esc");
         Row(gHere, L.T("一時停止 / 再開"), "Space");
         Row(gHere, L.T("ミュート"), $"M{L.Or}{L.T("中クリック")}{L.Or}{L.T("音量表示をクリック")}");
         Row(gHere, L.T("音量"), $"↑ ↓{L.Or}{L.T("ホイール")}");
-        Row(gHere, L.T("ズーム"), $"Ctrl + {L.T("ホイール")}");
+        Row(gHere, L.T("ズーム"), $"Ctrl + {L.T("ホイール")}{L.Or}Ctrl++ Ctrl+-");
         Row(gHere, L.T("ズームをリセット"), "Ctrl+0");
         Row(gHere, L.T("ズーム中の表示位置"), L.T("ドラッグ"));
         Row(gHere, L.T("ウィンドウの移動"), L.T("映像をドラッグ"));
         Row(gHere, L.T("スナップショットを保存"), "Ctrl+S");
         Row(gHere, L.T("スナップショットをコピー"), "Ctrl+C");
         Row(gHere, L.T("スナップショット一覧"), "Ctrl+G");
-        Row(gHere, L.T("常に前面に表示"), "Ctrl+T");
-        Row(gHere, L.T("ウィンドウ枠を非表示"), "Ctrl+B");
+        Row(gHere, L.T("常に手前に表示"), "Ctrl+T");
+        Row(gHere, L.T("ウィンドウ枠を隠す"), "Ctrl+B");
         Row(gHere, L.T("メニューバーの表示"), "F10");
-        Row(gHere, L.T("情報表示の切替（オフ → FPS だけ → 詳しく）"), "Ctrl+Shift+I");
-        Row(gHere, L.T("FSR・くっきりと標準の拡大を見比べる"), L.T("Q（押している間）"));
+        Row(gHere, L.T("情報表示の切り替え（オフ → FPS だけ → 詳しく）"), "Ctrl+Shift+I");
+        Row(gHere, L.T("標準の拡大と見比べる"), L.T("Q（押している間）"));
         Row(gHere, L.T("プロファイルを切り替える"), "Ctrl+1 – 9");
         Row(gHere, L.T("メニュー"), L.T("右クリック"));
         Row(gHere, L.T("操作一覧"), "F1");
 
         Row(gGlobal, L.T("スナップショットを保存"), FormatHotkey((Keys)_settings.HotkeySnapshot));
         Row(gGlobal, L.T("ミュート"), FormatHotkey((Keys)_settings.HotkeyMute));
-        Row(gGlobal, L.T("PiP の切替"), FormatHotkey((Keys)_settings.HotkeyPip));
+        Row(gGlobal, L.T("PiP の切り替え"), FormatHotkey((Keys)_settings.HotkeyPip));
         Row(gGlobal, L.T("音量を上げる"), FormatHotkey((Keys)_settings.HotkeyVolumeUp));
         Row(gGlobal, L.T("音量を下げる"), FormatHotkey((Keys)_settings.HotkeyVolumeDown));
-        Row(gGlobal, L.T("なめらか ⇔ 低遅延"), FormatHotkey((Keys)_settings.HotkeyStyle));
+        Row(gGlobal, L.T("映像の出し方（なめらか ⇔ 低遅延）"), FormatHotkey((Keys)_settings.HotkeyStyle));
         if (!_settings.GlobalHotkeys)
             Row(gGlobal, string.Empty, L.T("（グローバルホットキーは無効です。YuCap の画面では使えます）"));
 
-        var close = new Button { Text = L.T("閉じる"), DialogResult = DialogResult.OK };
-        Ui.Frame(dlg, lv, true, close);
-        dlg.AcceptButton = close;
-        dlg.CancelButton = close;
+        Ui.FrameClose(dlg, new UiScroll(table), fill: true);
         dlg.ShowDialog(this);
     }
 
@@ -1607,7 +1066,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         UpdateChecks();
         _canvas.Invalidate();
 
-        if (SettingsStore.LastLoadFailed)
+        if (SettingsStore.SaveBlocked)
+        {
+            // The real file is intact but could not be read (held by another program): nothing is written over it this session,
+            // so every change made now is lost on exit. Say so plainly, and keep saying it in the status bar.
+            ShowOsd(L.T("設定ファイルをほかのプログラムが使っていたため読み込めず、既定の設定で起動しました。今回変えた設定は保存されません（YuCap を起動し直すと元の設定に戻ります）。"), 10000);
+        }
+        else if (SettingsStore.LastLoadFailed)
             ShowOsd(L.T("設定ファイルを読み込めませんでした。既定値で起動しています。"), OsdLongMilliseconds);
 
         if (TestModeGuard.Recovered)
@@ -1781,6 +1246,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
+    private string? _videoPickName;   // the video device InitVideoAsync chose (InitAudio runs before it has started)
+
     private async Task InitVideoAsync()
     {
         try
@@ -1789,14 +1256,15 @@ public sealed partial class MainForm : Form, IMessageFilter
             var pick = ChooseVideoDevice(devices, _settings.VideoDeviceId, _settings.DeviceKeyword);
             if (pick == null)
             {
-                // Nothing the user chose and nothing matching the keyword: never open "some other" device
-                // (a webcam, a virtual camera). Say so and wait for WM_DEVICECHANGE / the device menu.
+                // Nothing the user chose, nothing matching the keyword, and (first run) no device that is not a camera:
+                // never open a webcam or a virtual camera. Say so and wait for WM_DEVICECHANGE / the device menu.
                 Log.Info($"InitVideo: no capture device found ({devices.Count} other video device(s))");
                 SetNoCaptureDeviceState(devices.Count > 0);
                 if (devices.Count > 0)
                     ShowOsd(L.T("キャプチャーボードが見つかりません。「デバイス」メニューから映像デバイスを選んでください"), OsdLongMilliseconds);
                 return;
             }
+            _videoPickName = pick.Name;
             LayoutCanvas();               // give the canvas a valid size before Start
             await StartVideoAsync(pick, _cliMode ?? _savedMode);
             _currentVideoInfo = pick;
@@ -1818,7 +1286,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         try
         {
             var devices = AudioEngine.EnumerateDevices();
-            var pick = ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword);
+            var pick = ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name ?? _videoPickName);
             if (pick == null)
             {
                 Log.Info("InitAudio: no capture audio device found (not opening an unrelated input)");
@@ -1896,7 +1364,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (!_audio.IsRunning)
             {
                 var pick = (present ? _currentAudioInfo : null)
-                    ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword);
+                    ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name);
                 if (pick != null)
                 {
                     try
@@ -2169,6 +1637,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
+        if (!_isPip) MinimumSize = NormalMinimumSize;
         // The context menu is laid out for one scaling only (see OnCtxOpening): make a new one for this monitor.
         if (e.DeviceDpiNew != _ctxDpi && IsHandleCreated && !_ctxFixPending)
         {
@@ -2200,11 +1669,11 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private ToolStripMenuItem BuildTextSizeSubmenu()
     {
-        var m = new ToolStripMenuItem(L.T("表示の文字の大きさ"));
+        var m = new ToolStripMenuItem(L.T("情報表示・通知の文字の大きさ"));
         foreach ((string label, int pct) in new[] { (L.T("自動"), 100), (L.T("小（75%）"), 75), (L.T("大（125%）"), 125), (L.T("特大（150%）"), 150) })
         {
             int p = pct;
-            var item = new ToolStripMenuItem(label, null, (_, _) => SetOverlayTextPct(p)) { Tag = p };
+            var item = Radio(new ToolStripMenuItem(label, null, (_, _) => SetOverlayTextPct(p)) { Tag = p });
             _textSizeItems.Add(item);
             m.DropDownItems.Add(item);
         }
@@ -2217,7 +1686,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         ApplyOverlayScale();
         PositionInfo();
         UpdateChecks();
-        ShowOsd(pct == 100 ? L.T("表示の文字の大きさ: 自動") : L.F("表示の文字の大きさ: {0}%", pct));
+        ShowOsd(pct == 100 ? L.T("情報表示・通知の文字の大きさ: 自動") : L.F("情報表示・通知の文字の大きさ: {0}%", pct));
     }
 
     private Rectangle ComputeDest(Size client)
@@ -2695,9 +2164,9 @@ public sealed partial class MainForm : Form, IMessageFilter
         // tied to the device it was taken on — so it can be put back via
         // "入力レベルを元に戻す" even after a restart, matching what this dialog
         // promises ("メニューから戻せます").
-        if (MessageBox.Show(this,
+        if (Ui.Message(this,
                 L.T("入力レベルを最大にしますか？\n\nWindows の録音デバイスの音量を 100% に変更します。\nこの設定は他のアプリにも影響し、YuCap を終了しても元に戻りません。\n（メニューの「入力レベルを元に戻す」で戻せます）"),
-                "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                MsgKind.Question, MessageBoxButtons.YesNo) != DialogResult.Yes)
             return;
 
         // A second "maximise" on the same device must not replace the remembered ORIGINAL level with
@@ -2845,51 +2314,84 @@ public sealed partial class MainForm : Form, IMessageFilter
             return;
         }
 
-        using var dlg = Ui.NewDialog(L.T("連写スナップショット"), 300, 130);
+        using var dlg = Ui.NewDialog(L.T("連写スナップショット"), 300);
 
-        var lblInt = Ui.Label(L.T("間隔 (秒):"), Ui.Pad, 20);
-        var numInt = new NumericUpDown
-        {
-            Minimum = 0.5m, Maximum = 3600, DecimalPlaces = 1, Increment = 0.5m,
-            Value = 5, Location = new Point(110, 16), Width = 100,
-        };
-        var lblCnt = Ui.Label(L.T("枚数:"), Ui.Pad, 56);
-        var numCnt = new NumericUpDown
-        {
-            Minimum = 1, Maximum = 999, Value = 10,
-            Location = new Point(110, 52), Width = 100,
-        };
-        dlg.Controls.AddRange(new Control[] { lblInt, numInt, lblCnt, numCnt });
-        Ui.AddOkCancel(dlg, L.T("開始"));
+        var numInt = Ui.Number(0.5m, 3600, 5, 100);
+        numInt.DecimalPlaces = 1;
+        numInt.Increment = 0.5m;
+        var numCnt = Ui.Number(1, 999, 10, 100);
+        var grid = Ui.Grid()
+            .AddRow(Ui.Caption(L.T("間隔（秒）:")), numInt)
+            .AddRow(Ui.Caption(L.T("枚数:")), numCnt);
+        Ui.FrameOkCancel(dlg, grid, L.T("開始"));
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         _burstTotal = (int)numCnt.Value;
         _burstDone = 0;
+        _burstSkips = 0;
         _burstTimer.Interval = Math.Max(100, (int)(numInt.Value * 1000));
         _burstTimer.Start();
-        ShowOsd(L.F("連写を開始します ({0}枚 / {1}秒間隔)", _burstTotal, numInt.Value), OsdLongMilliseconds);
+        ShowOsd(L.F("連写を開始します（{0} 枚・{1} 秒間隔）", _burstTotal, numInt.Value), OsdLongMilliseconds);
+    }
+
+    /// <summary>How many ticks in a row a burst waits for a video restart (renderer or style switch, reconnection) before it gives up.</summary>
+    private const int BurstMaxSkips = 5;
+
+    /// <summary>The video is being restarted on purpose or by the automatic recovery, and is expected back shortly.</summary>
+    private bool VideoRestarting =>
+        _engineSwapping || _engineSwitchBusy || _suspended || _resumeTimer.Enabled || _busyText != null || (_vRecovering && !_vGaveUp);
+
+    private void StopBurst(string osd)
+    {
+        _burstTimer.Stop();
+        ShowOsd(osd, OsdLongMilliseconds);
+        UpdateChecks();
     }
 
     private void BurstTick()
     {
-        // An unattended timer must stop on the FIRST failure: whatever broke
+        // The video is restarting (a renderer or style switch, a reconnection): there is no picture to take for a moment.
+        // Skip this shot rather than end the burst over it, but not forever.
+        if (!_video.IsRunning || VideoRestarting)
+        {
+            if (VideoRestarting && _burstSkips < BurstMaxSkips)
+            {
+                _burstSkips++;
+                Log.Info($"burst: video restarting - shot skipped ({_burstSkips}/{BurstMaxSkips})");
+                return;
+            }
+            StopBurst(L.F("映像が止まったため、連写を終えました（{0}/{1} 枚）", _burstDone, _burstTotal));
+            return;
+        }
+
+        // An unattended timer must stop on the FIRST real failure: whatever broke
         // one save (full disk, a removed/unwritable save folder) will break
         // every later shot too, so continuing just repeats a modal dialog on
         // every tick — an endless storm the user cannot dismiss ahead of.
         if (SaveSnapshotCore(out _, out string? error))
         {
+            _burstSkips = 0;
             _burstDone++;
             ShowOsd(L.F("連写 {0}/{1}", _burstDone, _burstTotal));
         }
-        else
+        else if (VideoRestarting && _burstSkips < BurstMaxSkips)
         {
-            _burstTimer.Stop();
-            ShowOsd(L.T("連写を中止しました（保存に失敗）"), OsdLongMilliseconds);
-            MessageBox.Show(this, L.F("保存に失敗しました。\n\n{0}", error), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            UpdateChecks();
+            _burstSkips++;   // the restart began between the check above and the grab
+            Log.Info($"burst: no picture while the video restarts - shot skipped ({_burstSkips}/{BurstMaxSkips})");
             return;
         }
-        if (_burstDone >= _burstTotal || !_video.IsRunning) { _burstTimer.Stop(); UpdateChecks(); }
+        else if (!_video.IsRunning)
+        {
+            StopBurst(L.F("映像が止まったため、連写を終えました（{0}/{1} 枚）", _burstDone, _burstTotal));
+            return;
+        }
+        else
+        {
+            StopBurst(L.T("連写を中止しました（保存に失敗）"));
+            Ui.Message(this, L.F("保存に失敗しました。\n\n{0}", error), MsgKind.Error);
+            return;
+        }
+        if (_burstDone >= _burstTotal) { _burstTimer.Stop(); UpdateChecks(); }
     }
 
     // ---- Startup registration -------------------------------------------
@@ -2925,7 +2427,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         catch (Exception ex)
         {
             Log.Info("ToggleStartup failed: " + ex);
-            MessageBox.Show(this, Errors.Describe(ex), "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, Errors.Describe(ex, L.T("Windows の自動実行の設定を変更できませんでした（アクセスが拒否されました）。")), MsgKind.Warning);
         }
         _miStartup.Checked = IsStartupRegistered();
     }
@@ -2934,30 +2436,14 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowDeviceKeywordSettings()
     {
-        using var dlg = Ui.NewDialog(L.T("優先デバイス設定"), 340, 130);
+        using var dlg = Ui.NewDialog(L.T("優先デバイス設定"), 380);
 
-        // Table layout: sizes come from the controls themselves, so nothing overlaps at any display scaling.
-        var body = new TableLayoutPanel
-        {
-            ColumnCount = 2,
-            RowCount = 2,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Margin = Padding.Empty,
-        };
-        body.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        var lbl = Ui.Label(L.T("キーワード:"), 0, 0);
-        lbl.Anchor = AnchorStyles.Left;
-        lbl.Margin = new Padding(0, 0, Ui.Gap, Ui.Gap);
-        var txt = new TextBox { Text = _settings.DeviceKeyword, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 0, 0, Ui.Gap) };
-        var hint = Ui.FlowHint(
-            L.T("デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）"));
-        body.Controls.Add(lbl, 0, 0);
-        body.Controls.Add(txt, 1, 0);
-        body.Controls.Add(hint, 0, 1);
-        body.SetColumnSpan(hint, 2);
-        Ui.FrameOkCancel(dlg, body);
+        var txt = new TextBox { Text = _settings.DeviceKeyword };
+        var grid = Ui.Grid()
+            .AddRow(Ui.Caption(L.T("キーワード:")), txt)
+            .AddSpan(Ui.Hint(L.T("デバイス名にこの語を含む機器を起動時に自動選択します。\n（既定: JVA14）")), underField: false);
+        Ui.FrameOkCancel(dlg, grid);
+        dlg.InitialFocus = txt;
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         string keyword = string.IsNullOrWhiteSpace(txt.Text) ? "JVA14" : txt.Text.Trim();
@@ -2969,7 +2455,7 @@ public sealed partial class MainForm : Form, IMessageFilter
 
         // Applying the new keyword right away (rather than only on the next
         // device/app start) matches what the dialog implies it just did.
-        var videoMatch = ChooseVideoDevice(VideoEngine.EnumerateDevices(), null, keyword);   // keyword only; no "first device" fallback
+        var videoMatch = ChooseVideoDevice(VideoEngine.EnumerateDevices(), null, keyword, firstRunFallback: false);   // keyword only; no "first device" fallback
         bool switched = false;
         if (videoMatch != null && videoMatch.Id != _currentVideoInfo?.Id)
         {
@@ -3045,7 +2531,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         dpi = Math.Max(96, dpi);
         if (!_menuFonts.TryGetValue((dpi, bold), out Font? f))
-            _menuFonts[(dpi, bold)] = f = new Font("Segoe UI", MenuBasePt * dpi / 96f,
+            _menuFonts[(dpi, bold)] = f = new Font(Ui.FamilyName, MenuBasePt * dpi / 96f,
                 bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
         return f;
     }
@@ -3110,6 +2596,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         // otherwise every switch would leave the previous language's items
         // behind and the check-state lists would grow without bound.
         _menu.Items.Clear();
+        _refilledMenus.Clear();
         _aspectItems.Clear();
         _rotationItems.Clear();
         _pipIdleItems.Clear();
@@ -3124,7 +2611,10 @@ public sealed partial class MainForm : Form, IMessageFilter
         _qualityItems.Clear();
         _hdrRoots.Clear();
         _hdrItems.Clear();
-        _interpItems.Clear();
+        _styleItems.Clear();
+        _styleRoots.Clear();
+        _sharpRoots.Clear();
+        _compareItems.Clear();
         _sharpnessItems.Clear();
         _nativeResItems.Clear();
         _chromaItems.Clear();
@@ -3139,7 +2629,6 @@ public sealed partial class MainForm : Form, IMessageFilter
         _trainPauseItems.Clear();
         _trainCountItems.Clear();
         _trainChooseRoots.Clear();
-        _ctxFull.Clear();
 
         BuildContextMenu(dpi);
         BuildMenu();
@@ -3304,47 +2793,45 @@ public sealed partial class MainForm : Form, IMessageFilter
             _settings.AdjSaturation, _settings.AdjGamma);
         int sh0 = _settings.ShadowBoost;
 
-        using var dlg = Ui.NewDialog(L.T("映像の調整"), 440, 312);
-        const int trackX = 96, trackW = 252, valueX = 356;
+        using var dlg = Ui.NewDialog(L.T("映像の調整"), 440);
+        var grid = Ui.Grid();
 
-        TrackBar AddRow(string name, int y, int min, int max, int value, int tick,
+        UiSlider AddRow(string name, int min, int max, int value, int tick,
             Func<int, string> format, Action<int> apply)
         {
-            var label = Ui.Label(name, Ui.Pad, y + 6);
-            var track = new TrackBar
+            var track = new UiSlider
             {
                 Minimum = min, Maximum = max, Value = Math.Clamp(value, min, max),
-                TickFrequency = tick, SmallChange = Math.Max(1, tick / 10), LargeChange = tick,
-                TickStyle = TickStyle.None,
-                Location = new Point(trackX, y), Size = new Size(trackW, 32),
+                SmallChange = Math.Max(1, tick / 10), LargeChange = tick,
             };
-            var valueLabel = Ui.Label(format(track.Value), valueX, y + 6);
+            // The read-out has a fixed width, so the slider does not move while the number changes.
+            var valueLabel = Ui.Fixed(Ui.Text(format(track.Value)), 56);
+            valueLabel.TextAlign = ContentAlignment.MiddleRight;
             track.ValueChanged += (_, _) =>
             {
                 valueLabel.Text = format(track.Value);
                 apply(track.Value);
                 ApplyRenderOptions();   // live: the video behind the dialog updates as you drag
             };
-            dlg.Controls.AddRange(new Control[] { label, track, valueLabel });
+            grid.AddRow(Ui.Caption(name), track, valueLabel);
             return track;
         }
 
-        TrackBar tb = AddRow(L.T("明るさ"), 16, -100, 100, b0, 25,
+        UiSlider tb = AddRow(L.T("明るさ"), -100, 100, b0, 25,
             v => v.ToString("+0;-0;0"), v => _settings.AdjBrightness = v);
-        TrackBar tc = AddRow(L.T("コントラスト"), 62, 0, 200, c0, 25,
+        UiSlider tc = AddRow(L.T("コントラスト"), 0, 200, c0, 25,
             v => v + "%", v => _settings.AdjContrast = v);
-        TrackBar ts = AddRow(L.T("彩度"), 108, 0, 200, s0, 25,
+        UiSlider ts = AddRow(L.T("彩度"), 0, 200, s0, 25,
             v => v + "%", v => _settings.AdjSaturation = v);
-        TrackBar tg = AddRow(L.T("ガンマ"), 154, 50, 200, g0, 25,
+        UiSlider tg = AddRow(L.T("ガンマ"), 50, 200, g0, 25,
             v => (v / 100.0).ToString("0.00"), v => _settings.AdjGamma = v);
 
-        TrackBar tsh = AddRow(L.T("暗部補正"), 200, 0, VideoAdjustments.MaxShadow, sh0, 1,
+        UiSlider tsh = AddRow(L.T("暗部補正"), 0, VideoAdjustments.MaxShadow, sh0, 1,
             ShadowLevelText, v => _settings.ShadowBoost = v);
 
-        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
+        var reset = Ui.Btn(L.T("既定に戻す"));
         reset.Click += (_, _) => { tb.Value = 0; tc.Value = 100; ts.Value = 100; tg.Value = 100; tsh.Value = 0; };
-        dlg.Controls.Add(reset);
-        Ui.AddOkCancel(dlg);
+        Ui.FrameOkCancel(dlg, grid, left: new Button[] { reset });
 
         if (dlg.ShowDialog(this) != DialogResult.OK)
         {
@@ -3369,7 +2856,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         for (int level = 0; level <= VideoAdjustments.MaxShadow; level++)
         {
             int lv = level;
-            var item = new ToolStripMenuItem(ShadowLevelText(lv), null, (_, _) => SetShadowBoost(lv)) { Tag = lv };
+            var item = Radio(new ToolStripMenuItem(ShadowLevelText(lv), null, (_, _) => SetShadowBoost(lv)) { Tag = lv });
             _shadowItems.Add(item);
             _miShadow.DropDownItems.Add(item);
         }
@@ -3406,62 +2893,50 @@ public sealed partial class MainForm : Form, IMessageFilter
         // The slider is the manual offset, or (自動) the trim; each keeps its own value while the box is toggled.
         int manualVal = autoBefore ? 0 : before, trimVal = autoBefore ? before : 0;
 
-        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440, 520);
-        int w = dlg.ClientSize.Width;
-        int inner = w - 2 * Ui.Pad;
+        using var dlg = Ui.NewDialog(L.T("音ズレ補正"), 440);
 
-        var chkAuto = new CheckBox
-        {
-            Text = L.T("自動で合わせる"), AutoSize = false, Checked = autoBefore,
-            Location = new Point(Ui.Pad, 12), Size = new Size(inner, 24),
-            Enabled = _video.SupportsVideoDelay || autoBefore,
-        };
-        var autoHint = Ui.Hint(L.T("映像と音の遅れの差を測り、少しずつ自動で合わせ続けます。テレビやスピーカーの中の遅れは測れないので、下の微調整で足してください。"),
-            Ui.Pad, 40, inner);
+        var chkAuto = Ui.Check(L.T("自動で合わせる"), autoBefore);
+        chkAuto.Enabled = _video.SupportsVideoDelay || autoBefore;
+        var autoHint = Ui.Hint(L.T("映像と音の遅れの差を測り、少しずつ自動で合わせ続けます。テレビやスピーカーの中の遅れは測れないので、下の微調整で足してください。"));
 
-        var left = Ui.Label(L.T("音声を早める"), Ui.Pad, 96);
-        var right = Ui.Label(L.T("音声を遅らせる"), 0, 96);
-        right.Left = w - Ui.Pad - right.PreferredWidth;
-
-        var track = new TrackBar
+        var ends = Ui.Row(Ui.Caption(L.T("音声を早める")), Ui.Spring(), Ui.Caption(L.T("音声を遅らせる")));
+        var track = new UiSlider
         {
             Minimum = -300, Maximum = 300, Value = Math.Clamp(before, -300, 300),
             TickFrequency = 50, SmallChange = 10, LargeChange = 50,
-            Location = new Point(Ui.Pad, 118), Size = new Size(inner, 45),
         };
-        var value = new Label
-        {
-            AutoSize = false, TextAlign = ContentAlignment.MiddleCenter,
-            Location = new Point(Ui.Pad, 166), Size = new Size(inner, 24),
-            Font = new Font(dlg.Font, FontStyle.Bold),
-        };
+        var value = Ui.Styled(string.Empty, Ui.HeadingPt, FontStyle.Bold, wrap: true);
+        value.TextAlign = ContentAlignment.MiddleCenter;
         // What is in force right now (and, with 自動, how the automatic part is doing).
-        var current = new Label
-        {
-            AutoSize = false, Location = new Point(Ui.Pad, 196), Size = new Size(inner, 62),
-        };
-        var hint = Ui.Hint(L.T("映像の動きと音が合う位置にしてください。手をたたく動画などで合わせると分かりやすいです。"),
-            Ui.Pad, 262, inner);
+        var current = Ui.Text(string.Empty);
+        var hint = Ui.Hint(L.T("映像の動きと音が合う位置にしてください。手をたたく動画などで合わせると分かりやすいです。"));
         // Live numbers: how long picture and sound take inside YuCap / Windows (offset included).
-        var live = new Label
-        {
-            AutoSize = false, Location = new Point(Ui.Pad, 312), Size = new Size(inner, 44),
-            Font = new Font(dlg.Font, FontStyle.Bold),
-        };
-        var liveHint = Ui.Hint(L.T("キャプチャーボードやテレビの中の遅れは含みません。目安として使ってください。"),
-            Ui.Pad, 360, inner);
-        var match = Ui.Button(L.T("目安に合わせる"), Ui.Pad, 402, 140);
+        var live = Ui.Styled(string.Empty, Ui.BodyPt, FontStyle.Bold, wrap: true);
+        var liveHint = Ui.Hint(L.T("キャプチャーボードやテレビの中の遅れは含みません。目安として使ってください。"));
+        var match = Ui.Btn(L.T("目安に合わせる"));
         long matchedTick = 0;
-        var mfHint = Ui.Hint(L.T("音声を早める補正は Direct3D 描画のときに使えます。標準の描画では 0 として扱います。"),
-            Ui.Pad, 440, inner);
+        var mfHint = Ui.Hint(L.T("音声を早める補正は Direct3D 描画のときに使えます。標準の描画では 0 として扱います。"));
+
+        var stack = Ui.Stack();
+        stack.Add(chkAuto);
+        stack.Add(autoHint, before: 4, indent: 24);
+        stack.Add(ends, before: Ui.Pad + 4);
+        stack.Add(track, before: 4);
+        stack.Add(value, before: 4);
+        stack.Add(current, before: Ui.Gap);
+        stack.Add(hint, before: 4);
+        stack.Add(live, before: Ui.Pad + 4);
+        stack.Add(liveHint, before: 4);
+        stack.Add(match, before: Ui.Gap + 4);
+        stack.Add(mfHint, before: Ui.Gap);
 
         bool snapping = false;
         void ShowMode()
         {
             bool auto = chkAuto.Checked;
             value.Text = auto ? L.F("微調整: {0} ms", AvSigned(track.Value)) : AvOffsetText(track.Value);
-            match.Visible = !auto;
-            mfHint.Visible = !_video.SupportsVideoDelay && track.Value < 0 && !auto;
+            Ui.Show(match, !auto);
+            Ui.Show(mfHint, !_video.SupportsVideoDelay && track.Value < 0 && !auto);
         }
         void UpdateCurrent()
         {
@@ -3490,7 +2965,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             UpdateCurrent();
         };
 
-        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 110);
+        var reset = Ui.Btn(L.T("既定に戻す"));
         reset.Click += (_, _) => track.Value = 0;
 
         // audio latency - video latency; positive = the sound comes later than the picture.
@@ -3527,13 +3002,12 @@ public sealed partial class MainForm : Form, IMessageFilter
         };
         var timer = new System.Windows.Forms.Timer { Interval = 250 };
         timer.Tick += (_, _) => UpdateLive();
-        dlg.FormClosed += (_, _) => { timer.Dispose(); value.Font.Dispose(); live.Font.Dispose(); };   // the two bold fonts were leaked per open
+        dlg.FormClosed += (_, _) => timer.Dispose();   // (the bold fonts are the shared ones of Ui.FontAt)
         ShowMode();
         UpdateLive();
         timer.Start();
 
-        dlg.Controls.AddRange(new Control[] { chkAuto, autoHint, left, right, track, value, current, hint, live, liveHint, match, mfHint, reset });
-        Ui.AddOkCancel(dlg);
+        Ui.FrameOkCancel(dlg, stack, left: new Button[] { reset });
 
         if (dlg.ShowDialog(this) != DialogResult.OK)
         {
@@ -3582,17 +3056,36 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// <summary>The GPU budget guard moved: say so (OSD) only when the user changed a setting a moment ago, otherwise the status bar tooltip and
     /// the info panel carry it silently.</summary>
     private bool _nvHintShown;
+    private bool _nvBrokenShown;           // the hint shown was the "fell back to FSR" one (re-armed once the scaler works again)
     private int _hdrKindSeen;
+    private string? _scalerNoteSeen, _streamNoteSeen, _hdrNoteSeen;
 
-    /// <summary>NVIDIA RTX scaler: say (once per choice) when it fell back to FSR or when the driver is not applying it; HDR: say what is shown when it changes.</summary>
+    /// <summary>Why the HDR request is not met, but only while HDR was asked for and SDR is shown (localized); null otherwise.</summary>
+    private string? HdrShortfallNote() =>
+        _settings.HdrMode != "off" && _video.HdrKind == 0 && _video.HdrNote is { Length: > 0 } n ? L.T(n) : null;
+
+    /// <summary>The engine's notes on what it could not do as asked (localized), for the status bar tooltip and the info panel.</summary>
+    private IEnumerable<string> EngineNotes()
+    {
+        if (_video.ScalerFallbackNote is { Length: > 0 } sc) yield return L.T(sc);
+        if (_video.StreamWindowNote is { Length: > 0 } sw) yield return L.T(sw);
+        if (HdrShortfallNote() is { } hdr) yield return L.F("HDR 表示: {0}", hdr);
+    }
+
+    /// <summary>Notices from the engine, each shown once when it changes: the NVIDIA RTX scaler fell back to FSR or the driver is not
+    /// applying it; what HDR shows (and why it is not HDR when HDR was asked for); a scaler that could not run as chosen; the stream
+    /// window that lost its picture.</summary>
     private void NvHdrOsdTick()
     {
         if (_testRunning) return;
         if (_settings.ScalingQuality == "nvrtx" && _video.IsRunning)
         {
-            if (!_nvHintShown && _video.NvRtxBrokenWhy is { } why)
+            string? why = _video.NvRtxBrokenWhy;
+            // Working again (the engine retries by itself): a later fallback deserves its own notice.
+            if (why == null && _nvBrokenShown) { _nvHintShown = false; _nvBrokenShown = false; }
+            if (!_nvHintShown && why != null)
             {
-                _nvHintShown = true;
+                _nvHintShown = _nvBrokenShown = true;
                 Log.Info("NVIDIA RTX scaler fell back to FSR: " + why);
                 ShowOsd(L.T("AI 拡大が使えないため、FSR にしています"), OsdLongMilliseconds);
             }
@@ -3602,13 +3095,37 @@ public sealed partial class MainForm : Form, IMessageFilter
                 ShowOsd(L.T("NVIDIA コントロールパネルで「RTX ビデオ強調」をオンにしてください"), OsdLongMilliseconds);
             }
         }
-        else _nvHintShown = false;
+        else _nvHintShown = _nvBrokenShown = false;
+
         int k = _video.HdrKind;
+        string? hdrNote = HdrShortfallNote();
         if (k != _hdrKindSeen)
         {
             _hdrKindSeen = k;
+            _hdrNoteSeen = hdrNote;
             if (_settings.HdrMode != "off" || k != 0)
-                ShowOsd(k == 1 ? L.T("HDR 表示: RTX Video HDR") : k == 2 ? L.T("HDR 表示: 簡易") : L.T("HDR 表示: オフ"), OsdLongMilliseconds);
+            {
+                string text = k == 1 ? L.T("HDR 表示: RTX Video HDR") : k == 2 ? L.T("HDR 表示: 簡易") : L.T("HDR 表示: オフ");
+                ShowOsd(hdrNote != null ? text + L.Par(hdrNote) : text, OsdLongMilliseconds);
+            }
+        }
+        else if (hdrNote != _hdrNoteSeen)
+        {
+            _hdrNoteSeen = hdrNote;
+            if (hdrNote != null) ShowOsd(L.F("HDR 表示: {0}", hdrNote), OsdLongMilliseconds);
+        }
+
+        string? scaler = _video.IsRunning ? _video.ScalerFallbackNote : null;
+        if (scaler != _scalerNoteSeen)
+        {
+            _scalerNoteSeen = scaler;
+            if (scaler != null) ShowOsd(L.T(scaler), OsdLongMilliseconds);
+        }
+        string? stream = _video.StreamWindowNote;
+        if (stream != _streamNoteSeen)
+        {
+            _streamNoteSeen = stream;
+            if (stream != null) ShowOsd(L.T(stream), OsdLongMilliseconds);
         }
     }
 
@@ -3628,11 +3145,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         foreach (var (mode, label) in new[] { ("off", L.T("オフ")), ("rtx", L.T("HDR で表示（NVIDIA RTX）")), ("simple", L.T("HDR で表示（簡易）")) })
         {
             string md = mode;
-            var item = new ToolStripMenuItem(label, null, (_, _) => SetHdrMode(md)) { Tag = md };
+            var item = Radio(new ToolStripMenuItem(label, null, (_, _) => SetHdrMode(md)) { Tag = md });
             _hdrItems.Add(item);
             m.DropDownItems.Add(item);
         }
-        m.DropDownOpening += (_, _) => UpdateHdrMenu();
+        m.DropDownOpening += (_, _) => UpdateHdrMenu(probeMonitor: true);
         _hdrRoots.Add(m);
         return m;
     }
@@ -3647,14 +3164,20 @@ public sealed partial class MainForm : Form, IMessageFilter
         catch { return false; }
     }
 
-    private void UpdateHdrMenu()
+    private bool _hdrMonitorOn;   // the last look at whether the window's monitor has Windows HDR on (taken when the HDR menu opens)
+
+    /// <summary>The HDR menu's state. Its parent is enabled from the renderer alone - it must follow a renderer switch even while
+    /// closed (a disabled submenu cannot be opened, so state worked out only on opening would stick). Whether the monitor has HDR
+    /// on is asked only when <paramref name="probeMonitor"/> (the submenu opening): that query talks to every output.</summary>
+    private void UpdateHdrMenu(bool probeMonitor)
     {
         bool supported = _video.SupportsScalingQuality;
-        bool hdr = supported && MonitorHdrOn();
+        if (probeMonitor) _hdrMonitorOn = supported && MonitorHdrOn();
+        bool hdr = supported && _hdrMonitorOn;
         bool rtx = hdr && D3DRenderer.NvAdapterPresent();
-        string hint = !supported ? L.T("Direct3D 描画のときに使えます（映像 → 描画方式）")
+        string hint = !supported ? L.T(D3dOnlyTip)
             : !hdr ? L.T("Windows の設定でこのモニターの HDR をオンにしてください") : string.Empty;
-        foreach (var root in _hdrRoots) { root.Enabled = supported; root.ToolTipText = hint; }
+        foreach (var root in _hdrRoots) { root.Enabled = supported; root.ToolTipText = supported ? string.Empty : hint; }
         foreach (var item in _hdrItems)
         {
             string md = (string)item.Tag!;
@@ -3691,7 +3214,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         ApplyRenderOptions();
         UpdateChecks();
         string label = key == "off" ? L.T("オフ") : key == "auto" ? L.T("自動") : key + "p";
-        ShowOsd(L.F("元の細かさに合わせて拡大: {0}", label));
+        ShowOsd(L.F("元の解像度に合わせて拡大: {0}", label));
     }
 
     /// <summary>Tell the user, once per decision, what 自動 settled on (called from the UI timer).</summary>
@@ -3721,33 +3244,6 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (st.Judging) return L.T("判定中");
         if (st.Target <= 0) return L.F("{0}p のまま（縮めません）", st.SourceHeight);
         return L.F("{0}p 相当（今は使っていません）", st.Target);
-    }
-
-    private void ToggleInterpolation()
-    {
-        if (!_video.SupportsInterpolation) return;
-        _settings.Interpolation = !_settings.Interpolation;
-        MarkSettingsDirty();
-        ApplyRenderOptions();
-        UpdateChecks();
-        ShowOsd(InterpolationOsdText(), _settings.Interpolation ? OsdLongMilliseconds : null);
-    }
-
-    /// <summary>The OSD line after toggling フレーム補間: on and running, or on but idle with the reason.</summary>
-    private string InterpolationOsdText()
-    {
-        if (!_settings.Interpolation) return L.T("フレーム補間: オフ");
-        if (!_video.SupportsInterpolation) return L.T("フレーム補間: Direct3D 描画で使えます");
-        InterpolationStatus? st = _video.InterpolationState;
-        if (st == null || st.Idle == InterpolationIdle.NoSignal) return L.T("フレーム補間: オン（映像が始まると働きます）");
-        return st.Idle switch
-        {
-            InterpolationIdle.None => L.F("フレーム補間: オン（{0:0}→{1:0} fps）", st.SourceFps, st.RefreshHz),
-            InterpolationIdle.LowLatency => L.T("フレーム補間: オン（低遅延モード中は使えません）"),
-            InterpolationIdle.RefreshTooLow => L.F("フレーム補間: オン（画面 {0:0}Hz が映像 {1:0}fps より十分高くないため今は働きません）", st.RefreshHz, st.SourceFps),
-            InterpolationIdle.Unavailable => L.T("フレーム補間: この環境では使えません"),
-            _ => L.T("フレーム補間: オン"),
-        };
     }
 
     /// <summary>The info overlay's 補間 line.</summary>
@@ -3801,7 +3297,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             string name = _video.SupportsScalingQuality && _video.PixelPerfect ? L.T("整数倍")
                 : _video.SupportsScalingQuality ? ScalerShortName() : L.T("標準");
-            if (_video.SupportsNativeRes && _video.NativeResState is { Active: > 0 }) name += L.Sep + L.T("元の細かさ");
+            if (_video.SupportsNativeRes && _video.NativeResState is { Active: > 0 }) name += L.Sep + L.T("元の解像度");
             return name;
         }
         if (d.Width < res.Width && d.Height < res.Height) return L.T("縮小");
@@ -3865,7 +3361,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         return st.Idle switch
         {
             InterpolationIdle.None => $"{st.SourceFps:0}→{st.RefreshHz:0} fps",
-            InterpolationIdle.LowLatency => L.T("待機（低遅延モード）"),
+            InterpolationIdle.LowLatency => L.T("待機（低遅延）"),
             InterpolationIdle.RefreshTooLow => L.F("待機（画面 {0:0}Hz）", st.RefreshHz),
             InterpolationIdle.NoSignal => L.T("待機（映像待ち）"),
             InterpolationIdle.Unavailable => L.T("使えません"),
@@ -3883,7 +3379,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     private static string RendererName(string renderer) =>
-        renderer == "d3d" ? L.T("Direct3D（高画質拡大・試験版）") : L.T("標準（Media Foundation）");
+        renderer == "d3d" ? "Direct3D" : L.T("互換（Media Foundation）");
 
     /// <summary>
     /// Replace the engine with the one for <paramref name="renderer"/> and restart the
@@ -3951,7 +3447,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             LayoutCanvas();
             UpdateStatus();
             UpdateChecks();
-            MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, reason, MsgKind.Warning);
             if (back == null)
                 ShowOsd(L.F("描画方式「{0}」を開始できなかったため、「{1}」に戻しました", RendererName(renderer), RendererName(previous)), OsdLongMilliseconds);
             return;
@@ -3971,8 +3467,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         string quality = _settings.ScalingQuality;
         bool supported = _video.SupportsScalingQuality;
         bool pixelPerfect = _displayMode == VideoDisplayMode.IntegerScale;
-        string tip = !supported ? L.T("Direct3D 描画のときに使えます（映像 → 描画方式）")
-            : pixelPerfect ? L.T("整数倍表示では使いません")
+        string tip = !supported ? L.T(D3dOnlyTip)
+            : pixelPerfect ? L.T("表示モードが整数倍のときは使いません")
             : string.Empty;
         foreach (var root in _qualityRoots)
         {
@@ -3994,11 +3490,23 @@ public sealed partial class MainForm : Form, IMessageFilter
         foreach (var item in _hdrItems) item.Checked = (string)item.Tag! == _settings.HdrMode;
         foreach (var item in _nativeResItems) item.Checked = (string)item.Tag! == _settings.NativeResScale;
         foreach (var item in _chromaItems) item.Checked = _settings.ChromaGuided;
-        foreach (var item in _restoreItems) { item.Checked = _settings.RestoreMode == "on"; item.Enabled = quality is "fsr" or "anime4k"; }
-        foreach (var item in _sharpnessItems)
+        bool sharpens = quality is "fsr" or "anime4k";
+        string sharpTip = sharpens ? string.Empty : L.T("拡大の画質が 高画質（FSR）か くっきり のときに使えます");
+        foreach (var item in _restoreItems)
         {
-            item.Checked = (int)item.Tag! == _settings.FsrSharpness;
-            item.Enabled = quality is "fsr" or "anime4k";
+            item.Checked = _settings.RestoreMode == "on";
+            item.Enabled = sharpens;
+            item.ToolTipText = sharpens ? RestoreTip : sharpTip;
+        }
+        foreach (var root in _sharpRoots) { root.Enabled = sharpens; root.ToolTipText = sharpTip; }
+        foreach (var item in _sharpnessItems) item.Checked = (int)item.Tag! == _settings.FsrSharpness;
+        bool canCompare = supported && !pixelPerfect && quality != "standard";
+        foreach (var item in _compareItems)
+        {
+            item.Enabled = canCompare;
+            item.ToolTipText = canCompare
+                ? L.T("Q を押している間（クリックなら 2 秒間）、標準の拡大で表示して違いを見比べます。")
+                : L.T("拡大の画質が 標準 以外のときに使えます");
         }
     }
 
@@ -4237,6 +3745,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             int h = _menu.Height;                 // read while visible
             _menu.Visible = false;
             if (_isFullscreen) _fsMenuVisible = false; else GrowClientHeight(-h);
+            // Hidden, the bar's Alt keys stop working too: say how to get it back.
+            if (!_testRunning) ShowOsd(L.T("メニューバーを隠しました。F10 か右クリックで戻せます"));
         }
         else
         {
@@ -4365,8 +3875,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             catch (Exception ex)
             {
                 _settings.AudioOutputDeviceId = previous;
-                MessageBox.Show(this, L.F("音声の出力先の切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, L.F("音声の出力先の切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
+                    MsgKind.Error);
                 try { _audio.Start(_currentAudioInfo, previous); } catch { /* the next device change retries */ }
                 UpdateStatus();
                 return;
@@ -4405,8 +3915,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("映像デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("映像デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
+                MsgKind.Error);
             await RecoverVideoAsync(); // best-effort: bring the previous device back
         }
         UpdateStatus();
@@ -4512,8 +4022,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
+                MsgKind.Error);
             await RecoverVideoAsync();
         }
         UpdateStatus();
@@ -4545,8 +4055,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("映像モードの変更に失敗しました。\n\n{0}", Errors.Describe(ex)),
+                MsgKind.Error);
             await RecoverVideoAsync();
         }
         UpdateStatus();
@@ -4574,8 +4084,8 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, L.F("音声デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
-                "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Ui.Message(this, L.F("音声デバイスの切り替えに失敗しました。\n\n{0}", Errors.Describe(ex)),
+                MsgKind.Error);
             // Start() leaves the engine stopped on failure: bring the previous device back, like SwitchAudioOutput.
             if (wasRunning && previous != null)
             {
@@ -4597,34 +4107,29 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private void ShowAudioBufferSettingsCore()
     {
-        using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 360, 250);
+        using var dlg = Ui.NewDialog(L.T("音声バッファ設定"), 440);
 
-        var lbl = Ui.Label(L.T("安全のための余裕 (ms):"), Ui.Pad, 22);
-        var num = new NumericUpDown
-        {
-            Minimum = AudioEngine.MinBufferMs,
-            Maximum = AudioEngine.MaxBufferMs,
-            Increment = 10,
-            Value = Math.Clamp(_audio.BufferMilliseconds, AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs),
-            Location = new Point(190, 20),
-            Width = 150,
-        };
+        var num = Ui.Number(AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs,
+            Math.Clamp(_audio.BufferMilliseconds, AudioEngine.MinBufferMs, AudioEngine.MaxBufferMs), 100);
+        num.Increment = 10;
 
         // Presets: the value is the safety margin YuCap keeps queued (the output device's own queue is small and fixed).
-        var lblPreset = Ui.Label(L.T("プリセット:"), Ui.Pad, 58);
-        var btnLow = Ui.Button(L.T("低遅延 20"), Ui.Pad, 78, 100);
-        var btnMid = Ui.Button(L.T("標準 40"), 126, 78, 100);
-        var btnSafe = Ui.Button(L.T("安定 100"), 236, 78, 100);
+        var btnLow = Ui.Btn(L.T("低遅延 20"));
+        var btnMid = Ui.Btn(L.T("標準 40"));
+        var btnSafe = Ui.Btn(L.T("安定 100"));
         btnLow.Click += (_, _) => num.Value = 20;
         btnMid.Click += (_, _) => num.Value = 40;
         btnSafe.Click += (_, _) => num.Value = 100;
 
         var hint = Ui.Hint(
-            L.T("音を出す前に YuCap がためておく量です。\n小さいほど音の遅れが減りますが、小さすぎると音が途切れます。\n途切れるときは大きくしてください（既定は 40）。\n実際の遅れは、ステータスバーの「遅延」や情報表示で確かめられます。"),
-            Ui.Pad, 114, 360 - 2 * Ui.Pad);
+            L.T("音を出す前に YuCap がためておく量です。\n小さいほど音の遅れが減りますが、小さすぎると音が途切れます。\n途切れるときは大きくしてください（既定は 40）。\n実際の遅れは、ステータスバーの「遅延」や情報表示で確かめられます。"));
 
-        dlg.Controls.AddRange(new Control[] { lbl, num, lblPreset, btnLow, btnMid, btnSafe, hint });
-        Ui.AddOkCancel(dlg);
+        var grid = Ui.Grid()
+            .AddRow(Ui.Caption(L.T("安全のための余裕 (ms):")), num)
+            .AddRow(Ui.Caption(L.T("プリセット:")), Ui.Stretch(Ui.Row(btnLow, btnMid, btnSafe), false))
+            .AddSpan(hint, underField: false, before: Ui.Pad);
+        Ui.FrameOkCancel(dlg, grid);
+        dlg.InitialFocus = num;
 
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
@@ -4635,8 +4140,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             try { _audio.Start(_currentAudioInfo, _settings.AudioOutputDeviceId); }
             catch (Exception ex)
             {
-                MessageBox.Show(this, L.F("音声の再初期化に失敗しました。\n\n{0}", Errors.Describe(ex)),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, L.F("音声の再初期化に失敗しました。\n\n{0}", Errors.Describe(ex)),
+                    MsgKind.Error);
                 // Back to the setting that worked, and bring the sound back with it.
                 _audio.BufferMilliseconds = oldBuffer;
                 try { _audio.Start(_currentAudioInfo, _settings.AudioOutputDeviceId); }
@@ -4894,6 +4399,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 _lblVideo.ToolTipText += "\n" + L.F("入力 {0:0}fps / 表示 {1:0}fps / 欠落 {2}",
                     st.InputFps, st.PresentedFps, st.DroppedFrames);
             if (_video.GuardStatus is { } guardTip) _lblVideo.ToolTipText += "\n" + guardTip;
+            foreach (string note in EngineNotes()) _lblVideo.ToolTipText += "\n" + note;
         }
         else
         {
@@ -4946,6 +4452,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (_video.SupportsCrop && HasCrop()) stateParts.Add(L.T("切り取り"));
         if (_video.SupportsLowLatency && _settings.LowLatency) stateParts.Add(L.T("低遅延"));
         if (_settings.AvAuto) stateParts.Add(L.T("音ズレ 自動"));
+        if (SettingsStore.SaveBlocked) stateParts.Add(L.T("設定は保存されません"));
         _lblState.Text = string.Join("  ", stateParts);
         _lblState.Visible = stateParts.Count > 0;
 
@@ -4955,160 +4462,6 @@ public sealed partial class MainForm : Form, IMessageFilter
             ? $"YuCap - {res.Width}x{res.Height} {_video.NegotiatedFps}fps"
             : L.T("YuCap - キャプチャビューア");
         if (Text != title) Text = title;
-    }
-
-    private void UpdateChecks()
-    {
-        foreach (var item in _aspectItems)
-            item.Checked = (VideoDisplayMode)item.Tag! == _displayMode;
-
-        foreach (var item in _rendererItems)
-            item.Checked = (string)item.Tag! == _settings.Renderer;
-        UpdateQualityMenu();
-        _miAdjust.Enabled = _video.SupportsAdjustments;
-        _miAdjust.ToolTipText = _video.SupportsAdjustments
-            ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
-        _miShadow.Enabled = _video.SupportsAdjustments;
-        _miShadow.ToolTipText = _video.SupportsAdjustments
-            ? L.T("暗い場面の暗い部分だけを持ち上げます。明るい部分と真っ黒はそのままです。")
-            : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
-        foreach (var it in _shadowItems) it.Checked = (int)it.Tag! == _settings.ShadowBoost;
-
-        _miCrop.Enabled = _video.SupportsCrop;
-        _miCrop.ToolTipText = _video.SupportsCrop
-            ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
-        foreach (var it in _interpItems)
-        {
-            it.Enabled = _video.SupportsInterpolation;
-            it.Checked = _video.SupportsInterpolation && _settings.Interpolation;
-            it.ToolTipText = _video.SupportsInterpolation
-                ? L.T("画面の更新が映像のコマ数より十分速いときだけ、間のコマを作って滑らかにします。映像が 1 コマぶん遅れます。")
-                : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
-        }
-        _miLowLatency.Enabled = _video.SupportsLowLatency;
-        _miLowLatency.Checked = _video.SupportsLowLatency && _settings.LowLatency;
-        _miLowLatency.ToolTipText = _video.SupportsLowLatency
-            ? string.Empty : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
-        _cmiLowLatency.Enabled = _miLowLatency.Enabled;
-        _cmiLowLatency.Checked = _miLowLatency.Checked;
-        _cmiLowLatency.ToolTipText = _miLowLatency.ToolTipText;
-        UpdateStyleItems();
-        UpdateStreamChecks();
-        UpdateSignalChecks();
-        _miLockAspect.Checked = _lockAspect;
-        _miBorderless.Checked = _isBorderless;
-        _cmiBorderless.Checked = _isBorderless;
-        _miTopmost.Checked = _alwaysOnTop;
-        _cmiTopmost.Checked = _alwaysOnTop;
-        _miMenuBar.Checked = _menu.Visible;
-        _cmiMenuBar.Checked = _menu.Visible;
-        _miStatusBar.Checked = _status.Visible;
-        _cmiStatusBar.Checked = _status.Visible;
-        _miMute.Checked = _audio.Muted;
-        _cmiMute.Checked = _audio.Muted;
-        _miMirror.Checked = _video.Mirror;
-        foreach (var item in _rotationItems)
-            item.Checked = (int)item.Tag! == _video.Rotation;
-        _miFreeze.Checked = _frozen;
-        _cmiFreeze.Checked = _frozen;
-        _miPip.Checked = _isPip;
-        _cmiPip.Checked = _isPip;
-        // The displayed shortcut must track the user's actual binding — it can
-        // be changed in ホットキー設定, and a stale "Ctrl+Alt+P" would lie.
-        _miPip.ShortcutKeyDisplayString = HotkeyMenuText((Keys)_settings.HotkeyPip);
-        _cmiPip.ShortcutKeyDisplayString = HotkeyMenuText((Keys)_settings.HotkeyPip);
-        _miClickThrough.Checked = _settings.PipClickThrough;
-        _miHotkeys.Checked = _settings.GlobalHotkeys;
-        _miCursorHide.Checked = _settings.CursorAutoHide;
-        _miUpdateCheck.Checked = _settings.UpdateCheckOnStartup;
-        _miRestoreLevel.Enabled = _settings.CaptureLevelBefore >= 0 && _audio.IsRunning
-            && _audio.CurrentDeviceId == _settings.CaptureLevelDeviceId;
-
-        // A found-but-not-skipped update relabels the help menu item so it's
-        // discoverable without a startup dialog the user has to dismiss.
-        if (_pendingUpdate != null)
-        {
-            // Staged: the click re-checks and lands in the staged branch of
-            // CheckForUpdatesAsync(manual: true), which asks to restart now.
-            _miCheckUpdate.Text = _updateStaged
-                ? L.F("再起動して更新: {0}...", _pendingUpdate.Version)
-                : L.F("更新があります: {0}...", _pendingUpdate.Version);
-            _miCheckUpdate.Font = _checkUpdateBoldFont;
-        }
-        else
-        {
-            _miCheckUpdate.Text = L.T("更新を確認...");
-            _miCheckUpdate.Font = _checkUpdateNormalFont;
-        }
-
-        // Burst mode is started and stopped by the same menu item; say which.
-        _miBurst.Text = _burstTimer.Enabled
-            ? L.F("連写を停止 ({0}/{1})", _burstDone, _burstTotal)
-            : L.T("連写スナップショット...");
-
-        // Every state toggle funnels through here, so this is the one place
-        // that reliably catches "something the user changed" for persistence.
-        // Not counted as a user change, though: this also runs whenever a menu
-        // merely opens, and that must not keep pushing back the automatic
-        // profile switch (the setters of profile values note the change themselves).
-        MarkSettingsDirty(userChange: false);
-        foreach (var item in _cursorSecItems)
-            item.Checked = _settings.CursorAutoHide && (int)item.Tag! == _settings.CursorHideSeconds;
-        foreach (var item in _textSizeItems)
-            item.Checked = (int)item.Tag! == _settings.OverlayTextPct;
-        UpdateInfoModeChecks();
-        foreach (var item in _pipIdleItems)
-            item.Checked = (int)item.Tag! == _settings.PipOpacity;
-        foreach (var item in _pipHoverItems)
-            item.Checked = (int)item.Tag! == _settings.PipOpacityHover;
-        foreach (var item in _pipSizeItems)
-            item.Checked = (int)item.Tag! == _settings.PipSizePct;
-        foreach (var item in _pipPosItems)
-            item.Checked = (int)item.Tag! == _settings.PipCorner;
-        _cmiMenuBarTop.Checked = _menu.Visible;
-        UpdateTrainChecks();
-        MirrorMenuState();
-    }
-
-    /// <summary>"ファイル(&amp;F)" -> "ファイル" (the right-click menu has no Alt keys; "(&amp;F)" in a context menu would collide with its own letters).</summary>
-    internal static string StripMnemonic(string text)
-    {
-        int i = text.IndexOf("(&", StringComparison.Ordinal);
-        if (i > 0 && text.EndsWith(")", StringComparison.Ordinal)) text = text.Substring(0, i);
-        return text.Replace("&", string.Empty);
-    }
-
-    /// <summary>
-    /// The right-click menu holds its own copies of the menu bar's menus. <see cref="UpdateChecks"/> keeps the bar's items right; this copies
-    /// their check mark, enabled state, text, shortcut text and tool tip to the twin in the right-click menu (items are paired by position,
-    /// and only when their name or text agree - a drop-down that is filled when it opens may differ between the two for a while).
-    /// </summary>
-    private void MirrorMenuState()
-    {
-        if (_ctxFull.Count == 0 || _menu.Items.Count < 8) return;
-        int[] barIndex = { 0, 1, 2, 3, 4, 6, 7 };       // ファイル デバイス 映像 音声 表示 [プロファイル] オプション ヘルプ
-        for (int i = 0; i < _ctxFull.Count && i < barIndex.Length; i++)
-            if (_menu.Items[barIndex[i]] is ToolStripMenuItem bar)
-                MirrorItems(bar, _ctxFull[i]);
-    }
-
-    private void MirrorItems(ToolStripMenuItem src, ToolStripMenuItem dst)
-    {
-        ToolStripItemCollection a = src.DropDownItems, b = dst.DropDownItems;
-        int n = Math.Min(a.Count, b.Count);
-        for (int i = 0; i < n; i++)
-        {
-            if (a[i] is not ToolStripMenuItem x || b[i] is not ToolStripMenuItem y) continue;
-            bool same = (!string.IsNullOrEmpty(x.Name) && x.Name == y.Name) || x.Text == y.Text;
-            if (!same) continue;
-            if (y.Checked != x.Checked) y.Checked = x.Checked;
-            if (y.Enabled != x.Enabled) y.Enabled = x.Enabled;
-            if (y.Text != x.Text) y.Text = x.Text;
-            if (y.ShortcutKeyDisplayString != x.ShortcutKeyDisplayString) y.ShortcutKeyDisplayString = x.ShortcutKeyDisplayString;
-            if (y.ToolTipText != x.ToolTipText) y.ToolTipText = x.ToolTipText;
-            if (x.Name == "checkupdate" && y.Font != x.Font) y.Font = x.Font;
-            if (x.HasDropDownItems && y.HasDropDownItems) MirrorItems(x, y);
-        }
     }
 
     // ---- Keyboard --------------------------------------------------------
@@ -5153,6 +4506,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         switch (keyData)
         {
             case Keys.F11:
+            case Keys.Alt | Keys.Enter:     // the usual video-player key for it
                 if (!isRepeat) ToggleFullscreen();
                 return true;
             case Keys.F10:
@@ -5173,7 +4527,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             case Keys.Control | Keys.T:
                 if (isRepeat) return true;
                 ToggleAlwaysOnTop();
-                ShowOsd(_alwaysOnTop ? L.T("常に前面: オン") : L.T("常に前面: オフ"));
+                ShowOsd(_alwaysOnTop ? L.T("常に手前に表示: オン") : L.T("常に手前に表示: オフ"));
                 return true;
             case Keys.Control | Keys.B:
                 if (!isRepeat) ToggleBorderless();
@@ -5182,11 +4536,21 @@ public sealed partial class MainForm : Form, IMessageFilter
             case Keys.Control | Keys.NumPad0:
                 if (!isRepeat) ResetZoom();
                 return true;
+            case Keys.Control | Keys.Oemplus:
+            case Keys.Control | Keys.Add:
+                ZoomStep(+1);
+                return true;
+            case Keys.Control | Keys.OemMinus:
+            case Keys.Control | Keys.Subtract:
+                ZoomStep(-1);
+                return true;
             case Keys.Control | Keys.Shift | Keys.I:
                 if (!isRepeat) CycleInfoMode();
                 return true;
             case Keys.Q:
-                if (!isRepeat) BeginCompare();
+                if (isRepeat) return true;
+                _compareTimer.Stop();   // held now: the key-up ends it, not the menu's two seconds
+                BeginCompare();
                 return true;
             case Keys.M:
                 if (!isRepeat) ToggleMute();
@@ -5412,7 +4776,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private void UpdateInfo()
     {
         if (_info.Mode == InfoMode.Fps) { UpdateFpsInfo(); return; }
-        string renderer = _video.SupportsScalingQuality ? "Direct3D" : L.T("標準（Media Foundation）");
+        string renderer = _video.SupportsScalingQuality ? "Direct3D" : L.T("互換（Media Foundation）");
         string input = _video.CurrentMode is { } m ? ModeLabel(m) : "—";
         string fps = _video.Stats is { } st
             ? L.F("入力 {0:0} / 表示 {1:0} / 欠落 {2}", st.InputFps, st.PresentedFps, st.DroppedFrames) + GameFpsNote()
@@ -5459,9 +4823,10 @@ public sealed partial class MainForm : Form, IMessageFilter
             L.T("音ズレ補正") + ": " + AvInfoText(),
             L.T("補間") + ": " + (InterpMetric(out _) ?? InterpolationInfoText()),
             L.T("動き検出") + ": " + (_settings.Interpolation && _video.SupportsInterpolation ? (D3DRenderer.MotionLabel.StartsWith("NVIDIA", StringComparison.Ordinal) ? L.T("NVIDIA OFA（専用回路）") : L.T("ブロックマッチング（GPU）")) : "—"),
-            L.T("元の細かさ") + ": " + NativeResInfoText(),
+            L.T("元の解像度") + ": " + NativeResInfoText(),
             L.T("表示方法") + ": " + (string.IsNullOrEmpty(_video.PresentMode) ? "—" : _video.PresentMode),
-        }) + (_video.GuardStatus is { } guardNote ? "\n" + guardNote : string.Empty));
+        }) + (_video.GuardStatus is { } guardNote ? "\n" + guardNote : string.Empty)
+           + string.Concat(EngineNotes().Select(n => "\n" + n)));
         PositionInfo();
     }
 

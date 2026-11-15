@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -6,16 +7,19 @@ using System.Windows.Forms;
 namespace YuCap;
 
 /// <summary>
-/// 「なめらか ⇔ 低遅延」: the two ways of showing the picture that people actually choose between, as one switch.
-/// なめらか = frame interpolation on and low latency off (every refresh shows a new picture, about one source frame later);
-/// 低遅延 = low latency on (each frame is shown at once; interpolation then has nothing to fill and idles).
-/// Switching restarts the engine on a fresh window (the swap chain kind is fixed at start) through the same path as the
-/// 低遅延モード item, so it never blocks the UI thread and keeps fullscreen. Going back to なめらか turns interpolation on.
+/// 映像の出し方: 標準 / なめらか / 低遅延, one choose-one menu over the two settings underneath (kept as they are on disk and in
+/// profiles, so nothing saved earlier changes meaning):
+/// 標準 = interpolation off, low latency off; なめらか = interpolation on, low latency off (every refresh shows a new picture,
+/// about one source frame later); 低遅延 = low latency on (each frame is shown at once; the interpolation setting is kept but
+/// has nothing to fill and idles).
+/// A change of low latency restarts the engine on a fresh window (the swap chain kind is fixed at start), so it never blocks
+/// the UI thread and keeps fullscreen; a change of interpolation alone does not restart anything.
+/// The hotkey (Ctrl+Alt+L by default) switches なめらか ⇔ 低遅延; from 標準 it goes to 低遅延, and the menu reaches all three.
 /// </summary>
 public sealed partial class MainForm
 {
-    private ToolStripMenuItem _miStyle = null!;
-    private ToolStripMenuItem _cmiStyle = null!;
+    private readonly List<ToolStripMenuItem> _styleRoots = new();
+    private readonly List<ToolStripMenuItem> _styleItems = new();
 
     private enum PlayStyle { Smooth, LowLatency, Standard }
 
@@ -33,60 +37,73 @@ public sealed partial class MainForm
 
     private void UpdateStyleItems()
     {
-        if (_miStyle == null || _cmiStyle == null) return;
         bool can = CanSwitchStyle;
-        string text = L.T("なめらか ⇔ 低遅延") + (can ? L.Par(L.F("今: {0}", StyleName(CurrentStyle))) : string.Empty);
-        string tip = can
-            ? L.T("なめらか（フレーム補間オン）と低遅延（低遅延モードオン）を切り替えます。切り替えると映像が一度つながり直ります。")
-            : L.T("Direct3D 描画のときに使えます（映像 → 描画方式）");
+        // What is shown, not what is stored: on the compatibility renderer neither setting has an effect.
+        PlayStyle shown = can ? CurrentStyle : PlayStyle.Standard;
         string key = HotkeyMenuText((Keys)_settings.HotkeyStyle);
-        foreach (ToolStripMenuItem it in new[] { _miStyle, _cmiStyle })
+        foreach (ToolStripMenuItem root in _styleRoots)
         {
-            it.Text = text;
-            it.Enabled = can;
-            it.ToolTipText = tip;
-            it.ShortcutKeyDisplayString = key;
+            root.Enabled = can;
+            root.ToolTipText = can ? L.T("ホットキーでは なめらか ⇔ 低遅延 を切り替えます。") : L.T(D3dOnlyTip);
+            root.ShortcutKeyDisplayString = key;
         }
+        foreach (ToolStripMenuItem it in _styleItems)
+            it.Checked = (PlayStyle)it.Tag! == shown;
     }
 
-    private async void ToggleStyle()
+    /// <summary>The hotkey: なめらか ⇔ 低遅延 (標準 goes to 低遅延).</summary>
+    private void ToggleStyle() => ChoosePlayStyle(CurrentStyle == PlayStyle.LowLatency ? PlayStyle.Smooth : PlayStyle.LowLatency);
+
+    /// <summary>映像の出し方 from the menu or the hotkey. Serialised with the other engine switches (renderer, profile).</summary>
+    private async void ChoosePlayStyle(PlayStyle target)
     {
-        if (_engineSwapping || _testRunning || _startingUp) return;
+        if (_testRunning || _startingUp) return;
+        if (_engineSwapping || _engineSwitchBusy) { Log.Info("ChoosePlayStyle: another switch is running"); UpdateChecks(); return; }
+        _engineSwitchBusy = true;
         _devOpBusy++;   // may show a dialog that pumps messages: no automatic recovery meanwhile
-        try { await SwitchStyleAsync(); }
-        catch (Exception ex) { Log.Info("ToggleStyle: " + ex); }
-        finally { _devOpBusy--; }
+        try { await SwitchStyleAsync(target); }
+        catch (Exception ex) { Log.Info("ChoosePlayStyle: " + ex); }
+        finally { _devOpBusy--; _engineSwitchBusy = false; }
     }
 
-    /// <summary>Switch to the other style. True when it is done (the OSD has been shown); false when it was not possible
+    /// <summary>Switch to <paramref name="target"/>. True when it is done (the OSD has been shown); false when it was not possible
     /// (nothing changed, or the change was undone).</summary>
-    private async Task<bool> SwitchStyleAsync()
+    private async Task<bool> SwitchStyleAsync(PlayStyle target)
     {
         if (!CanSwitchStyle)
         {
-            ShowOsd(L.T("なめらか ⇔ 低遅延は Direct3D 描画のときに使えます（映像 → 描画方式）"), OsdLongMilliseconds);
+            ShowOsd(L.T("映像の出し方は Direct3D 描画のときに選べます（映像 → 描画方式）"), OsdLongMilliseconds);
             return false;
         }
+        if (target == CurrentStyle) { ShowOsd(L.F("映像の出し方: {0}", StyleName(target))); return true; }
         NoteUserChange();
-        bool toLow = !_settings.LowLatency;
+        bool toLow = target == PlayStyle.LowLatency;
         bool interpBefore = _settings.Interpolation;
         long t0 = Stopwatch.GetTimestamp();
-        if (!toLow) _settings.Interpolation = true;   // なめらか: interpolation on, low latency off
+        // 低遅延 keeps the interpolation setting as it is; the other two set it.
+        if (!toLow) _settings.Interpolation = target == PlayStyle.Smooth;
 
-        if (!await SetLowLatencyAsync(toLow))
+        if (toLow != _settings.LowLatency)
         {
-            _settings.Interpolation = interpBefore;
-            ApplyRenderOptions();
-            UpdateChecks();
-            return false;
+            if (!await SetLowLatencyAsync(toLow))
+            {
+                _settings.Interpolation = interpBefore;
+                ApplyRenderOptions();
+                UpdateChecks();
+                return false;
+            }
+        }
+        else
+        {
+            ApplyRenderOptions();   // interpolation only: no restart
         }
         MarkSettingsDirty();
         UpdateChecks();
-        Log.Info($"style: {(toLow ? "low latency" : "smooth")} in {Stopwatch.GetElapsedTime(t0).TotalMilliseconds:0} ms");
+        Log.Info($"style: {target} in {Stopwatch.GetElapsedTime(t0).TotalMilliseconds:0} ms");
 
-        string text = StyleOsdText();
+        string text = target == PlayStyle.Standard ? L.F("映像の出し方: {0}", StyleName(target)) : StyleOsdText();
         ShowOsd(text);
-        _ = StyleOsdFollowUpAsync(text);
+        if (target != PlayStyle.Standard) _ = StyleOsdFollowUpAsync(text);
         return true;
     }
 
@@ -106,6 +123,10 @@ public sealed partial class MainForm
             return late > 0 ? L.F("なめらか（補間 {0:0}→{1:0} fps・遅れ 約 {2} ms）", src, shown, late)
                             : L.F("なめらか（補間 {0:0}→{1:0} fps）", src, shown);
         }
+        // Say why it idles when the reason is one the user can act on (or should know about).
+        if (st?.Idle == InterpolationIdle.RefreshTooLow)
+            return L.F("なめらか（画面 {0:0}Hz が映像 {1:0}fps より十分高くないため、補間は待機中）", st.RefreshHz, st.SourceFps);
+        if (st?.Idle == InterpolationIdle.Unavailable) return L.T("なめらか（この環境では補間を使えません）");
         return late > 0 ? L.F("なめらか（補間は待機中・遅れ 約 {0} ms）", late) : L.T("なめらか（補間は待機中）");
     }
 
@@ -124,7 +145,7 @@ public sealed partial class MainForm
     }
 
     // =====================================================================
-    //  The low-latency restart shared by the 低遅延モード item and the style switch
+    //  The low-latency restart behind 映像の出し方
     // =====================================================================
 
     /// <summary>Set low latency to <paramref name="on"/> (restarting the engine when a device is open). On failure the old
@@ -146,8 +167,8 @@ public sealed partial class MainForm
                 LayoutCanvas();
                 UpdateChecks();
                 UpdateStatus();
-                MessageBox.Show(this, reason, "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                ShowOsd(L.T("低遅延モードを切り替えられなかったため、元に戻しました"), OsdLongMilliseconds);
+                Ui.Message(this, reason, MsgKind.Warning);
+                ShowOsd(L.T("映像の出し方を切り替えられなかったため、元に戻しました"), OsdLongMilliseconds);
                 return false;
             }
             _videoError = null;

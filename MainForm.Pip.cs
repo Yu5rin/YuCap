@@ -231,7 +231,7 @@ public sealed partial class MainForm
         {
             if (!EnsurePipHotkeyForClickThrough())
             {
-                ShowOsd(L.T("クリックスルーには PiP切替 のホットキーが必要です。\nオプション → ホットキー設定 で割り当ててください。"), OsdLongMilliseconds);
+                ShowOsd(L.T("クリックを通すには PiP の切り替えのホットキーが必要です。\nオプション → ホットキーの設定 で割り当ててください。"), OsdLongMilliseconds);
                 return;
             }
             _settings.PipClickThrough = true;
@@ -436,10 +436,13 @@ public sealed partial class MainForm
             Keys.Control | Keys.S => L.T("スナップショットを保存"),
             Keys.Control | Keys.C => L.T("スナップショットをコピー"),
             Keys.Control | Keys.G => L.T("スナップショット一覧"),
-            Keys.Control | Keys.T => L.T("常に前面に表示"),
-            Keys.Control | Keys.B => L.T("ウィンドウ枠を非表示"),
+            Keys.Control | Keys.T => L.T("常に手前に表示"),
+            Keys.Control | Keys.B => L.T("ウィンドウ枠を隠す"),
             Keys.Control | Keys.D0 or Keys.Control | Keys.NumPad0 => L.T("ズームをリセット"),
-            Keys.Control | Keys.Shift | Keys.I => L.T("情報表示の切替（オフ → FPS だけ → 詳しく）"),
+            Keys.Control | Keys.Oemplus or Keys.Control | Keys.Add => L.T("ズームイン"),
+            Keys.Control | Keys.OemMinus or Keys.Control | Keys.Subtract => L.T("ズームアウト"),
+            Keys.Control | Keys.Shift | Keys.I => L.T("情報表示の切り替え（オフ → FPS だけ → 詳しく）"),
+            Keys.Alt | Keys.Enter => L.T("全画面表示の切り替え"),
             _ => null,
         };
     }
@@ -456,7 +459,8 @@ public sealed partial class MainForm
 
     private void ShowHotkeySettings()
     {
-        var dlg = Ui.NewDialog(L.T("ホットキー設定"), 440, 358);
+        var dlg = Ui.NewDialog(L.T("ホットキーの設定"), 540);
+        var grid = Ui.Grid();
 
         Keys snapCombo = (Keys)_settings.HotkeySnapshot;
         Keys muteCombo = (Keys)_settings.HotkeyMute;
@@ -465,23 +469,20 @@ public sealed partial class MainForm
         Keys volDownCombo = (Keys)_settings.HotkeyVolumeDown;
         Keys styleCombo = (Keys)_settings.HotkeyStyle;
 
-        const int tbX = 165, tbWidth = 175;
-        int clearX = tbX + tbWidth + Ui.Gap;
         string hintText = L.T("欄を選んでキーの組み合わせを押してください。［解除］または Backspace で割り当てを外せます。");
         Label? hint = null;
 
-        (TextBox tb, Button clear) MakeRow(string label, int y, Keys initial, Action<Keys> set)
+        (TextBox tb, Button clear) MakeRow(string label, Keys initial, Action<Keys> set)
         {
-            var lbl = Ui.Label(L.T(label), Ui.Pad, y + 4);
+            var lbl = Ui.Caption(L.T(label));
             var tb = new TextBox
             {
                 Text = FormatHotkey(initial),
                 ReadOnly = true,
-                Location = new Point(tbX, y),
-                Width = tbWidth,
                 TabStop = true,
             };
-            var clearBtn = Ui.Button(L.T("解除"), clearX, y - 1, 64, true);
+            tb.GotFocus += (_, _) => tb.BeginInvoke(new Action(() => tb.Select(tb.TextLength, 0)));
+            var clearBtn = Ui.Btn(L.T("解除"));
             void Clear()
             {
                 set(Keys.None);
@@ -511,27 +512,23 @@ public sealed partial class MainForm
                 tb.Text = FormatHotkey(e.KeyData);
             };
             clearBtn.Click += (_, _) => Clear();
-            dlg.Controls.Add(lbl);
-            dlg.Controls.Add(tb);
-            dlg.Controls.Add(clearBtn);
+            grid.AddRow(lbl, tb, clearBtn);
             return (tb, clearBtn);
         }
 
-        var (tbSnap, _) = MakeRow("スナップショット:", Ui.Pad, snapCombo, k => snapCombo = k);
-        var (tbMute, _) = MakeRow("ミュート:", Ui.Pad + 36, muteCombo, k => muteCombo = k);
-        var (tbPip, _) = MakeRow("PiP切替:", Ui.Pad + 72, pipCombo, k => pipCombo = k);
+        var (tbSnap, _) = MakeRow("スナップショット:", snapCombo, k => snapCombo = k);
+        var (tbMute, _) = MakeRow("ミュート:", muteCombo, k => muteCombo = k);
+        var (tbPip, _) = MakeRow("PiP の切り替え:", pipCombo, k => pipCombo = k);
 
-        var (tbVolUp, _) = MakeRow("音量を上げる:", Ui.Pad + 108, volUpCombo, k => volUpCombo = k);
-        var (tbVolDown, _) = MakeRow("音量を下げる:", Ui.Pad + 144, volDownCombo, k => volDownCombo = k);
+        var (tbVolUp, _) = MakeRow("音量を上げる:", volUpCombo, k => volUpCombo = k);
+        var (tbVolDown, _) = MakeRow("音量を下げる:", volDownCombo, k => volDownCombo = k);
 
-        var (tbStyle, _) = MakeRow("なめらか ⇔ 低遅延:", Ui.Pad + 180, styleCombo, k => styleCombo = k);
+        var (tbStyle, _) = MakeRow("映像の出し方（なめらか ⇔ 低遅延）:", styleCombo, k => styleCombo = k);
 
-        int hintY = Ui.Pad + 180 + 36;
-        hint = Ui.Hint(hintText, Ui.Pad, hintY, 440 - 2 * Ui.Pad);
-        dlg.Controls.Add(hint);   // was built but never added, so the instructions were never shown
+        hint = Ui.Hint(hintText);
+        grid.AddSpan(hint, underField: false, before: Ui.Pad);
 
-        Ui.AddOkCancel(dlg);
-        var reset = Ui.Button(L.T("既定に戻す"), Ui.Pad, dlg.ClientSize.Height - Ui.Pad - Ui.ButtonHeight, 100);
+        var reset = Ui.Btn(L.T("既定に戻す"));
         reset.Click += (_, _) =>
         {
             var defaults = new AppSettings();   // the one place the defaults are defined
@@ -549,7 +546,8 @@ public sealed partial class MainForm
             tbMute.Text = FormatHotkey(muteCombo);
             tbPip.Text = FormatHotkey(pipCombo);
         };
-        dlg.Controls.Add(reset);
+        Ui.FrameOkCancel(dlg, grid, left: new Button[] { reset });
+        dlg.InitialFocus = tbSnap;
 
         // Loop instead of a single ShowDialog: a duplicate/reserved assignment
         // must send the user back into the same dialog with their typed values
@@ -579,8 +577,7 @@ public sealed partial class MainForm
                     if ((all[i] & Keys.KeyCode) != Keys.None && all[i] == all[j]) duplicate = true;
             if (duplicate)
             {
-                MessageBox.Show(this, L.T("同じキーが複数の操作に割り当てられています。"), "YuCap",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, L.T("同じキーが複数の操作に割り当てられています。"), MsgKind.Warning);
                 continue;
             }
 
@@ -588,8 +585,8 @@ public sealed partial class MainForm
             foreach (Keys c in all) if (reserved == Keys.None && IsReservedCombo(c)) reserved = c;
             if ((reserved & Keys.KeyCode) != Keys.None)
             {
-                MessageBox.Show(this, L.F("{0} は Windows の基本操作と重なるため使えません。", FormatHotkey(reserved)),
-                    "YuCap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Ui.Message(this, L.F("{0} は Windows の基本操作と重なるため使えません。", FormatHotkey(reserved)),
+                    MsgKind.Warning);
                 continue;
             }
 
@@ -603,9 +600,9 @@ public sealed partial class MainForm
                 else if (IsCommonAppCombo(c))
                     clashes.Add(L.F("{0}: ほかのアプリでもよく使うキーです。どこからでも効くようにすると、そのアプリでは使えなくなります", FormatHotkey(c)));
             }
-            if (clashes.Count > 0 && MessageBox.Show(this,
+            if (clashes.Count > 0 && Ui.Message(this,
                     L.F("次のキーは、ほかの操作と重なります。\n\n{0}\n\nこのまま割り当てますか？", string.Join("\n", clashes)),
-                    "YuCap", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                    MsgKind.Warning, MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
                 continue;
             break;
         }

@@ -8,7 +8,7 @@ using System.Windows.Forms;
 namespace YuCap;
 
 /// <summary>
-/// 自分専用モデル: the menu entries (オプション → 自分専用モデル, 拡大の画質 → 自分専用モデル（name）), the picture collector
+/// 自分専用モデル: the menu entries (映像 → 自分専用モデル, 拡大の画質 → 自分専用モデル（name）), the picture collector
 /// (<see cref="TrainCapture"/>) and its status-bar count. Training itself is tools/train_upscaler.py (README: 自分専用モデルを作る).
 /// </summary>
 public sealed partial class MainForm
@@ -21,7 +21,7 @@ public sealed partial class MainForm
 
     private const string UserModelTagPrefix = "user:";
 
-    /// <summary>オプション → 自分専用モデル（右クリックのメニューにも同じものが入る）.</summary>
+    /// <summary>映像 → 自分専用モデル (the right-click menu's 映像 has the same).</summary>
     private ToolStripMenuItem BuildTrainSubmenu()
     {
         var m = new ToolStripMenuItem(L.T("自分専用モデル"));
@@ -54,14 +54,16 @@ public sealed partial class MainForm
         m.DropDownItems.Add(pause);
         m.DropDownItems.Add(new ToolStripSeparator());
 
-        var choose = new ToolStripMenuItem(L.T("自分専用モデルを選ぶ"));
+        var choose = Refilled(new ToolStripMenuItem(L.T("使うモデルを選ぶ")));
         choose.DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
         choose.DropDownOpening += (_, _) => FillTrainChoose(choose);
         _trainChooseRoots.Add(choose);
         m.DropDownItems.Add(choose);
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("自分専用モデルのフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.ModelsDir, null)));
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("学習用の絵のフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.DataDirFor(_settings.ActiveProfile), null)));
-        m.DropDownItems.Add(new ToolStripMenuItem(L.T("学習のフォルダーを開く"), null, (_, _) => OpenFolder(UserModels.Root, null)));
+        // The collected pictures' folder is the 集めた絵 item above.
+        var folders = new ToolStripMenuItem(L.T("フォルダーを開く"));
+        folders.DropDownItems.Add(new ToolStripMenuItem(L.T("できたモデル"), null, (_, _) => OpenFolder(UserModels.ModelsDir, null)));
+        folders.DropDownItems.Add(new ToolStripMenuItem(L.T("学習の作業場所"), null, (_, _) => OpenFolder(UserModels.Root, null)));
+        m.DropDownItems.Add(folders);
         m.DropDownOpening += (_, _) => { UpdateTrainChecks(); RefreshTrainCount(); };
         return m;
     }
@@ -93,11 +95,13 @@ public sealed partial class MainForm
     {
         root.DropDownItems.Clear();
         bool crisp = _settings.ScalingQuality == "anime4k";
-        root.DropDownItems.Add(new ToolStripMenuItem(L.T("内蔵のくっきり"), null, (_, _) => { _settings.A4kModel = ""; SetScalingQuality("anime4k"); })
+        string tip = _video.SupportsScalingQuality ? string.Empty : L.T(D3dOnlyTip);
+        root.DropDownItems.Add(Radio(new ToolStripMenuItem(L.T("内蔵のくっきり"), null, (_, _) => { _settings.A4kModel = ""; SetScalingQuality("anime4k"); })
         {
             Checked = crisp && !UserModelActive,
             Enabled = _video.SupportsScalingQuality,
-        });
+            ToolTipText = tip,
+        }));
         List<string> names = UserModels.List();
         if (names.Count == 0)
         {
@@ -109,12 +113,14 @@ public sealed partial class MainForm
         {
             string n = name;
             char arch = UserModels.ArchOf(UserModels.PathOf(n));
-            root.DropDownItems.Add(new ToolStripMenuItem($"{n}（{arch}）", null, (_, _) => SetUserModel(n))
+            root.DropDownItems.Add(Radio(new ToolStripMenuItem(n + L.Par(arch.ToString()), null, (_, _) => SetUserModel(n))
             {
                 Checked = crisp && string.Equals(_settings.A4kModel, n, StringComparison.OrdinalIgnoreCase),
                 Enabled = _video.SupportsScalingQuality,
-                ToolTipText = L.F("{0} 形のモデル（{1}）", arch, File.GetLastWriteTime(UserModels.PathOf(n)).ToString("yyyy-MM-dd HH:mm")),
-            });
+                ToolTipText = _video.SupportsScalingQuality
+                    ? L.F("{0} 形のモデル（{1}）", arch, File.GetLastWriteTime(UserModels.PathOf(n)).ToString("yyyy-MM-dd HH:mm"))
+                    : tip,
+            }));
         }
     }
 
@@ -137,7 +143,8 @@ public sealed partial class MainForm
         foreach (var i in _trainSetupItems)
         {
             i.Enabled = !ready && !_trainSetupRunning;
-            i.ToolTipText = ready ? L.T("学習の準備はできています。")
+            i.ToolTipText = _trainSetupRunning ? L.T("学習の準備を実行中です（黒い窓を見てください）")
+                : ready ? L.T("学習の準備はできています。")
                 : TrainEnv.Partial ? L.T("学習の準備が最後まで終わっていない可能性があります。押すと確かめて、必要ならやり直します。")
                 : L.F("PyTorch などを {0} に入れます。押すと、入れるものを確かめてから始めます。", Path.Combine(UserModels.Root, "venv"));
         }
@@ -238,13 +245,13 @@ public sealed partial class MainForm
             foreach (string name in UserModels.List().Take(5))
             {
                 string n = name;
-                var item = new ToolStripMenuItem(L.F("自分専用モデル（{0}）", n), null, (_, _) => SetUserModel(n))
+                var item = Radio(new ToolStripMenuItem(L.F("自分専用モデル（{0}）", n), null, (_, _) => SetUserModel(n))
                 {
                     Tag = UserModelTagPrefix + n,
                     ToolTipText = L.T("自分のゲーム画面で学習させた拡大モデルを使います。くっきりと同じ仕組みで、GPU の使い方も同じです。"),
                     Checked = _settings.ScalingQuality == "anime4k" && string.Equals(_settings.A4kModel, n, StringComparison.OrdinalIgnoreCase),
                     Enabled = _video.SupportsScalingQuality,
-                };
+                });
                 m.DropDownItems.Insert(at++, item);
             }
         }
