@@ -615,6 +615,7 @@ public sealed partial class MainForm
         _ctx.Items.Add(new ToolStripSeparator());
         _ctx.Items.Add(BuildStyleSubmenu());
         _ctx.Items.Add(BuildQualitySubmenu());
+        _ctx.Items.Add(BuildTrainSubmenu());
         _cmiProfiles = Refilled(new ToolStripMenuItem(L.T("プロファイル")) { Name = IdProfiles });
         _cmiProfiles.DropDownOpening += (_, _) => UpdateProfileMenu();
         UpdateProfileMenu();

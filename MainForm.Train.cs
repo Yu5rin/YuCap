@@ -21,10 +21,11 @@ public sealed partial class MainForm
 
     private const string UserModelTagPrefix = "user:";
 
-    /// <summary>映像 → 自分専用モデル (the right-click menu's 映像 has the same).</summary>
+    /// <summary>映像 → 自分専用モデル (the right-click menu has the same twice: at its top and under its 映像). The explicit id
+    /// pairs every copy, and so every item under it, with the menu bar's.</summary>
     private ToolStripMenuItem BuildTrainSubmenu()
     {
-        var m = new ToolStripMenuItem(L.T("自分専用モデル"));
+        var m = new ToolStripMenuItem(L.T("自分専用モデル")) { Name = "train" };
         var collect = new ToolStripMenuItem(L.T("学習用の絵を集める"), null, (_, _) => ToggleTrainCapture())
         {
             ToolTipText = L.T("遊んでいる間、動いているゲームの絵を数秒おきにそのままの大きさで保存します（オフが標準）。保存した絵は、自分専用の拡大モデルを作るための学習に使います。作り方は README の「自分専用モデルを作る」。"),

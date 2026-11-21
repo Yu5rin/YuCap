@@ -2544,6 +2544,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         ApplyFontTree(_ctx.Items, _ctx.DeviceDpi);
         _ctx.Opened -= OnCtxFontOpened;
         _ctx.Opened += OnCtxFontOpened;
+        StyleMenuOverflow();
 
         _checkUpdateNormalFont = MenuFont(_menu.DeviceDpi);
         _checkUpdateBoldFont = MenuFont(_menu.DeviceDpi, true);
@@ -2551,6 +2552,25 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     private void OnCtxFontOpened(object? sender, EventArgs e) => FixDropDownFont(_ctx);
+
+    /// <summary>The menu bar's overflow drop-down (the » button of a narrow window) gets the bar's colours and font.</summary>
+    /// <remarks>It already draws with the bar's renderer, but its colours are its own: the overflowed menus keep the bar as
+    /// their Owner while the drop-down becomes their Parent, so their (inherited) BackColor is the drop-down's default
+    /// SystemColors.Control - and the professional renderer fills a drop-down item whose BackColor differs from its Owner's
+    /// with that colour, which painted every menu not pointed at light under the light text. With the bar's BackColor nothing
+    /// is filled and the renderer draws the drop-down's own dark background, hover and border. The drop-down lives as long as
+    /// the bar, so this is run again (harmlessly) on every menu rebuild.</remarks>
+    private void StyleMenuOverflow()
+    {
+        ToolStripDropDown overflow = _menu.OverflowButton.DropDown;
+        overflow.BackColor = Ui.Colors.Back;   // = _menu.BackColor (set later in the constructor)
+        overflow.ForeColor = Ui.Colors.Text;
+        overflow.Font = MenuFont(_menu.DeviceDpi);
+        overflow.Opened -= OnOverflowFontOpened;
+        overflow.Opened += OnOverflowFontOpened;
+    }
+
+    private void OnOverflowFontOpened(object? sender, EventArgs e) => FixDropDownFont(_menu.OverflowButton.DropDown);
 
     /// <summary>Items of one strip/drop-down get the font for <paramref name="dpi"/>; the update item keeps its bold when an update is pending.</summary>
     private void ApplyFontTree(ToolStripItemCollection items, int dpi)
