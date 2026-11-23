@@ -224,27 +224,35 @@ public sealed class VideoEngine : IVideoEngine
         attrs.Set(CaptureDeviceAttributeKeys.SourceType, CaptureDeviceAttributeKeys.SourceTypeVidcap);
         using IMFActivateCollection collection = MediaFactory.MFEnumDeviceSources(attrs);
 
-        IMFActivate? match = null;
+        // Prefer the exact symbolic link; use the friendly name only when no link matches.
+        // The collection's Dispose releases every item it holds (and zeroes their
+        // NativePointer), so the items are not disposed here, and the chosen one gets
+        // its own reference before the collection goes away.
+        IMFActivate? byLink = null, byName = null;
         foreach (IMFActivate act in collection)
         {
             string link = SafeString(act, CaptureDeviceAttributeKeys.SourceTypeVidcapSymbolicLink);
-            if (match == null && (link == info.Id ||
-                SafeString(act, CaptureDeviceAttributeKeys.FriendlyName) == info.Name))
-                match = act;      // keep this one
-            else
-                act.Dispose();
+            if (byLink == null && string.Equals(link, info.Id, StringComparison.OrdinalIgnoreCase))
+                byLink = act;
+            else if (byName == null && SafeString(act, CaptureDeviceAttributeKeys.FriendlyName) == info.Name)
+                byName = act;
         }
+        IMFActivate? hit = byLink ?? byName;
         // Own message for the user, not a framework exception: Errors.Describe only
         // passes UserFacingException's text through verbatim (see Errors.cs) — a
         // bare InvalidOperationException would instead show generic English text.
-        return match ?? throw new UserFacingException(L.T("映像デバイスが見つかりません。"));
+        if (hit == null || hit.NativePointer == IntPtr.Zero)
+            throw new UserFacingException(L.T("映像デバイスが見つかりません。"));
+        Marshal.AddRef(hit.NativePointer);
+        return new IMFActivate(hit.NativePointer);
     }
 
     // ---- Start / Stop ----------------------------------------------------
 
     public void Start(VideoDeviceInfo info, CaptureMode? mode = null)
     {
-        Log.Info($"VideoEngine.Start: {info.Name} mode={(mode == null ? "auto" : $"{mode.Width}x{mode.Height}@{mode.Fps}")}");
+        string idTail = info.Id.Length > 40 ? info.Id[^40..] : info.Id;
+        Log.Info($"VideoEngine.Start: {info.Name} [{idTail}] mode={(mode == null ? "auto" : $"{mode.Width}x{mode.Height}@{mode.Fps}")}");
         Stop();
         try { StartCore(info, mode); }
         catch
@@ -262,6 +270,9 @@ public sealed class VideoEngine : IVideoEngine
             throw new UserFacingException(L.T("表示ウィンドウが設定されていません。"));
 
         using IMFActivate activate = FindActivate(info);
+        // A NULL source would make the capture engine silently open the default device.
+        if (activate.NativePointer == IntPtr.Zero)
+            throw new UserFacingException(L.T("映像デバイスが見つかりません。"));
 
         // Create the capture engine via its class factory.
         Guid clsid = Mf.ClsidCaptureEngine, iidFactory = Mf.IidClassFactory;

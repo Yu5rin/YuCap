@@ -738,6 +738,7 @@ internal static partial class Program
         {
             lines.Add($"=== {dev.Name} ===");
             lines.Add($"    {dev.Id}");
+            int mfMaxW = 0, mfMaxFps = 0;
             using (var probe = new VideoEngine())
             {
                 try
@@ -748,7 +749,11 @@ internal static partial class Program
                     probe.Attach(host.Handle);
                     probe.Start(dev);
                     foreach (CaptureMode m in probe.GetModes())
+                    {
                         lines.Add($"    {m.Width,5}x{m.Height,-5} {m.Compression,-8} {m.Fps,3}fps");
+                        mfMaxW = Math.Max(mfMaxW, m.Width);
+                        mfMaxFps = Math.Max(mfMaxFps, m.Fps);
+                    }
                     lines.Add($"    current: {probe.CurrentMode}");
                 }
                 catch (Exception ex)
@@ -762,7 +767,20 @@ internal static partial class Program
             lines.Add("  native media types (source reader):");
             try
             {
-                foreach (string l in CaptureFormats.ProbeDevice(dev)) lines.Add("    " + l);
+                int natMaxW = 0, natMaxFps = 0;
+                foreach (string l in CaptureFormats.ProbeDevice(dev))
+                {
+                    lines.Add("    " + l);
+                    var mt = System.Text.RegularExpressions.Regex.Match(l, @"(\d+)x\d+@(\d+)");
+                    if (mt.Success)
+                    {
+                        natMaxW = Math.Max(natMaxW, int.Parse(mt.Groups[1].Value));
+                        natMaxFps = Math.Max(natMaxFps, int.Parse(mt.Groups[2].Value));
+                    }
+                }
+                // Regression check: with several devices, the capture engine once silently opened the default one.
+                if (devices.Count >= 2 && mfMaxW > 0 && (mfMaxW != natMaxW || mfMaxFps != natMaxFps))
+                    lines.Add($"  MISMATCH: opened the wrong device? (capture engine max {mfMaxW}px@{mfMaxFps}, native max {natMaxW}px@{natMaxFps})");
             }
             catch (Exception ex)
             {

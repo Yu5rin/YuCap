@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Linq;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -1892,10 +1893,10 @@ public sealed class D3DVideoEngine : IVideoEngine
             catch (Exception ex)
             {
                 Log.Info($"D3D: opening by symbolic link failed (0x{ex.HResult:X8}); looking the device up by name");
-                string? link = null;
-                foreach (VideoDeviceInfo d in VideoEngine.EnumerateDevices())
-                    if (d.Name == _info.Name) { link = d.Id; break; }
-                if (link == null) throw new UserFacingException(L.T("映像デバイスが見つかりません。"));
+                // Only a unique name is trusted: with several same-named devices this could open the wrong one.
+                var sameName = VideoEngine.EnumerateDevices().Where(d => d.Name == _info.Name).ToList();
+                if (sameName.Count != 1) ExceptionDispatchInfo.Capture(ex).Throw();
+                string link = sameName[0].Id;
                 devAttrs.Set(CaptureDeviceAttributeKeys.SourceTypeVidcapSymbolicLink, link);
                 source = MediaFactory.MFCreateDeviceSource(devAttrs);
             }

@@ -1332,7 +1332,8 @@ public sealed partial class MainForm : Form, IMessageFilter
                 NoteVideoStopped();
                 StopVideo();   // dead already: the branch below reopens it
             }
-            if (!_video.IsRunning)
+            // A start in flight or pending already decides the device (it may be a switch to another one): do not queue the old device over it.
+            if (!_video.IsRunning && _vsRunning == null && _vsPending == null)
             {
                 var pick = (present ? _currentVideoInfo : null)
                     ?? ChooseVideoDevice(devices, _settings.VideoDeviceId, _settings.DeviceKeyword);
@@ -3923,7 +3924,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         try
         {
             await StartVideoAsync(info, _savedMode);
-            _currentVideoInfo = info;
+            if (_currentVideoInfo?.Id != info.Id)
+            {
+                // The start that completed was another device's (a later request won): not this switch's success.
+                Log.Info($"SwitchVideoDevice: {info.Name} was superseded by {_currentVideoInfo?.Name}");
+                UpdateStatus();
+                return;
+            }
             _videoError = null;
             _recoveryMain = null;
             ResetRecovery();
