@@ -129,6 +129,16 @@ public sealed partial class MainForm
             items.Add(new ToolStripMenuItem(L.T("名前を変更..."), null, (_, _) => RenameActiveProfile()) { Enabled = false, ToolTipText = noneTip });
             items.Add(new ToolStripMenuItem(L.T("削除..."), null, (_, _) => DeleteActiveProfile()) { Enabled = false, ToolTipText = noneTip });
         }
+        var manage = new ToolStripMenuItem(L.T("プロファイルの管理..."), null, (_, _) => ShowProfileManager())
+        {
+            ToolTipText = L.T("プロファイルの並び順（Ctrl+1〜9 の順番）を変えたり、名前を変更・削除したりします。"),
+        };
+        if (Profiles.Count == 0)
+        {
+            manage.Enabled = false;
+            manage.ToolTipText = L.T("プロファイルがまだありません");
+        }
+        items.Add(manage);
         items.Add(new ToolStripSeparator());
         items.Add(BuildAutoProfileMenu());
     }
@@ -310,10 +320,96 @@ public sealed partial class MainForm
         ShowOsd(osd);
     }
 
+    /// <summary>
+    /// プロファイルの管理: reorder (Ctrl+1..9 follow the list order), rename and delete. Everything is done on a working
+    /// copy that replaces the list on OK; キャンセル leaves the profiles as they were. The automatic switch scores every
+    /// profile on its own and does nothing when two fit alike, so the order never changes which one it picks.
+    /// </summary>
+    private void ShowProfileManager()
+    {
+        VideoProfile? active = FindActiveProfile();
+        var rows = Profiles.Select(p => new ProfileOrderList.Row(p, p.Name)).ToList();
+
+        using var dlg = Ui.NewDialog(L.T("プロファイルの管理"), 460);
+        var list = Ui.Stretch(new ProfileOrderList(rows));
+        UiButton up = Ui.Stretch(Ui.Btn(L.T("上へ")));
+        UiButton down = Ui.Stretch(Ui.Btn(L.T("下へ")));
+        UiButton rename = Ui.Stretch(Ui.Btn(L.T("名前を変更...")));
+        UiButton delete = Ui.Stretch(Ui.Btn(L.T("削除...")));
+        var buttons = Ui.Stack();
+        buttons.Add(up);
+        buttons.Add(down);
+        buttons.Add(rename, before: Ui.Pad);
+        buttons.Add(delete);
+        Ui.Opt(buttons).Top = true;
+        var stack = Ui.Stack();
+        stack.Add(Ui.Row(list, buttons));
+        stack.Add(Ui.Hint(L.T("Ctrl+1〜9 はこの並び順で割り当てられます。ドラッグや Alt+↑↓ でも並べ替えられます。")), before: Ui.Gap);
+        Ui.FrameOkCancel(dlg, stack);
+        dlg.InitialFocus = list;
+        if (rows.Count > 0) list.Selected = Math.Max(0, rows.FindIndex(r => ReferenceEquals(r.Profile, active)));
+
+        void UpdateButtons()
+        {
+            int s = list.Selected;
+            up.Enabled = s > 0;
+            down.Enabled = s >= 0 && s < rows.Count - 1;
+            rename.Enabled = delete.Enabled = s >= 0;
+            // A button that has just greyed itself out would pass the focus on to whatever is next: keep it on the list.
+            if (dlg.ActiveControl is Button { Enabled: false }) list.Focus();
+        }
+
+        void Rename()
+        {
+            int s = list.Selected;
+            if (s < 0) return;
+            ProfileOrderList.Row row = rows[s];
+            string? name = AskProfileName(L.T("名前を変更"), row.Name, row.Name, rows.Select(r => r.Name).ToList(), dlg);
+            if (name == null) return;
+            row.Name = name;
+            list.Invalidate();
+        }
+
+        void Delete()
+        {
+            int s = list.Selected;
+            if (s < 0) return;
+            if (Ui.Message(dlg, L.F("プロファイル「{0}」を削除しますか？", rows[s].Name), MsgKind.Question,
+                    MessageBoxButtons.YesNo, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+            rows.RemoveAt(s);
+            list.Selected = Math.Min(s, rows.Count - 1);
+            list.Invalidate();
+            UpdateButtons();
+        }
+
+        list.SelectionChanged += (_, _) => UpdateButtons();
+        list.RenameRequested += (_, _) => Rename();
+        list.DeleteRequested += (_, _) => Delete();
+        up.Click += (_, _) => list.MoveSelected(-1);
+        down.Click += (_, _) => list.MoveSelected(1);
+        rename.Click += (_, _) => Rename();
+        delete.Click += (_, _) => Delete();
+        UpdateButtons();
+
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        bool changed = rows.Count != Profiles.Count
+                       || rows.Where((r, i) => !ReferenceEquals(r.Profile, Profiles[i]) || r.Name != r.Profile.Name).Any();
+        if (!changed) return;
+        VideoProfile? activeNow = FindActiveProfile();   // looked up again: the dialog pumped messages meanwhile
+        foreach (ProfileOrderList.Row r in rows) r.Profile.Name = r.Name;
+        Profiles.Clear();
+        Profiles.AddRange(rows.Select(r => r.Profile));
+        _settings.ActiveProfile = activeNow != null && Profiles.Contains(activeNow) ? activeNow.Name : null;
+        FinishProfileEdit(L.T("プロファイルを更新しました"));
+    }
+
     /// <summary>One text box, 32 characters at most, trimmed, non-empty and unique (ignoring case).
     /// The reason it cannot be accepted is shown under the box and OK stays disabled meanwhile.
-    /// <paramref name="ownName"/> is the name being renamed, which may of course be kept.</summary>
-    private string? AskProfileName(string title, string initial, string? ownName)
+    /// <paramref name="ownName"/> is the name being renamed, which may of course be kept. <paramref name="names"/>: the
+    /// names it must differ from (default: the saved profiles); <paramref name="owner"/>: the window it opens over.</summary>
+    private string? AskProfileName(string title, string initial, string? ownName,
+        IReadOnlyCollection<string>? names = null, IWin32Window? owner = null)
     {
         using var dlg = Ui.NewDialog(title, 380);
 
@@ -328,8 +424,8 @@ public sealed partial class MainForm
         string? Problem(string text)
         {
             if (text.Length == 0) return L.T("名前を入力してください");
-            if (Profiles.Any(p => string.Equals(p.Name, text, StringComparison.OrdinalIgnoreCase)
-                                  && !string.Equals(p.Name, ownName, StringComparison.OrdinalIgnoreCase)))
+            if ((names ?? Profiles.Select(p => p.Name)).Any(n => string.Equals(n, text, StringComparison.OrdinalIgnoreCase)
+                                  && !string.Equals(n, ownName, StringComparison.OrdinalIgnoreCase)))
                 return L.T("同じ名前のプロファイルがあります");
             return null;
         }
@@ -346,7 +442,7 @@ public sealed partial class MainForm
         dlg.InitialFocus = box;
         dlg.Shown += (_, _) => box.SelectAll();
 
-        return dlg.ShowDialog(this) == DialogResult.OK ? box.Text.Trim() : null;
+        return dlg.ShowDialog(owner ?? this) == DialogResult.OK ? box.Text.Trim() : null;
     }
 
     // =====================================================================
@@ -514,4 +610,152 @@ public sealed partial class MainForm
             return src;
         }
     }
+}
+
+/// <summary>The list of the profile manager: one row per profile with the key it has (Ctrl+1..9) and its name, in the dark
+/// palette. Reordered with the buttons beside it, Alt+Up / Alt+Down, or by dragging a row.</summary>
+internal sealed class ProfileOrderList : Control
+{
+    /// <summary>A working copy of one profile in the manager: the profile itself and the name it will have.</summary>
+    internal sealed class Row
+    {
+        public VideoProfile Profile;
+        public string Name;
+        public Row(VideoProfile profile, string name) { Profile = profile; Name = name; }
+    }
+
+    private readonly List<Row> _rows;
+    private readonly int _visibleRows;
+    private int _selected = -1;
+    private bool _dragging;
+
+    public event EventHandler? SelectionChanged;
+    public event EventHandler? RenameRequested;
+    public event EventHandler? DeleteRequested;
+
+    public ProfileOrderList(List<Row> rows)
+    {
+        _rows = rows;
+        _visibleRows = Math.Clamp(rows.Count, 5, AppSettings.MaxProfiles);   // fixed: the dialog does not shrink after a delete
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                 | ControlStyles.ResizeRedraw | ControlStyles.Selectable | ControlStyles.StandardClick, true);
+        TabStop = true;
+        BackColor = Ui.Colors.Field;
+        ForeColor = Ui.Colors.Text;
+        AccessibleRole = AccessibleRole.List;
+    }
+
+    public int Selected
+    {
+        get => _selected;
+        set
+        {
+            value = _rows.Count == 0 ? -1 : Math.Clamp(value, -1, _rows.Count - 1);
+            if (value == _selected) { Invalidate(); return; }
+            _selected = value;
+            Invalidate();
+            SelectionChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    /// <summary>Move the selected row up (-1) or down (+1) in the list; the selection goes with it.</summary>
+    public void MoveSelected(int delta)
+    {
+        int from = _selected, to = from + delta;
+        if (from < 0 || to < 0 || to >= _rows.Count) return;
+        (_rows[from], _rows[to]) = (_rows[to], _rows[from]);
+        _selected = to;
+        Invalidate();
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private int RowHeight => Font.Height + 2 * Ui.Px(this, 6);
+
+    public override Size GetPreferredSize(Size proposedSize)
+    {
+        int w = proposedSize.Width > 1 && proposedSize.Width < 100000 ? proposedSize.Width : Ui.Px(this, 280);
+        return new Size(w, RowHeight * _visibleRows + 2);
+    }
+
+    private const TextFormatFlags TextFlags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis
+                                              | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.Left;
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.Clear(BackColor);
+        int rh = RowHeight, padX = Ui.Px(this, 12);
+        int keyW = TextRenderer.MeasureText("Ctrl+9", Font, Size.Empty, TextFormatFlags.NoPadding).Width;
+        bool focused = Focused;
+        for (int i = 0; i < _rows.Count; i++)
+        {
+            var row = new Rectangle(1, 1 + i * rh, Width - 2, rh);
+            if (!row.IntersectsWith(e.ClipRectangle)) continue;
+            bool sel = i == _selected;
+            Color back = sel ? Ui.Colors.Hover : i % 2 == 1 ? Ui.Colors.FieldAlt : BackColor;
+            if (back != BackColor) using (var bb = new SolidBrush(back)) g.FillRectangle(bb, row);
+            if (sel && focused) using (var bar = new SolidBrush(Ui.Colors.Accent)) g.FillRectangle(bar, row.X, row.Y, Ui.Px(this, 3), row.Height);
+            var key = new Rectangle(row.X + padX, row.Y, keyW, rh);
+            if (i < 9) TextRenderer.DrawText(g, "Ctrl+" + (i + 1), Font, key, Ui.Colors.SubText, back, TextFlags);
+            int nameX = key.Right + padX;
+            var name = new Rectangle(nameX, row.Y, Math.Max(1, row.Right - padX - nameX), rh);
+            TextRenderer.DrawText(g, _rows[i].Name, Font, name, ForeColor, back, TextFlags);
+        }
+        using var pen = new Pen(Ui.FieldEdge(this));
+        g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+    }
+
+    private int RowAt(int y) => _rows.Count == 0 ? -1 : Math.Clamp((y - 1) / RowHeight, 0, _rows.Count - 1);
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        Focus();
+        if (e.Button != MouseButtons.Left || _rows.Count == 0) return;
+        Selected = RowAt(e.Y);
+        _dragging = true;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!_dragging || _selected < 0) return;
+        // Dragging a row: it swaps with whichever row the pointer is over, one step at a time.
+        int target = RowAt(e.Y);
+        while (target != _selected) MoveSelected(target < _selected ? -1 : 1);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e) { _dragging = false; base.OnMouseUp(e); }
+    protected override void OnMouseCaptureChanged(EventArgs e) { _dragging = false; base.OnMouseCaptureChanged(e); }
+    protected override void OnMouseDoubleClick(MouseEventArgs e)
+    {
+        base.OnMouseDoubleClick(e);
+        if (e.Button == MouseButtons.Left && _selected >= 0) RenameRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    protected override bool IsInputKey(Keys keyData) =>
+        (keyData & Keys.KeyCode) is Keys.Up or Keys.Down or Keys.Home or Keys.End || base.IsInputKey(keyData);
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        bool alt = e.Alt && !e.Control && !e.Shift;
+        switch (e.KeyCode)
+        {
+            case Keys.Up when alt: MoveSelected(-1); break;
+            case Keys.Down when alt: MoveSelected(1); break;
+            case Keys.Up when !e.Alt: Selected = Math.Max(0, _selected - 1); break;
+            case Keys.Down when !e.Alt: Selected = _selected + 1; break;
+            case Keys.Home: Selected = 0; break;
+            case Keys.End: Selected = _rows.Count - 1; break;
+            case Keys.F2: if (_selected >= 0) RenameRequested?.Invoke(this, EventArgs.Empty); break;
+            case Keys.Delete: if (_selected >= 0) DeleteRequested?.Invoke(this, EventArgs.Empty); break;
+            default: return;
+        }
+        e.Handled = e.SuppressKeyPress = true;
+    }
+
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); Invalidate(); }
 }

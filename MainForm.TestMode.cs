@@ -2190,6 +2190,27 @@ public sealed partial class MainForm
         return DialogResult.Cancel;
     }
 
+    /// <summary>The profile manager over three sample profiles (one with a long Japanese name); the real list is put back.</summary>
+    private void AuditProfileManager()
+    {
+        var saved = Profiles.ToList();
+        string? savedActive = _settings.ActiveProfile;
+        try
+        {
+            Profiles.Clear();
+            foreach (string n in new[] { "PS5 1080p60", "Nintendo Switch（ドックモード・テレビ出力）", "レトロゲーム用 480i" })
+                Profiles.Add(new VideoProfile { Name = n });
+            _settings.ActiveProfile = Profiles[1].Name;
+            ShowProfileManager();
+        }
+        finally
+        {
+            Profiles.Clear();
+            Profiles.AddRange(saved);
+            _settings.ActiveProfile = savedActive;
+        }
+    }
+
     private async Task DialogStep(TestSection sec)
     {
         _dlgRows.Clear();
@@ -2199,6 +2220,7 @@ public sealed partial class MainForm
             ShowBurstDialog, ShowAudioBufferSettings, ShowAvSyncDialog, ShowAdjustmentsDialog, ShowCropDialog,
             ShowSnapshotSettings, () => ShowSnapshotGallery(), ShowAbout, ShowShortcuts, ShowDeviceKeywordSettings, ShowHotkeySettings,
             () => AskProfileName(L.T("新しいプロファイル"), string.Empty, null),
+            AuditProfileManager,
             ShowTrainDialog, () => AuditTrainWindow(false), () => AuditTrainWindow(true),
         };
         Ui.DialogAudit = AuditDialog;
