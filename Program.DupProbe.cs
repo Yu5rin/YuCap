@@ -8,13 +8,14 @@ using System.Windows.Forms;
 namespace YuCap;
 
 // Hidden developer command for calibrating and checking the same-picture pass (the game frame rate):
-//   --dup-probe [file.csv] [--seconds 12] [--display name] [--interp] [--off]
+//   --dup-probe [file.csv] [--seconds 12] [--display name] [--interp] [--off] [--auto]
 // runs the Direct3D engine on the capture device for some seconds and writes one line per captured frame (the four numbers the
 // GPU reduced the thumbnail difference to, and the verdict), then a summary with the live game frame rate, the answer delay and the GPU time of the pass.
 internal static partial class Program
 {
     private static string? _dupProbeComp;
     private static CaptureMode? _dupProbeMode;
+    private static bool _dupProbeAuto;   // --auto: keep the automatic choice instead of forcing 1080p60
 
     private static void RunDupProbe(string outPath, int seconds, bool interp, bool off)
     {
@@ -37,7 +38,7 @@ internal static partial class Program
                 CaptureMode? mode = _dupProbeMode != null ? modes.Where(m => m.Width == _dupProbeMode.Width && m.Height == _dupProbeMode.Height && m.Fps == _dupProbeMode.Fps).FirstOrDefault() : null;
                 mode ??= modes.Where(m => m.Width == 1920 && m.Height == 1080 && m.Fps == 60)
                     .OrderBy(m => _dupProbeComp != null && m.Compression.Equals(_dupProbeComp, StringComparison.OrdinalIgnoreCase) ? 0 : m.Compression == "NV12" ? 1 : 2).FirstOrDefault();
-                engine.Start(dev, mode);
+                if (!_dupProbeAuto) engine.Start(dev, mode);
                 engine.SetVideoRect(new Rectangle(0, 0, canvas.ClientSize.Width, canvas.ClientSize.Height));
                 engine.Interpolation = interp;
                 PumpFor(1500);

@@ -1361,6 +1361,25 @@ public sealed partial class MainForm : Form, IMessageFilter
         {
             var devices = VideoEngine.EnumerateDevices();
             bool present = _currentVideoInfo != null && devices.Any(d => d.Id == _currentVideoInfo.Id);
+            if (_video.IsRunning && _currentVideoInfo != null && !present && !_video.EndedUnexpectedly)
+            {
+                // One missing enumeration is not an unplug: a stick whose audio interface re-enumerates briefly hides its
+                // video interface too. Look again before stopping a picture that is running fine.
+                string wantId = _currentVideoInfo.Id;
+                Log.Info("OnDeviceChange: the video device is not listed - checking again in 1.5 s");
+                await Task.Delay(1500);
+                if (IsDisposed || _testRunning) return;
+                devices = VideoEngine.EnumerateDevices();
+                present = devices.Any(d => d.Id == wantId);
+                if (present) Log.Info("OnDeviceChange: the video device is back in the list - keeping the picture");
+                // The user may have switched device or started one during the wait: `present` describes the old device
+                // only, so never stop or judge the current one by it.
+                if (_currentVideoInfo?.Id != wantId || _vsRunning != null || _vsPending != null)
+                {
+                    Log.Info("OnDeviceChange: the video device changed during the recheck - leaving it to the new start");
+                    present = true;
+                }
+            }
             if (_video.IsRunning && _currentVideoInfo != null && !present)
             {
                 if (_frozen) ToggleFreeze();
@@ -2057,25 +2076,25 @@ public sealed partial class MainForm : Form, IMessageFilter
         _restartAttempts++;
         Log.Info($"resize guard: UpdateVideo wedged — restarting preview (attempt {_restartAttempts})");
         RestartPreview();
-        // Watch the restarted session too: its first resize can wedge as well.
-        _resizeGuard.Start();
     }
 
     /// <summary>Rebuild the capture preview to recover from a wedged UpdateVideo.
     /// The render window MUST be recreated first: the abandoned session's
     /// DirectComposition target is still bound to the old HWND, so reusing it
     /// fails with DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED.</summary>
-    private void RestartPreview()
+    private async void RestartPreview()
     {
         if (_currentVideoInfo == null) return;
         try
         {
             _canvas.ResetHandle();
             _video.Attach(_canvas.Handle);
-            _video.Start(_currentVideoInfo, _cliMode ?? _savedMode);
+            // The shared start path: a Direct3D start runs off the UI thread instead of freezing it for the old session's teardown.
+            await StartVideoAsync(_currentVideoInfo, _cliMode ?? _savedMode);
             ApplyRenderOptions();
             LayoutCanvas();
             Log.Info("resize guard: preview restarted on a fresh window");
+            _resizeGuard.Start();   // watch the restarted session too: its first resize can wedge as well
         }
         catch (Exception ex)
         {
@@ -4008,12 +4027,12 @@ public sealed partial class MainForm : Form, IMessageFilter
     {
         root.DropDownItems.Clear();
 
-        // Renamed from "自動 (最大解像度)": the code keeps the device's OWN
-        // default mode, it never picks the maximum resolution — the old label
-        // promised something this never actually did.
-        var auto = new ToolStripMenuItem(L.T("自動（機器の既定）"), null, (_, _) => ClearModePreference())
+        // Auto keeps the device's own current type when it runs at 24 fps or more, otherwise it takes the
+        // largest size, then the highest rate (CaptureFormats.PickAuto): the label and tip say so.
+        var auto = new ToolStripMenuItem(L.T("自動"), null, (_, _) => ClearModePreference())
         {
             Checked = _savedMode == null,
+            ToolTipText = L.T("機器が今使っている形式が 24fps 以上ならそのまま使い、そうでなければ 24fps 以上で最大の解像度・最高のフレームレートを選びます。"),
         };
         root.DropDownItems.Add(auto);
 
@@ -4026,6 +4045,13 @@ public sealed partial class MainForm : Form, IMessageFilter
         root.DropDownItems.Add(new ToolStripSeparator());
 
         var cur = _video.CurrentMode;
+        // A hidden NV12 twin of an MJPG entry (the device itself may be running it) is shown as that MJPG entry.
+        if (cur is { Compression: "NV12" } && !modes.Any(x => x.Equals(cur)))
+        {
+            var twin = modes.FirstOrDefault(x => x.Compression == "MJPG" && x.Width == cur.Width && x.Height == cur.Height && x.Fps == cur.Fps);
+            if (twin != null) cur = twin;
+        }
+        ToolStripMenuItem? low = null;   // types under 20 fps (a stick's leftover YUY2 modes) go in their own submenu at the end
         foreach (var m in modes)
         {
             var mode = m;
@@ -4034,8 +4060,15 @@ public sealed partial class MainForm : Form, IMessageFilter
                 Checked = _savedMode != null && mode.Equals(cur),
             };
             item.Click += (_, _) => ApplyVideoMode(mode);
-            root.DropDownItems.Add(item);
+            if (mode.Fps < 20)
+            {
+                low ??= new ToolStripMenuItem(L.T("低フレームレート"));
+                low.DropDownItems.Add(item);
+                if (item.Checked) low.Checked = true;
+            }
+            else root.DropDownItems.Add(item);
         }
+        if (low != null) root.DropDownItems.Add(low);
     }
 
     /// <summary>

@@ -287,6 +287,7 @@ internal static partial class Program
                 else if (args[i] == "--display" && i + 1 < args.Length) dpDisp = args[++i];
                 else if (args[i] == "--interp") dpInterp = true;
                 else if (args[i] == "--off") dpOff = true;
+                else if (args[i] == "--auto") _dupProbeAuto = true;
                 else if (args[i] == "--comp" && i + 1 < args.Length) _dupProbeComp = args[++i];
                 else if (args[i] == "--mode" && i + 1 < args.Length) _dupProbeMode = ParseMode(args[++i]);
                 else if (!args[i].StartsWith("--", StringComparison.Ordinal)) dpOut = args[i];

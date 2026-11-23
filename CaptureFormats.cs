@@ -8,9 +8,9 @@ namespace YuCap;
 /// <summary>
 /// Enumeration and selection of a capture device's native formats through a source
 /// reader. The selection rules are the same as VideoEngine.ConfigureFormat (which keeps
-/// its own copy for the Capture Engine path): exact match, else same resolution at the
-/// highest frame rate, else the largest resolution at the highest frame rate.
-/// An empty Compression means "any".
+/// shares it for the Capture Engine path): exact match, else same resolution at the
+/// highest frame rate, else the largest resolution at the highest frame rate; with no mode
+/// the automatic choice (PickAuto). An empty Compression means "any".
 /// </summary>
 internal static class CaptureFormats
 {
@@ -33,45 +33,112 @@ internal static class CaptureFormats
         return list;
     }
 
-    /// <summary>The selectable modes, in the same shape VideoEngine.GetModes returns.</summary>
-    public static List<CaptureMode> ToModes(IEnumerable<RawType> types) =>
-        types
+    /// <summary>Compressed (decoded by the reader / the system, not a raw pixel format) subtypes.</summary>
+    public static bool IsCompressed(string comp) => comp is "MJPG" or "MJPEG" or "H264" or "HEVC" or "H265";
+
+    private static bool SameShape(RawType a, RawType b) => a.W == b.W && a.H == b.H && a.Fps == b.Fps;
+
+    /// <summary>True when <paramref name="r"/> is an NV12 type that has an MJPG type of the same size and frame rate.</summary>
+    private static bool HasMjpgTwin(IReadOnlyList<RawType> types, RawType r)
+    {
+        if (r.Comp != "NV12") return false;
+        foreach (RawType m in types) if (m.Comp == "MJPG" && SameShape(m, r)) return true;
+        return false;
+    }
+
+    /// <summary>A cheap capture stick sends only MJPG; the NV12 types it lists are the Windows camera frame server
+    /// decoding that MJPG. Such a device lists an NV12 twin for every MJPG type and the other way round. A real NV12
+    /// card that also offers MJPG does not (its sets differ), so it is never treated as a twin device.</summary>
+    public static bool IsTwinDevice(IReadOnlyList<RawType> types)
+    {
+        bool anyNv12 = false;
+        foreach (RawType r in types)
+        {
+            if (r.Comp == "NV12")
+            {
+                anyNv12 = true;
+                if (!HasMjpgTwin(types, r)) return false;
+            }
+            else if (r.Comp == "MJPG" && !types.Any(n => n.Comp == "NV12" && SameShape(n, r))) return false;
+        }
+        return anyNv12;
+    }
+
+    /// <summary>The selectable modes, in the same shape VideoEngine.GetModes returns. On a twin device the NV12 entries
+    /// that duplicate an MJPG entry are left out (one entry per size and rate).</summary>
+    public static List<CaptureMode> ToModes(IEnumerable<RawType> types)
+    {
+        List<RawType> all = types.ToList();
+        bool twin = IsTwinDevice(all);
+        return all
+            .Where(r => !(twin && HasMjpgTwin(all, r)))
             .GroupBy(r => (r.Comp, r.W, r.H))
             .Select(g => new CaptureMode(g.Key.Comp, g.Key.W, g.Key.H, g.Max(r => r.Fps)))
             .OrderByDescending(m => (long)m.Width * m.Height)
             .ThenByDescending(m => m.Fps)
             .ToList();
+    }
 
-    /// <summary>Choose the native type to use. <paramref name="current"/> is the device's
-    /// own default (used when no mode was asked for). Returns null if there are no types.</summary>
-    public static RawType? Pick(List<RawType> types, CaptureMode? desired, RawType? current)
+    /// <summary>Below this a type is not a sensible automatic choice (a device's leftover YUY2 1080p at 5 fps).</summary>
+    public const int MinAutoFps = 24;
+
+    /// <summary>On a twin device an NV12 type becomes its MJPG type (the reader then decodes the real stream itself);
+    /// anything else is returned unchanged.</summary>
+    public static RawType MapTwin(List<RawType> types, RawType r)
+    {
+        if (!HasMjpgTwin(types, r) || !IsTwinDevice(types)) return r;
+        int i = types.FindIndex(m => m.Comp == "MJPG" && SameShape(m, r));
+        return i >= 0 ? types[i] : r;
+    }
+
+    /// <summary>Automatic choice. The device's own current type is kept when it runs at <see cref="MinAutoFps"/> or
+    /// more (a card's 1080p120 stays). Otherwise the largest size, then the highest rate, among the types at
+    /// <see cref="MinAutoFps"/> or more; on a tie an uncompressed type that is not an MJPG twin, then MJPG, then the twin.
+    /// With <paramref name="mapTwin"/> an NV12 twin is turned into its MJPG type.</summary>
+    public static RawType? PickAuto(List<RawType> types, RawType? current, bool mapTwin)
     {
         if (types.Count == 0) return null;
+        bool twinDev = IsTwinDevice(types);
+        int curIdx = current is { } c
+            ? types.FindIndex(r => r.Comp == c.Comp && r.W == c.W && r.H == c.H && r.Fps == c.Fps) : -1;
 
-        if (desired == null)
+        RawType chosen;
+        if (curIdx >= 0 && types[curIdx].Fps >= MinAutoFps) chosen = types[curIdx];
+        else
         {
-            if (current is { } c)
-            {
-                int same = types.FindIndex(r => r.Comp == c.Comp && r.W == c.W && r.H == c.H && r.Fps == c.Fps);
-                if (same >= 0) return types[same];
-            }
-            return Largest(types);
+            var ok = types.Where(r => r.Fps >= MinAutoFps).ToList();
+            if (ok.Count == 0) chosen = curIdx >= 0 ? types[curIdx] : Largest(types);
+            else
+                chosen = ok.OrderByDescending(r => (long)r.W * r.H).ThenByDescending(r => r.Fps)
+                    .ThenBy(r => twinDev && r.Comp == "NV12" ? 2 : IsCompressed(r.Comp) ? 1 : 0).First();
         }
+        return mapTwin ? MapTwin(types, chosen) : chosen;
+    }
+
+    /// <summary>Choose the native type to use. <paramref name="current"/> is the device's
+    /// own default (used by the automatic choice when no mode was asked for). Returns null if there are no types.
+    /// With <paramref name="mapTwin"/> (the Direct3D path) an NV12 twin of an MJPG type is opened as the MJPG type.</summary>
+    public static RawType? Pick(List<RawType> types, CaptureMode? desired, RawType? current, bool mapTwin = false)
+    {
+        if (types.Count == 0) return null;
+        if (desired == null) return PickAuto(types, current, mapTwin);
 
         // RawType is a struct: use FindIndex so "not found" is unambiguous.
         bool CompOk(RawType r) => string.IsNullOrEmpty(desired.Compression) || r.Comp == desired.Compression;
         int exact = types.FindIndex(r =>
             CompOk(r) && r.W == desired.Width && r.H == desired.Height &&
             (desired.Fps <= 0 || r.Fps == desired.Fps));
-        if (exact >= 0) return types[exact];
-
-        int sameRes = types.FindIndex(r => CompOk(r) && r.W == desired.Width && r.H == desired.Height);
-        if (sameRes >= 0)
+        RawType pick;
+        if (exact >= 0) pick = types[exact];
+        else
         {
-            return types.Where(r => CompOk(r) && r.W == desired.Width && r.H == desired.Height)
-                .OrderByDescending(r => r.Fps).First();
+            int sameRes = types.FindIndex(r => CompOk(r) && r.W == desired.Width && r.H == desired.Height);
+            pick = sameRes >= 0
+                ? types.Where(r => CompOk(r) && r.W == desired.Width && r.H == desired.Height)
+                    .OrderByDescending(r => r.Fps).First()
+                : Largest(types);
         }
-        return Largest(types);
+        return mapTwin ? MapTwin(types, pick) : pick;
     }
 
     private static RawType Largest(List<RawType> types) =>

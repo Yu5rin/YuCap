@@ -410,6 +410,8 @@ public sealed class D3DVideoEngine : IVideoEngine
     // run on the UI thread: StartAsync runs the whole start on a worker (this engine only needs the HWND, which its own
     // render thread uses anyway), and Stop() only detaches the session - the join happens in the background. A new
     // Start waits for that join first, so the window's DirectComposition target is free again.
+    /// <summary>Devices whose compressed type stalled on the hardware decoder: opened with software decoding for the rest of the process.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> SoftwareDecodeDevices = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _startLock = new();
     private readonly object _sLock = new();
     private readonly object _shutdownLock = new();
@@ -1220,7 +1222,7 @@ public sealed class D3DVideoEngine : IVideoEngine
             RequestStop("Stop()");
 
             // The render thread owns the teardown order (it stops the capture thread first).
-            Thread? cap = _captureThread, rnd = _renderThread;
+            Thread? cap = CurrentCaptureThread(), rnd = _renderThread;
             rnd?.Join(budgetMs);
             cap?.Join(Math.Max(50, budgetMs - (int)sw.ElapsedMilliseconds));
             if ((cap?.IsAlive ?? false) || (rnd?.IsAlive ?? false))
@@ -1340,24 +1342,27 @@ public sealed class D3DVideoEngine : IVideoEngine
                 DrainRequests();
 
                 bool captureDone = true;
-                Thread? cap = _captureThread;
+                Thread? cap = CurrentCaptureThread();   // _stopping is set: a watchdog can no longer swap it
                 if (captureMayUseDevice && cap != null && cap.IsAlive)
                 {
-                    // Frames normally keep flowing, so the loop sees _stopping within a frame.
-                    // Shutting the media source down is the fallback for a device that has
-                    // stopped delivering (it can unblock a pending ReadSample).
-                    captureDone = cap.Join(800);
+                    // While frames flow the loop sees _stopping within a frame and the thread leaves by itself: give it the
+                    // full, original allowances (a card's reader disposal can take over a second, and releasing the device
+                    // under it is worse than waiting). When no frame arrives the thread sits in ReadSample for good, and
+                    // shutting the media source down is what frees the device, so do that at once with shorter allowances.
+                    long last = Volatile.Read(ref _lastFrameTick);
+                    bool flowing = last != 0 && Environment.TickCount64 - last < 500;
+                    captureDone = flowing && cap.Join(800);
                     if (!captureDone)
                     {
-                        Log.Info("D3D: capture thread still in ReadSample after 800ms — shutting the media source down");
+                        Log.Info($"D3D: capture thread still in ReadSample (frames flowing: {flowing}) — shutting the media source down");
                         IMFMediaSource? src = _source;
                         if (src != null)
                         {
                             var t = new Thread(() => { try { src.Shutdown(); } catch { } }) { IsBackground = true, Name = "YuCap.D3D.SrcShutdown" };
                             t.Start();
-                            t.Join(1000);
+                            t.Join(flowing ? 1000 : 600);
                         }
-                        captureDone = cap.Join(1200);
+                        captureDone = cap.Join(flowing ? 1200 : 700);
                     }
                     if (!captureDone) Log.Info("D3D: capture thread did not exit — leaking the device instead of releasing it under its feet");
                 }
@@ -1767,10 +1772,28 @@ public sealed class D3DVideoEngine : IVideoEngine
         private static readonly int VideoStream = unchecked((int)0xFFFFFFFC);   // MF_SOURCE_READER_FIRST_VIDEO_STREAM
         private static readonly int CurrentTypeIndex = unchecked((int)0xFFFFFFFF);
 
-        private void CaptureMain()
+        // ---- capture thread generations ----
+        // A compressed type that never delivers is abandoned (its thread may be stuck in ReadSample for good) and the
+        // device is reopened by a new thread with a new generation; a thread of an older generation touches nothing shared.
+        private int _capGen;
+        private readonly object _capLock = new();
+        private long _lastFrameTick;               // Environment.TickCount64 of the newest frame (0 = none yet)
+        private string _pickedComp = string.Empty;  // the native type OpenReader opened (set before it returns)
+        /// <summary>How long a compressed type may take to deliver its first frame before the reader is abandoned.</summary>
+        private const int FirstFrameWatchMs = 2500;
+
+        private Thread? CurrentCaptureThread() { lock (_capLock) return _captureThread; }
+
+        private void CaptureMain() => CaptureRun(Volatile.Read(ref _capGen), initial: true,
+            hwTransforms: !SoftwareDecodeDevices.ContainsKey(_info.Id));
+
+        private void CaptureRun(int gen, bool initial, bool hwTransforms)
         {
             IMFSourceReader? reader = null;
+            IMFMediaSource? source = null;
             bool opened = false;
+            var firstFrameSeen = new ManualResetEventSlim(false);
+            bool Stale() => gen != Volatile.Read(ref _capGen);
             try
             {
                 EnsureStartup();
@@ -1778,9 +1801,11 @@ public sealed class D3DVideoEngine : IVideoEngine
                     throw new UserFacingException(L.T("映像の開始がタイムアウトしました。"));
                 D3DRenderer r = _r;
 
-                reader = OpenReader(out YuvInfo yuv0, out int w0, out int h0);
+                reader = OpenReader(hwTransforms, out source, out YuvInfo yuv0, out int w0, out int h0);
                 opened = true;
-                _captureOpened.Set();
+                if (initial) _captureOpened.Set();
+                if (!hwTransforms) Log.Info("D3D: reader opened with software decoding");
+                if (hwTransforms && CaptureFormats.IsCompressed(_pickedComp)) StartFirstFrameWatchdog(gen, firstFrameSeen, source);
 
                 YuvInfo yuv = yuv0;
                 int width = w0, height = h0;
@@ -1794,7 +1819,7 @@ public sealed class D3DVideoEngine : IVideoEngine
                     long arrival = Stopwatch.GetTimestamp();   // when the frame reached us: the video delay counts from here
                     using (sample)
                     {
-                        if (_stopping) break;
+                        if (_stopping || Stale()) break;
                         if ((flags & SourceReaderFlag.EndOfStream) != 0)
                         {
                             Log.Info("D3D: end of stream (device removed?)");
@@ -1817,24 +1842,33 @@ public sealed class D3DVideoEngine : IVideoEngine
                         if (sample == null) continue;
 
                         Interlocked.Increment(ref _inFrames);
+                        Volatile.Write(ref _lastFrameTick, Environment.TickCount64);
                         TrackArrival(arrival);
                         r.SetNominalMs(_nominalMs);
                         SubmitSample(r, sample, width, height, yuv, arrival, TrackSmooth(arrival), ref texIid);
                         // With the ring active the render thread counts what the ring loses.
                         if (Interlocked.Exchange(ref _frameReady, 1) == 1 && !_ringActive) Interlocked.Increment(ref _dropped);
                         TryWake();
-                        if (firstFrame) { firstFrame = false; Log.Info($"D3D: first frame received (t+{TraceMs}ms)"); }
+                        if (firstFrame)
+                        {
+                            firstFrame = false;
+                            firstFrameSeen.Set();
+                            Log.Info($"D3D: first frame received (t+{TraceMs}ms)");
+                            // The software retry worked where the hardware decoder did not: use it for this device from now on.
+                            if (!hwTransforms && !initial && SoftwareDecodeDevices.TryAdd(_info.Id, true))
+                                Log.Info("D3D: software decoding remembered for this device");
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                if (!opened)
+                if (!opened && initial)
                 {
                     _captureOpenError = ex;
                     _captureOpened.Set();
                 }
-                else if (!_stopping)
+                else if (!_stopping && !Stale())
                 {
                     Log.Info($"D3D: capture failed — {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message.Split('\n')[0]}");
                     RequestStop($"capture failure (0x{ex.HResult:X8})", unexpected: true);
@@ -1843,12 +1877,42 @@ public sealed class D3DVideoEngine : IVideoEngine
             finally
             {
                 var cs = Stopwatch.StartNew();
+                // Only this thread's own objects: after an abandon the session's current source belongs to the new thread.
                 try { reader?.Dispose(); } catch { }
-                try { _source?.Shutdown(); } catch { }
-                try { _source?.Dispose(); } catch { }
-                Log.Info($"D3D: capture thread done ({cs.ElapsedMilliseconds}ms)");
-                if (!_captureOpened.IsSet) _captureOpened.Set();
+                try { source?.Shutdown(); } catch { }
+                try { source?.Dispose(); } catch { }
+                Log.Info($"D3D: capture thread done ({cs.ElapsedMilliseconds}ms{(Stale() ? ", abandoned" : string.Empty)})");
+                if (initial && !_captureOpened.IsSet) _captureOpened.Set();
             }
+        }
+
+        /// <summary>A compressed type read through the hardware decoder can stall for good (a stick that interleaves 4-byte stub
+        /// samples). If no frame shows up in time, abandon the reader and reopen with software decoding.</summary>
+        private void StartFirstFrameWatchdog(int gen, ManualResetEventSlim firstFrame, IMFMediaSource source)
+        {
+            var t = new Thread(() =>
+            {
+                if (firstFrame.Wait(FirstFrameWatchMs) || _stopping || gen != Volatile.Read(ref _capGen)) return;
+                Log.Info($"D3D: no frame from {_pickedComp} within {FirstFrameWatchMs}ms — reopening with software decoding");
+                lock (_capLock)
+                {
+                    if (_stopping || Interlocked.CompareExchange(ref _capGen, gen + 1, gen) != gen) return;
+                }
+                // Shutdown frees the device (a blocked ReadSample may not return for a long time, so it is never joined).
+                var sd = new Thread(() => { try { source.Shutdown(); } catch { } }) { IsBackground = true, Name = "YuCap.D3D.SrcShutdown" };
+                sd.Start();
+                sd.Join(1500);
+                Log.Info("D3D: abandoned a stuck reader");
+                lock (_capLock)
+                {
+                    if (_stopping) return;   // the render thread's teardown has taken over
+                    var nt = new Thread(() => CaptureRun(gen + 1, initial: false, hwTransforms: false)) { IsBackground = true, Name = "YuCap.D3D.Capture" };
+                    nt.SetApartmentState(ApartmentState.MTA);
+                    _captureThread = nt;
+                    nt.Start();
+                }
+            }) { IsBackground = true, Name = "YuCap.D3D.CapWatch" };
+            t.Start();
         }
 
         private void SubmitSample(D3DRenderer r, IMFSample sample, int w, int h, YuvInfo yuv, long arrival, long smooth, ref Guid texIid)
@@ -1882,13 +1946,12 @@ public sealed class D3DVideoEngine : IVideoEngine
         }
 
         /// <summary>Open the device, build the source reader and select the format.</summary>
-        private IMFSourceReader OpenReader(out YuvInfo yuv, out int width, out int height)
+        private IMFSourceReader OpenReader(bool hwTransforms, out IMFMediaSource source, out YuvInfo yuv, out int width, out int height)
         {
             using IMFAttributes devAttrs = MediaFactory.MFCreateAttributes(2);
             devAttrs.Set(CaptureDeviceAttributeKeys.SourceType, CaptureDeviceAttributeKeys.SourceTypeVidcap);
             devAttrs.Set(CaptureDeviceAttributeKeys.SourceTypeVidcapSymbolicLink, _info.Id);
 
-            IMFMediaSource source;
             try { source = MediaFactory.MFCreateDeviceSource(devAttrs); }
             catch (Exception ex)
             {
@@ -1904,7 +1967,7 @@ public sealed class D3DVideoEngine : IVideoEngine
 
             using IMFAttributes ra = MediaFactory.MFCreateAttributes(4);
             ra.Set(SourceReaderAttributeKeys.D3DManager, _dxgiManager!);
-            ra.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, 1u);    // MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS
+            ra.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, hwTransforms ? 1u : 0u);    // MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS (off: the software MJPEG decoder)
             ra.Set(SourceReaderAttributeKeys.EnableAdvancedVideoProcessing, 1u);
             IMFSourceReader reader = MediaFactory.MFCreateSourceReaderFromMediaSource(source, ra);
             try { return ConfigureReader(reader, out yuv, out width, out height); }
@@ -1933,7 +1996,9 @@ public sealed class D3DVideoEngine : IVideoEngine
             }
             catch { /* no "current" type: fall back to the largest */ }
 
-            CaptureFormats.RawType pick = CaptureFormats.Pick(types, _wantedMode, cur)!.Value;
+            // Direct3D path: an NV12 type that is only the frame server's decode of an MJPG type is opened as that MJPG type.
+            CaptureFormats.RawType pick = CaptureFormats.Pick(types, _wantedMode, cur, mapTwin: true)!.Value;
+            _pickedComp = pick.Comp;
             string pickedDesc, currentNativeDesc = "-", outputDesc = "-";
             using (IMFMediaType native = reader.GetNativeMediaType(VideoStream, pick.Index))
             {
@@ -1942,6 +2007,11 @@ public sealed class D3DVideoEngine : IVideoEngine
                 if (ex != null)
                 {
                     using (ex) ex.SetNativeMediaType(VideoStream, native, out _);
+                }
+                else if (CaptureFormats.IsCompressed(pick.Comp))
+                {
+                    // SetCurrentMediaType would silently swap a compressed type for the frame server's NV12 twin.
+                    throw new UserFacingException(L.T("この映像形式を開けません。"));
                 }
                 else
                 {

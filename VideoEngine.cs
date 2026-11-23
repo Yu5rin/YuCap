@@ -1,12 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Diagnostics;
 using System.Drawing.Imaging;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 using Vortice.MediaFoundation;
+using RawType = YuCap.CaptureFormats.RawType;
 
 namespace YuCap;
 
@@ -292,12 +294,13 @@ public sealed class VideoEngine : IVideoEngine
         if (_callback.LastHr < 0)
             Marshal.ThrowExceptionForHR(_callback.LastHr);
 
-        // Configure the source format. With no explicit mode we keep the device
-        // default (on JVA14 that is already 1080p120), which is the best viewer
-        // default; an explicit mode (menu/persisted) is applied verbatim.
+        // Configure the source format. With no explicit mode the automatic choice keeps the
+        // device's current type when it runs at 24 fps or more (on JVA14 that is already
+        // 1080p120) and otherwise picks the largest, fastest type; an explicit mode
+        // (menu/persisted) is applied verbatim.
         _engine.GetSource(out IntPtr srcPtr);
         _source = (IMFCaptureSource)srcPtr;
-        if (mode != null) ConfigureFormat(mode);
+        ConfigureFormat(mode);
 
         // Preview sink → render into our window.
         _engine.GetSink(Mf.SinkTypePreview, out IntPtr sinkPtr);
@@ -439,8 +442,6 @@ public sealed class VideoEngine : IVideoEngine
 
     // ---- Format enumeration & selection ---------------------------------
 
-    private readonly record struct RawType(int Index, string Comp, int W, int H, int Fps);
-
     private List<RawType> EnumerateRaw()
     {
         var list = new List<RawType>();
@@ -461,49 +462,48 @@ public sealed class VideoEngine : IVideoEngine
 
     public List<CaptureMode> GetModes()
     {
-        return EnumerateRaw()
-            .GroupBy(r => (r.Comp, r.W, r.H))
-            .Select(g => new CaptureMode(g.Key.Comp, g.Key.W, g.Key.H, g.Max(r => r.Fps)))
-            .OrderByDescending(m => (long)m.Width * m.Height)
-            .ThenByDescending(m => m.Fps)
-            .ToList();
+        return CaptureFormats.ToModes(EnumerateRaw());
     }
 
+    /// <summary>Choose and apply the device's media type: the explicit mode, or (no mode) the automatic choice, which
+    /// keeps the device's current type when it runs at 24 fps or more (see <see cref="CaptureFormats.PickAuto"/>).</summary>
     private void ConfigureFormat(CaptureMode? desired)
     {
         List<RawType> types = EnumerateRaw();
         if (types.Count == 0) return;
 
-        // NOTE: RawType is a struct, so FirstOrDefault() would return default(RawType)
-        // (Index = 0 — a real, arbitrary format!) when nothing matches. Use FindIndex
-        // so "not found" is unambiguous and the fallbacks actually run.
-        // An empty Compression means "any" (used by command-line --mode).
-        bool CompOk(RawType r) =>
-            string.IsNullOrEmpty(desired!.Compression) || r.Comp == desired.Compression;
-        RawType pick;
-        int exact = desired == null ? -1 : types.FindIndex(r =>
-            CompOk(r) && r.W == desired.Width && r.H == desired.Height &&
-            (desired.Fps <= 0 || r.Fps == desired.Fps));
-        int sameRes = desired == null ? -1 : types.FindIndex(r =>
-            CompOk(r) && r.W == desired.Width && r.H == desired.Height);
+        RawType? cur = null;
+        try
+        {
+            using IMFMediaType ct = _source!.GetCurrentDeviceMediaType(Mf.PreferredPreviewStream);
+            if (TryDescribe(ct, out string cc, out int cw, out int ch, out int cf))
+                cur = new RawType(-1, cc, cw, ch, cf);
+        }
+        catch { /* no current type: the largest wins */ }
 
-        if (exact >= 0)
-        {
-            pick = types[exact];
-        }
-        else if (sameRes >= 0)
-        {
-            pick = types.Where(r => CompOk(r) &&
-                    r.W == desired!.Width && r.H == desired.Height)
-                .OrderByDescending(r => r.Fps).First();
-        }
-        else
-        {
-            pick = types.OrderByDescending(r => (long)r.W * r.H).ThenByDescending(r => r.Fps).First();
-        }
-
+        // An explicit mode saved as a hidden NV12 twin (older versions listed it) is opened as its MJPG type, which is
+        // the entry the menu shows; the automatic choice stays as it was.
+        RawType pick = CaptureFormats.Pick(types, desired, cur, mapTwin: desired != null)!.Value;
+        if (cur is { } c0 && c0.Comp == pick.Comp && c0.W == pick.W && c0.H == pick.H && c0.Fps == pick.Fps)
+            return;   // already the device's current type
+        Log.Info($"VideoEngine: format {pick.Comp} {pick.W}x{pick.H}@{pick.Fps}" +
+            (cur is { } c1 ? $" (device was at {c1.Comp} {c1.W}x{c1.H}@{c1.Fps})" : string.Empty));
         using IMFMediaType chosen = _source!.GetAvailableDeviceMediaType(Mf.PreferredPreviewStream, pick.Index);
         _source.SetCurrentDeviceMediaType(Mf.PreferredPreviewStream, chosen);
+        // The capture engine applies the type asynchronously: wait until it reads back as chosen.
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 1500)
+        {
+            try
+            {
+                using IMFMediaType now = _source.GetCurrentDeviceMediaType(Mf.PreferredPreviewStream);
+                if (TryDescribe(now, out string nc, out int nw, out int nh, out int nf) &&
+                    nc == pick.Comp && nw == pick.W && nh == pick.H && nf == pick.Fps) return;
+            }
+            catch { /* not readable yet */ }
+            Thread.Sleep(20);
+        }
+        Log.Info("VideoEngine: the device type did not read back as chosen within 1.5 s");
     }
 
     private void ReadCurrentFormat()

@@ -127,7 +127,7 @@ public sealed partial class MainForm
         videoDevices.DropDownOpening += (_, _) => { RebuildVideoDeviceList(videoDevices); RadioAll(videoDevices); };
         audioDevices.DropDownOpening += (_, _) => { RebuildAudioDeviceList(audioDevices); RadioAll(audioDevices); };
         audioOutput.DropDownOpening += (_, _) => { RebuildAudioOutputList(audioOutput); RadioAll(audioOutput); };
-        videoMode.DropDownOpening += (_, _) => { RebuildVideoModeList(videoMode); RadioAll(videoMode); };
+        videoMode.DropDownOpening += (_, _) => { RebuildVideoModeList(videoMode); RadioAll(videoMode); foreach (ToolStripItem sub in videoMode.DropDownItems) if (sub is ToolStripMenuItem { HasDropDownItems: true } subMenu) RadioAll(subMenu); };   // the low-frame-rate submenu too
         foreach (var root in new[] { videoDevices, audioDevices, audioOutput, videoMode })
             Refilled(root).DropDownItems.Add(new ToolStripMenuItem(L.T("（開くと更新）")) { Enabled = false });
 

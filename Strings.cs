@@ -359,7 +359,9 @@ internal static class L
 
         // ---- Device lists ----
         ["（デバイスなし）"] = "(no devices)",
-        ["自動（機器の既定）"] = "Auto (device default)",
+        ["機器が今使っている形式が 24fps 以上ならそのまま使い、そうでなければ 24fps 以上で最大の解像度・最高のフレームレートを選びます。"] =
+            "Keeps the format the device is currently using if it runs at 24 fps or more; otherwise picks the largest size and highest frame rate at 24 fps or more.",
+        ["低フレームレート"] = "Low frame rate",
         ["（利用可能なモードなし）"] = "(no modes available)",
 
         // ---- OSD ----
@@ -504,6 +506,7 @@ internal static class L
         ["映像の開始がタイムアウトしました。"] = "Starting the video timed out.",
         ["映像デバイスの形式を取得できません。"] = "Could not read the video device's format.",
         ["映像形式を NV12 に変換できません。"] = "Could not convert the video format to NV12.",
+        ["この映像形式を開けません。"] = "Could not open this video format.",
         ["映像デバイスが見つかりません。"] = "Video device not found.",
         ["表示ウィンドウが設定されていません。"] = "No render window has been set.",
         ["キャプチャエンジンの初期化がタイムアウトしました。"] = "Capture engine initialization timed out.",
