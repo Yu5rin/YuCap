@@ -412,6 +412,7 @@ internal static class L
         ["音声バッファ {0}ms"] = "Audio buffer {0}ms",
         ["スナップショット: {0}"] = "Snapshots: {0}",
         ["映像: {0}"] = "Video: {0}",
+        ["映像: {0} / 音声: {1}"] = "Video: {0} / Audio: {1}",
         ["音声: {0}"] = "Audio: {0}",
         ["映像モード: 自動"] = "Video mode: auto",
         ["PiP: オン"] = "PiP: on",

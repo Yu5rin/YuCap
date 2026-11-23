@@ -1289,6 +1289,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     }
 
     private string? _videoPickName;   // the video device InitVideoAsync chose (InitAudio runs before it has started)
+    private string? _videoPickId;
 
     private async Task InitVideoAsync()
     {
@@ -1307,6 +1308,7 @@ public sealed partial class MainForm : Form, IMessageFilter
                 return;
             }
             _videoPickName = pick.Name;
+            _videoPickId = pick.Id;
             LayoutCanvas();               // give the canvas a valid size before Start
             await StartVideoAsync(pick, _cliMode ?? _savedMode);
             _currentVideoInfo = pick;
@@ -1323,12 +1325,34 @@ public sealed partial class MainForm : Form, IMessageFilter
         }
     }
 
+    /// <summary>Once, when upgrading to audio-follows-video: the audio saved with the user's video device stays their choice for
+    /// that video device (as a manual pick), unless it is the audio that belongs to that device anyway.</summary>
+    private void MigrateAudioPairing(IReadOnlyList<AudioDeviceInfo> devices)
+    {
+        if (_settings.AudioSettingsVersion >= 2) return;
+        try
+        {
+            string? vid = _settings.VideoDeviceId, aid = _settings.AudioDeviceId;
+            var audio = string.IsNullOrEmpty(aid) ? null : devices.FirstOrDefault(d => d.Id == aid);
+            if (!string.IsNullOrEmpty(vid) && audio != null && DevicePairing.FindAudioFor(vid, new[] { audio }) == null)
+            {
+                _settings.AudioDeviceByVideo ??= new Dictionary<string, string>();
+                _settings.AudioDeviceByVideo.TryAdd(vid, audio.Id);
+            }
+            _settings.AudioSettingsVersion = 2;
+            SaveSettings();
+        }
+        catch (Exception ex) { Log.Info("MigrateAudioPairing: " + ex.Message); }
+    }
+
     private void InitAudio()
     {
         try
         {
             var devices = AudioEngine.EnumerateDevices();
-            var pick = ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name ?? _videoPickName);
+            MigrateAudioPairing(devices);
+            var pick = ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name ?? _videoPickName,
+                _currentVideoInfo?.Id ?? _videoPickId, _settings.AudioDeviceByVideo);
             if (pick == null)
             {
                 Log.Info("InitAudio: no capture audio device found (not opening an unrelated input)");
@@ -1426,7 +1450,8 @@ public sealed partial class MainForm : Form, IMessageFilter
             if (!_audio.IsRunning)
             {
                 var pick = (present ? _currentAudioInfo : null)
-                    ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name);
+                    ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name,
+                        _currentVideoInfo?.Id, _settings.AudioDeviceByVideo);
                 if (pick != null)
                 {
                     try
@@ -2143,9 +2168,11 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     private bool IsMenuDropdownOpen()
     {
-        if (_ctx.Visible) return true;
+        // Do not use item.IsOnDropDown: an item pushed into the "»" overflow reports true even
+        // when no menu is open (narrow window, high DPI), which used to disable the wheel for good.
+        if (_ctx.Visible || _menu.OverflowButton.DropDown.Visible) return true;
         foreach (ToolStripMenuItem item in _menu.Items.OfType<ToolStripMenuItem>())
-            if (item.IsOnDropDown || item.DropDown.Visible) return true;
+            if (item.DropDown.Visible) return true;
         return false;
     }
 
@@ -2527,7 +2554,11 @@ public sealed partial class MainForm : Form, IMessageFilter
         var audioMatch = ChooseAudioDevice(AudioEngine.EnumerateDevices(), null, keyword);
         if (audioMatch != null && audioMatch.Id != _currentAudioInfo?.Id)
         {
-            SwitchAudioDevice(audioMatch);
+            // While a video switch is running, _currentVideoInfo is still the old device, so the pick must not be stored under it (manual: false).
+            // With no video switch (switched is still false here) it is a manual pick, stored per video, so the video's paired audio does not win at next startup.
+            _devOpBusy++;
+            try { SwitchAudioDeviceCore(audioMatch, manual: !switched); }
+            finally { _devOpBusy--; }
             switched = true;
         }
 
@@ -3998,7 +4029,10 @@ public sealed partial class MainForm : Form, IMessageFilter
             _settings.VideoDeviceId = info.Id;   // the user's own choice: startup and hot-plug prefer it from now on
             MarkSettingsDirty();
             LayoutCanvas();
-            ShowOsd(L.F("映像: {0}", info.Name));
+            AudioDeviceInfo? followed = FollowAudioToVideo(info);
+            ShowOsd(followed != null
+                ? L.F("映像: {0} / 音声: {1}", info.Name, followed.Name)
+                : L.F("映像: {0}", info.Name));
         }
         catch (OperationCanceledException) { /* stopped on purpose meanwhile */ }
         catch (Exception ex)
@@ -4008,6 +4042,30 @@ public sealed partial class MainForm : Form, IMessageFilter
             await RecoverVideoAsync(); // best-effort: bring the previous device back
         }
         UpdateStatus();
+    }
+
+    /// <summary>After a video device switch: move the audio to the device that belongs to the new video device (the one the user
+    /// picked for it by hand, else the one in the same physical device). Keeps the current audio when the video device has none of
+    /// its own. Returns the audio device switched to, or null when nothing changed.</summary>
+    private AudioDeviceInfo? FollowAudioToVideo(VideoDeviceInfo video)
+    {
+        try
+        {
+            var devices = AudioEngine.EnumerateDevices();
+            AudioDeviceInfo? target = null;
+            if (_settings.AudioDeviceByVideo != null && _settings.AudioDeviceByVideo.TryGetValue(video.Id, out string? manualId))
+                target = devices.FirstOrDefault(d => d.Id == manualId);
+            target ??= DevicePairing.FindAudioFor(video.Id, devices);
+            if (target == null) return null;
+            if (_currentAudioInfo?.Id == target.Id && _audio.IsRunning) return null;
+            Log.Info($"audio follows video: {video.Name} -> {target.Name}");
+            return SwitchAudioDeviceCore(target, manual: false) ? target : null;
+        }
+        catch (Exception ex)
+        {
+            Log.Info("FollowAudioToVideo: " + ex.Message);
+            return null;
+        }
     }
 
     /// <summary>After a failed switch (Start() stops the engine first), try to
@@ -4171,18 +4229,37 @@ public sealed partial class MainForm : Form, IMessageFilter
         finally { _devOpBusy--; }
     }
 
-    private void SwitchAudioDeviceCore(AudioDeviceInfo info)
+    /// <param name="manual">A menu pick by the user: remembered for the video device in use. False when YuCap follows a video
+    /// device switch itself (then nothing is remembered and the caller shows the OSD).</param>
+    /// <returns>True when the device is open.</returns>
+    private bool SwitchAudioDeviceCore(AudioDeviceInfo info, bool manual = true)
     {
         AudioDeviceInfo? previous = _currentAudioInfo;
         bool wasRunning = _audio.IsRunning;
+        bool ok = false;
         try
         {
             _audio.Start(info, _settings.AudioOutputDeviceId);
             _currentAudioInfo = info;
             ResetRecovery();
-            _settings.AudioDeviceId = info.Id;   // the user's own choice: startup and hot-plug prefer it from now on
+            _settings.AudioDeviceId = info.Id;   // the last device in use: startup and hot-plug prefer it from now on
+            if (manual && _currentVideoInfo?.Id is { Length: > 0 } vid)
+            {
+                // Remember the pick for this video device - unless it is the device that belongs to it anyway.
+                if (DevicePairing.FindAudioFor(vid, new[] { info }) != null)
+                {
+                    if (_settings.AudioDeviceByVideo?.Remove(vid) == true && _settings.AudioDeviceByVideo.Count == 0)
+                        _settings.AudioDeviceByVideo = null;
+                }
+                else
+                {
+                    _settings.AudioDeviceByVideo ??= new Dictionary<string, string>();
+                    _settings.AudioDeviceByVideo[vid] = info.Id;
+                }
+            }
             MarkSettingsDirty();
-            ShowOsd(L.F("音声: {0}", info.Name));
+            if (manual) ShowOsd(L.F("音声: {0}", info.Name));
+            ok = true;
         }
         catch (Exception ex)
         {
@@ -4196,6 +4273,7 @@ public sealed partial class MainForm : Form, IMessageFilter
             }
         }
         UpdateStatus();
+        return ok;
     }
 
     // ---- Audio buffer settings ------------------------------------------

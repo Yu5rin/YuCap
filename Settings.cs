@@ -33,7 +33,8 @@ public sealed class AppSettings
     public string? InfoMode { get; set; }
     public int Volume { get; set; } = 100;
     public int AudioBufferMs { get; set; } = AudioEngine.DefaultBufferMs;
-    /// <summary>0 = written before the audio path was rebuilt (v1.9); the old defaults of the buffer (120 / 200 ms) then mean "never changed" and move to the new default once.</summary>
+    /// <summary>0 = written before the audio path was rebuilt (v1.9); the old defaults of the buffer (120 / 200 ms) then mean "never changed" and move to the new default once.
+    /// 2 = audio follows the video device (<see cref="AudioDeviceByVideo"/>): an older file's saved audio is moved into it once, at startup.</summary>
     public int AudioSettingsVersion { get; set; }
 
     // Snapshot output.
@@ -181,6 +182,9 @@ public sealed class AppSettings
     /// Startup and hot-plug prefer it, then <see cref="DeviceKeyword"/>; null = never picked. Never some other device.</summary>
     public string? VideoDeviceId { get; set; }
     public string? AudioDeviceId { get; set; }
+    /// <summary>The audio device the user picked by hand while a given video device was in use (video id -> audio endpoint id).
+    /// It wins over the audio device that belongs to that video device; absent = use the paired one.</summary>
+    public Dictionary<string, string>? AudioDeviceByVideo { get; set; }
     public string Language { get; set; } = "ja";  // "ja" | "en"
 
     // Window placement.
@@ -243,6 +247,13 @@ public sealed class AppSettings
         if (string.IsNullOrWhiteSpace(AudioOutputDeviceId)) AudioOutputDeviceId = null;
         if (string.IsNullOrWhiteSpace(VideoDeviceId)) VideoDeviceId = null;
         if (string.IsNullOrWhiteSpace(AudioDeviceId)) AudioDeviceId = null;
+        if (AudioDeviceByVideo != null)
+        {
+            AudioDeviceByVideo = AudioDeviceByVideo
+                .Where(kv => !string.IsNullOrWhiteSpace(kv.Key) && !string.IsNullOrWhiteSpace(kv.Value))
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
+            if (AudioDeviceByVideo.Count == 0) AudioDeviceByVideo = null;
+        }
         // Settings files from before the volume hotkeys have no such entries: the property initialisers
         // already gave them their defaults. Only a combo without a key (modifiers alone) is meaningless.
         if ((HotkeyVolumeUp & 0xFFFF) == 0) HotkeyVolumeUp = 0;

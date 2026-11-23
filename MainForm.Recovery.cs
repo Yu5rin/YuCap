@@ -35,11 +35,22 @@ public sealed partial class MainForm
         return null;
     }
 
-    /// <summary>The audio half: the one picked last, else the keyword, else (first run, as for the video) the audio device whose
-    /// name shares a word with the video device in use - a capture card's audio is named after the card.</summary>
+    /// <summary>The audio half, in order: what the user picked by hand for this video device, the audio that belongs to the video
+    /// device (same container / same USB parent), the one picked last, the keyword, and (first run, as for the video) the audio
+    /// device whose name shares a word with the video device in use - a capture card's audio is named after the card.</summary>
     internal static AudioDeviceInfo? ChooseAudioDevice(IReadOnlyList<AudioDeviceInfo> devices, string? savedId, string? keyword,
-        string? videoName = null)
+        string? videoName = null, string? videoId = null, IReadOnlyDictionary<string, string>? manualByVideo = null)
     {
+        if (!string.IsNullOrEmpty(videoId))
+        {
+            if (manualByVideo != null && manualByVideo.TryGetValue(videoId, out string? manualId))
+            {
+                var manual = devices.FirstOrDefault(d => d.Id == manualId);
+                if (manual != null) return manual;
+            }
+            var paired = DevicePairing.FindAudioFor(videoId, devices);
+            if (paired != null) return paired;
+        }
         if (!string.IsNullOrEmpty(savedId))
         {
             var byId = devices.FirstOrDefault(d => d.Id == savedId);
@@ -265,7 +276,8 @@ public sealed partial class MainForm
             var devices = AudioEngine.EnumerateDevices();
             AudioDeviceInfo? cur = _currentAudioInfo;
             AudioDeviceInfo? pick = (cur != null ? devices.FirstOrDefault(d => d.Id == cur.Id) : null)
-                ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name);
+                ?? ChooseAudioDevice(devices, _settings.AudioDeviceId, _settings.DeviceKeyword, _currentVideoInfo?.Name,
+                    _currentVideoInfo?.Id, _settings.AudioDeviceByVideo);
             if (pick == null) return false;
             try { _audio.Stop(); } catch { /* ignore */ }
             _audio.Start(pick, _settings.AudioOutputDeviceId);
