@@ -30,7 +30,10 @@ public sealed partial class MainForm
         }
         if (_gallery == null || _gallery.IsDisposed)
         {
-            var g = new SnapshotGalleryForm(GalleryRoot()) { Icon = Icon };
+            // Topmost like the main window when that is: an owned window of a topmost owner otherwise opens behind it.
+            var g = new SnapshotGalleryForm(GalleryRoot()) { Icon = Icon, TopMost = IsTopmostNow() };
+            // After one of its own modal dialogs, closing hands activation to another app; give it back to the owner.
+            g.FormClosing += (_, _) => { if (Form.ActiveForm == g) Activate(); };
             g.FormClosed += (_, _) => { if (ReferenceEquals(_gallery, g)) _gallery = null; };
             _gallery = g;
             g.Show(this);

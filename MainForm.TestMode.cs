@@ -637,7 +637,7 @@ public sealed partial class MainForm
         if (_info.Showing) ToggleInfo();
         if (_isPip) ExitPip();
         if (_isFullscreen) PlaceFullscreen(); else EnterFullscreen(userAction: false);
-        TopMost = true;
+        SetTopmost(true);
         Activate();
         Focus();
         LayoutCanvas();

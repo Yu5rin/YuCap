@@ -359,7 +359,7 @@ public sealed partial class MainForm
                 SelectedPath = SnapshotDirectory,
                 ShowNewFolderButton = true,
             };
-            if (fb.ShowDialog(dlg) == DialogResult.OK) txtDir.Text = fb.SelectedPath;
+            if (ShowSystemDialog(dlg, () => fb.ShowDialog(dlg)) == DialogResult.OK) txtDir.Text = fb.SelectedPath;
         };
         var cmbFmt = Ui.Combo(160, L.T("PNG (無劣化)"), L.T("JPEG (高画質)"));
         cmbFmt.SelectedIndex =

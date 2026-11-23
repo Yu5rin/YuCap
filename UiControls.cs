@@ -181,10 +181,28 @@ internal class UiWindow : Form
         finally { _placing = false; }
     }
 
+    [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int index);
+
+    /// <summary>An owned window opens behind a topmost owner (always on top, PiP, fullscreen) unless it is topmost itself:
+    /// make this one topmost exactly when the opener really is. It ends with the window, so nothing stays on top of
+    /// other apps afterwards. Runs before every show; a dialog shown again follows the opener's state of that moment.</summary>
+    private void MatchOpenerTopmost()
+    {
+        bool want = false;
+        try
+        {
+            Form? o = Opener;
+            want = o != null && !o.IsDisposed && o.IsHandleCreated && (GetWindowLong(o.Handle, -20) & 0x8) != 0;
+        }
+        catch { /* leave it as it is */ }
+        if (TopMost != want) TopMost = want;
+    }
+
     /// <summary>Before the handle exists: put the window on the opener's monitor, so it is created at that monitor's DPI.</summary>
     protected void PrePlace(IWin32Window? owner)
     {
         Opener = owner as Form ?? (owner is Control c ? c.FindForm() : null) ?? Ui.MainWindow;
+        MatchOpenerTopmost();
         if (KeepLocation || Opener == null || Opener.IsDisposed || IsHandleCreated) return;
         try
         {

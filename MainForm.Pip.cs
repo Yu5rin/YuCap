@@ -45,7 +45,7 @@ public sealed partial class MainForm
             _canvas.EnableEdgeResize = true;
             RefreshFrame();
         }
-        TopMost = true;
+        SetTopmost(true);
 
         // The normal-mode minimum (320x240) would clamp the smaller PiP size
         // presets (10-20%) up to a 4:3 window with black bars instead of a
@@ -73,7 +73,7 @@ public sealed partial class MainForm
         ApplyClickThrough(false);
         SyncPipHotkey();
         try { Opacity = 1.0; } catch { }
-        TopMost = _alwaysOnTop = _prePipTopmost;
+        SetTopmost(_alwaysOnTop = _prePipTopmost);
         if (_isBorderless != _prePipBorderless)
         {
             _isBorderless = _prePipBorderless;

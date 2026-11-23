@@ -312,6 +312,9 @@ public sealed partial class MainForm
         if (_trainWin == null || _trainWin.IsDisposed)
         {
             _trainWin = new TrainWindow(MakeTrainView, CancelTraining, UseTrainedModel, () => OpenFolder(UserModels.ModelsDir, null));
+            // After one of its own modal dialogs, closing hands activation to another app; give it back to the owner.
+            var tw = _trainWin;
+            tw.FormClosing += (_, _) => { if (Form.ActiveForm == tw) Activate(); };
             _trainWin.FormClosed += (_, _) => _trainWin = null;
             _trainWin.Show(this);       // owned: stays above the main window, even a maximised or fullscreen one
         }

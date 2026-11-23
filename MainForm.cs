@@ -784,6 +784,7 @@ public sealed partial class MainForm : Form, IMessageFilter
     private const uint EventSystemForeground = 0x0003, WinEventOutOfContext = 0x0000;
     private const uint MonitorDefaultToNull = 0, MonitorDefaultToNearest = 2;
     private const int WsExTopmost = 0x0008;
+    private static readonly IntPtr HwndTopmost = new(-1), HwndNoTopmost = new(-2);
     private const int WmActivateApp = 0x001C;
     private WinEventProc? _foregroundProc;   // kept referenced: the hook calls it from native code
     private IntPtr _foregroundHook;
@@ -794,15 +795,56 @@ public sealed partial class MainForm : Form, IMessageFilter
     /// taskbar there does not cut into the picture while the user works elsewhere.</summary>
     private void ApplyTopmost()
     {
-        if (!IsHandleCreated || IsDisposed) return;
+        if (!IsHandleCreated || IsDisposed || _topmostHeld) return;
         bool want = _isPip || _alwaysOnTop || (_isFullscreen && !ForegroundAppOnOurMonitor(out _));
-        if (want) { TopMost = true; return; }
-        if (!TopMost) return;
-        TopMost = false;
+        // Never use the WinForms TopMost setter here: it calls SetWindowPos without SWP_NOACTIVATE, so every call
+        // activates this window - even while it is disabled under a modal dialog, which then loses the keyboard.
+        // Wanted: re-assert every time (cheap; lifts owned windows opened since, e.g. dialogs).
+        if (want) { SetTopmost(true); return; }
+        if (!IsTopmostNow()) return;
+        SetTopmost(false);
         // Leaving the topmost band puts the window at the top of the normal band - over the app the user just
         // switched to. Slot it back in behind that app.
         if (ForegroundAppOnOurMonitor(out IntPtr fg) && (GetWindowLong(fg, GwlExStyle) & WsExTopmost) == 0)
             SetWindowPos(Handle, fg, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    /// <summary>Whether this window really carries WS_EX_TOPMOST (the WinForms TopMost getter reads the same style once the handle exists).</summary>
+    internal bool IsTopmostNow() => IsHandleCreated ? (GetWindowLong(Handle, GwlExStyle) & WsExTopmost) != 0 : TopMost;
+
+    /// <summary>Enter or leave the topmost band without activating the window (the WinForms TopMost setter activates it).
+    /// Before the handle exists the property is set instead, so CreateParams picks it up.</summary>
+    private void SetTopmost(bool on)
+    {
+        if (!IsHandleCreated) { TopMost = on; return; }
+        SetWindowPos(Handle, on ? HwndTopmost : HwndNoTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    private bool _topmostHeld;   // a system dialog is open: ApplyTopmost stands down
+
+    /// <summary>Run a system common dialog (folder picker, ...) from <paramref name="owner"/>. Such a dialog is not made
+    /// topmost by us, so while this window (or the owner dialog) is topmost it can open behind it. Both leave the topmost
+    /// band meanwhile (without activating anything) and get it back afterwards - the dialog then stays on top of them as
+    /// their owned window.</summary>
+    internal T ShowSystemDialog<T>(Form? owner, Func<T> show)
+    {
+        bool mainTop = IsTopmostNow();
+        bool ownerTop = owner != null && owner != this && owner.IsHandleCreated && (GetWindowLong(owner.Handle, GwlExStyle) & WsExTopmost) != 0;
+        if (!mainTop && !ownerTop) return show();
+        _topmostHeld = true;
+        if (ownerTop) SetWindowPos(owner!.Handle, HwndNoTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+        if (mainTop) SetTopmost(false);
+        try { return show(); }
+        finally
+        {
+            _topmostHeld = false;
+            if (!IsDisposed)
+            {
+                if (mainTop) ApplyTopmost();
+                if (ownerTop && !owner!.IsDisposed && owner.IsHandleCreated)
+                    SetWindowPos(owner.Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+            }
+        }
     }
 
     /// <summary>True when the foreground window belongs to another process and sits on the monitor this window covers.</summary>
@@ -1118,7 +1160,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         FormBorderStyle = FormBorderStyle.Sizable;
         _canvas.EnableEdgeResize = _isBorderless;
         RefreshFrame(); // hides chrome via WM_NCCALCSIZE when borderless
-        TopMost = _alwaysOnTop;
+        SetTopmost(_alwaysOnTop);
         _menu.Visible = _settings.MenuVisible;
         _status.Visible = _settings.StatusVisible;
         _fsMenuVisible = _settings.FullscreenMenuVisible;
@@ -3677,7 +3719,7 @@ public sealed partial class MainForm : Form, IMessageFilter
         if (Bounds != _restoreBounds) Bounds = _restoreBounds;   // may have crossed a DPI boundary
         WindowState = _restoreWindowState;
         HookForeground(false);
-        TopMost = _alwaysOnTop;
+        SetTopmost(_alwaysOnTop);
         RefreshFrame();
         UpdateChecks();
 
@@ -4495,6 +4537,9 @@ public sealed partial class MainForm : Form, IMessageFilter
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        // A modal dialog of ours is up (this window is disabled): app shortcuts must not act behind it.
+        if (ModalOpen) return base.ProcessCmdKey(ref msg, keyData);
+
         // Test mode: Esc aborts, every other key is swallowed so nothing changes under the test.
         if (_testRunning)
         {
